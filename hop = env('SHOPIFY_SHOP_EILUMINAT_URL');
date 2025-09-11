@@ -1,0 +1,31 @@
+[90m= [39m[34;4mIlluminate\Http\JsonResponse[39;24m {#5350
+    +[1mheaders[22m: [34;4mSymfony\Component\HttpFoundation\ResponseHeaderBag[39;24m {#5352},
+    +[1moriginal[22m: [
+      "[34mdata[39m" => [
+        "[34mwebhookSubscriptionCreate[39m" => [
+          "[34mwebhookSubscription[39m" => [
+            "[34mid[39m" => "[32mgid://shopify/WebhookSubscription/1989727551870[39m",
+            "[34mendpoint[39m" => [
+              "[34m__typename[39m" => "[32mWebhookHttpEndpoint[39m",
+              "[34mcallbackUrl[39m" => "[32mhttps://coolify.lustreled.ro/api/webhooks/shopify/update[39m",
+            ],
+            "[34mformat[39m" => "[32mJSON[39m",
+          ],
+          "[34muserErrors[39m" => [],
+        ],
+      ],
+      "[34mextensions[39m" => [
+        "[34mcost[39m" => [
+          "[34mrequestedQueryCost[39m" => [35m10[39m,
+          "[34mactualQueryCost[39m" => [35m10[39m,
+          "[34mthrottleStatus[39m" => [
+            "[34mmaximumAvailable[39m" => [33m2000.0[39m,
+            "[34mcurrentlyAvailable[39m" => [35m1990[39m,
+            "[34mrestoreRate[39m" => [33m100.0[39m,
+          ],
+        ],
+      ],
+    ],
+    +[1mexception[22m: [36mnull[39m,
+  }
+

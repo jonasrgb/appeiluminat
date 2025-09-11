@@ -13,7 +13,17 @@ return [
     | a conventional file to locate the various service credentials.
     |
     */
-
+    'shopify' => [
+        'notifications_webhook_secret' => env('SHOPIFY_WEBHOOK_SECRET'),
+        'app_webhook_secret'           => env('API_KEY_SECRET_EILUMINAT'),
+        
+        'webhook_secret' => env('SHOPIFY_WEBHOOK_SECRET'),
+        'store_domain' => env('SHOPIFY_STORE_DOMAIN'),
+        'admin_token' => env('SHOPIFY_ADMIN_TOKEN'),
+        'api_key' => env('SHOPIFY_API_KEY'),
+        'api_secret' => env('SHOPIFY_API_SECRET'),
+    ],
+    
     'mailgun' => [
         'domain' => env('MAILGUN_DOMAIN'),
         'secret' => env('MAILGUN_SECRET'),
