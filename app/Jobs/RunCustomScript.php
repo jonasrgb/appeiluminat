@@ -37,7 +37,7 @@ class RunCustomScript implements ShouldQueue
         try {
             // Creează clientul Guzzle
             $client = new Client([
-                'base_uri' => 'https://6931e0469da2f74cc04dc0e57313c4e6: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@lustreled.myshopify.com/admin/api/2025-01/',
+                'base_uri' => env('RUN_lustreled_SECRET'),
                 'http_errors' => false,
             ]);
 

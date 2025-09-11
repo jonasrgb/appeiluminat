@@ -37,7 +37,7 @@ class RunCustomScript3 implements ShouldQueue
         try {
             // Creează clientul Guzzle
             $client = new Client([
-                'base_uri' => 'https://8928e7430ea40c2d27a42ebeb2be0346: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@eiluminat.myshopify.com/admin/api/2025-01/',
+                'base_uri' => env('RUN_eiluminat_SECRET'),
                 'http_errors' => false,
             ]);
 

@@ -37,7 +37,7 @@ class RunCustomScript2 implements ShouldQueue
         try {
             // Creează clientul Guzzle
             $client = new Client([
-                'base_uri' => 'https://e0590a06043f059dbd0bbfbdb16e6b13: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@powerleds-ro.myshopify.com/admin/api/2025-01/',
+                'base_uri' => env('RUN_POWERLEDS_SECRET'),
                 'http_errors' => false,
             ]);
 
