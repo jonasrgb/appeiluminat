@@ -94,6 +94,7 @@ return [
 
     'middleware' => [
         'web',
+        'auth', // require authenticated user session
         Authorize::class,
     ],
 

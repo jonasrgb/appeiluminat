@@ -863,11 +863,12 @@ class ReplicateProductCreateToShop implements ShouldQueue
 
         $out = [];
         foreach ($names as $i => $name) {
-            $vals = array_keys($valuesByIndex[$i] ?? []);
+            // Ensure values are strings; PHP may cast numeric-string keys to ints.
+            $vals = array_map('strval', array_keys($valuesByIndex[$i] ?? []));
             $out[] = array_filter([
                 'name'   => $name,
                 // 2025-01: values are array of OptionValueInput { name: String! }
-                'values' => $vals ? array_map(fn($x) => ['name' => $x], $vals) : null,
+                'values' => $vals ? array_map(fn($x) => ['name' => (string)$x], $vals) : null,
             ], fn($v) => $v !== null);
         }
         return $out;

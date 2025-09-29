@@ -38,12 +38,153 @@ public function handle(): void
     ])->first();
 
     if (!$mirror || !$mirror->target_product_gid) {
-        Log::warning('Update skipped: no product mirror mapping', [
-            'target_shop' => $target->domain,
-            'source_shop' => $this->sourceShopId,
-            'source_pid'  => $this->sourceProductId,
-        ]);
-        return;
+        // Feature-flagged hook for future auto-bootstrap when mirror is missing
+        if (config('features.mirror_bootstrap.enabled')) {
+            $handle = $this->payload['handle'] ?? null;
+            $skus = [];
+            if (!empty($this->payload['variants']) && is_array($this->payload['variants'])) {
+                foreach ($this->payload['variants'] as $v) {
+                    $sku = $v['sku'] ?? null;
+                    if ($sku !== null && $sku !== '') $skus[] = (string)$sku;
+                }
+            }
+            Log::notice('Mirror missing: auto-bootstrap feature enabled (dry-run may suppress writes)', [
+                'target_shop' => $target->domain,
+                'source_shop' => $this->sourceShopId,
+                'source_pid'  => $this->sourceProductId,
+                'dry_run'     => (bool)config('features.mirror_bootstrap.dry_run'),
+                'handle'      => $handle,
+                'skus'        => $skus,
+            ]);
+            // Read-only discovery (handle first, then SKUs). Always logs; no writes in this step.
+            try {
+                $candidate = null;
+                $strategy  = null;
+
+                if ($handle) {
+                    $found = $this->searchTargetProductByHandle($target, $handle);
+                    if (!empty($found['gid'])) {
+                        $candidate = $found;
+                        $strategy  = 'handle';
+                    } elseif (!empty($found['ambiguous'])) {
+                        Log::warning('Auto-bootstrap: handle search ambiguous or multiple matches', [
+                            'target_shop' => $target->domain,
+                            'handle'      => $handle,
+                        ]);
+                    } else {
+                    Log::info('Auto-bootstrap: no product found by handle', [
+                        'target_shop' => $target->domain,
+                        'source_pid'  => $this->sourceProductId,
+                        'handle'      => $handle,
+                    ]);
+                    }
+                }
+
+                if (!$candidate && !empty($skus)) {
+                    $found = $this->searchTargetProductBySkus($target, $skus);
+                    if (!empty($found['gid'])) {
+                        $candidate = $found;
+                        $strategy  = 'sku';
+                    } elseif (!empty($found['ambiguous'])) {
+                        Log::warning('Auto-bootstrap: SKU search ambiguous or multiple products matched', [
+                            'target_shop' => $target->domain,
+                            'skus'        => $skus,
+                        ]);
+                    } else {
+                    Log::info('Auto-bootstrap: no product found by SKUs', [
+                        'target_shop' => $target->domain,
+                        'source_pid'  => $this->sourceProductId,
+                        'skus'        => $skus,
+                    ]);
+                    }
+                }
+
+                if ($candidate) {
+                    Log::notice('Auto-bootstrap DRY-RUN candidate found', [
+                        'target_shop' => $target->domain,
+                        'strategy'    => $strategy,
+                        'product_gid' => $candidate['gid'] ?? null,
+                        'handle'      => $candidate['handle'] ?? null,
+                        'title'       => $candidate['title'] ?? null,
+                    ]);
+                } else {
+                    Log::notice('Auto-bootstrap DRY-RUN: no suitable candidate found', [
+                        'target_shop' => $target->domain,
+                        'handle'      => $handle,
+                        'skus'        => $skus,
+                    ]);
+                    Log::warning('Auto-bootstrap skipped: no candidate found', [
+                        'target_shop' => $target->domain,
+                        'source_pid'  => $this->sourceProductId,
+                        'handle'      => $handle,
+                        'skus'        => $skus,
+                    ]);
+                }
+            } catch (\Throwable $e) {
+                Log::error('Auto-bootstrap discovery failed', [
+                    'target_shop' => $target->domain,
+                    'error'       => $e->getMessage(),
+                ]);
+            }
+            if ((bool)config('features.mirror_bootstrap.dry_run')) {
+                Log::info('Auto-bootstrap DRY-RUN: skipping DB writes and updates', [
+                    'target_shop' => $target->domain,
+                ]);
+                return;
+            }
+
+            if (empty($candidate['gid'] ?? null)) {
+                Log::warning('Auto-bootstrap skipped: no candidate found (no writes)', [
+                    'target_shop' => $target->domain,
+                    'source_pid'  => $this->sourceProductId,
+                    'handle'      => $handle,
+                    'skus'        => $skus,
+                ]);
+                return;
+            }
+
+            try {
+                $pm = ProductMirror::updateOrCreate(
+                    [
+                        'source_shop_id'    => $this->sourceShopId,
+                        'target_shop_id'    => $this->targetShopId,
+                        'source_product_id' => $this->sourceProductId,
+                    ],
+                    [
+                        'source_product_gid' => 'gid://shopify/Product/' . $this->sourceProductId,
+                        'target_product_gid' => $candidate['gid'],
+                        'target_product_id'  => (int)($this->numericIdFromGid($candidate['gid']) ?? 0),
+                    ]
+                );
+
+                $pm->last_snapshot = $this->normalizeProductSnapshot($this->payload);
+                $pm->save();
+
+                $opt  = $this->normalizeOptionsFromPayload($this->payload);
+                $vars = $this->normalizeSourceVariants($this->payload, $opt);
+                $this->ensureVariantMirrors($pm, $target, $opt, $vars);
+
+                Log::notice('Auto-bootstrap mapping created', [
+                    'target_shop' => $target->domain,
+                    'target_gid'  => $candidate['gid'],
+                ]);
+
+                $mirror = $pm;
+            } catch (\Throwable $e) {
+                Log::error('Auto-bootstrap mapping failed', [
+                    'target_shop' => $target->domain,
+                    'error'       => $e->getMessage(),
+                ]);
+                return;
+            }
+        } else {
+            Log::warning('Update skipped: no product mirror mapping', [
+                'target_shop' => $target->domain,
+                'source_shop' => $this->sourceShopId,
+                'source_pid'  => $this->sourceProductId,
+            ]);
+            return;
+        }
     }
 
     Log::info('Replicate update start', [
@@ -1150,7 +1291,7 @@ public function handle(): void
 
         $mutation = <<<'GQL'
         mutation CreateVariants($productId: ID!, $variants: [ProductVariantsBulkInput!]!, $strategy: ProductVariantsBulkCreateStrategy!) {
-          productVariantsBulkCreate(productId: $productId, variants: $variants, strategy: REMOVE_STANDALONE_VARIANT) {
+          productVariantsBulkCreate(productId: $productId, variants: $variants, strategy: $strategy) {
             productVariants { id selectedOptions { name value } inventoryItem { id } }
             userErrors { field message }
           }
@@ -2013,6 +2154,61 @@ private function productSet(Shop $shop, array $input): void
     }
 }
 
+
+    // --- Discovery helpers (read-only) ---
+    private function searchTargetProductByHandle(Shop $shop, string $handle): array
+    {
+        $q = <<<'GQL'
+        query($query: String!) {
+          products(first: 1, query: $query) {
+            nodes { id handle title }
+          }
+        }
+        GQL;
+
+        $queryStr = 'handle:' . $handle;
+        $res = $this->gql($shop, $q, ['query' => $queryStr]);
+        $nodes = $res['data']['products']['nodes'] ?? [];
+        if (count($nodes) === 1) {
+            return [
+                'gid'    => $nodes[0]['id'] ?? null,
+                'handle' => $nodes[0]['handle'] ?? null,
+                'title'  => $nodes[0]['title'] ?? null,
+            ];
+        }
+        return ['ambiguous' => count($nodes) > 1];
+    }
+
+    private function searchTargetProductBySkus(Shop $shop, array $skus): array
+    {
+        $parts = [];
+        foreach (array_values(array_unique($skus)) as $s) {
+            $s = trim((string)$s);
+            if ($s === '') continue;
+            $parts[] = 'sku:"' . addslashes($s) . '"';
+        }
+        if (!$parts) return [];
+        $queryStr = implode(' OR ', $parts);
+
+        $q = <<<'GQL'
+        query($query: String!) {
+          products(first: 10, query: $query) {
+            nodes { id handle title }
+          }
+        }
+        GQL;
+
+        $res = $this->gql($shop, $q, ['query' => $queryStr]);
+        $nodes = $res['data']['products']['nodes'] ?? [];
+        if (count($nodes) === 1) {
+            return [
+                'gid'    => $nodes[0]['id'] ?? null,
+                'handle' => $nodes[0]['handle'] ?? null,
+                'title'  => $nodes[0]['title'] ?? null,
+            ];
+        }
+        return ['ambiguous' => count($nodes) > 1];
+    }
 
     // Normalizează nume/opțiuni ca să construim chei stabile
     private function canonOptName(string $s): string { return mb_strtolower(trim($s)); }
