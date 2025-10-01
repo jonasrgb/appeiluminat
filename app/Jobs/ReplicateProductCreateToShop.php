@@ -12,6 +12,7 @@ use Illuminate\Queue\InteractsWithQueue;
 use Illuminate\Queue\SerializesModels;
 use Illuminate\Support\Facades\Http;
 use Illuminate\Support\Facades\Log;
+use Illuminate\Support\Facades\Mail;
 
 class ReplicateProductCreateToShop implements ShouldQueue
 {
@@ -29,87 +30,114 @@ class ReplicateProductCreateToShop implements ShouldQueue
 
     public function handle(): void
     {
-        $target = Shop::findOrFail($this->targetShopId);
+        try {
+            $target = Shop::findOrFail($this->targetShopId);
 
-        [$productGid, $productLegacyId, $variantMap] = $this->productCreate($target, $this->payload);
+            $metaDescription = $this->fetchSourceMetaDescription();
 
-        // Save product mapping (mirror)
-        $pm = ProductMirror::updateOrCreate(
-            [
+            [$productGid, $productLegacyId, $variantMap] = $this->productCreate($target, $this->payload, $metaDescription);
+
+            // Save product mapping (mirror)
+            $pm = ProductMirror::updateOrCreate(
+                [
+                    'source_shop_id'    => $this->sourceShopId,
+                    'source_product_id' => $this->sourceProductId,
+                    'target_shop_id'    => $target->id,
+                ],
+                [
+                    'source_product_gid' => "gid://shopify/Product/{$this->sourceProductId}",
+                    'target_product_gid' => $productGid,
+                    'target_product_id'  => $productLegacyId,
+                ]
+            );
+
+            $mirror = ProductMirror::where([
                 'source_shop_id'    => $this->sourceShopId,
                 'source_product_id' => $this->sourceProductId,
                 'target_shop_id'    => $target->id,
-            ],
-            [
-                'source_product_gid' => "gid://shopify/Product/{$this->sourceProductId}",
-                'target_product_gid' => $productGid,
-                'target_product_id'  => $productLegacyId,
-            ]
-        );
+            ])->first();
 
-        $mirror = ProductMirror::where([
-            'source_shop_id'    => $this->sourceShopId,
-            'source_product_id' => $this->sourceProductId,
-            'target_shop_id'    => $target->id,
-        ])->first();
+            if ($mirror) {
+                $snap = is_array($mirror->last_snapshot ?? null)
+                    ? $mirror->last_snapshot
+                    : (is_string($mirror->last_snapshot) ? (json_decode($mirror->last_snapshot, true) ?: []) : []);
 
-        if ($mirror) {
-            $snap = is_array($mirror->last_snapshot ?? null)
-                ? $mirror->last_snapshot
-                : (is_string($mirror->last_snapshot) ? (json_decode($mirror->last_snapshot, true) ?: []) : []);
+                $imgs = $this->extractSourceImages($this->payload);
+                $snap['images'] = $imgs;
+                $snap['images_fingerprint'] = $this->fingerprintImages($imgs);
 
-            $imgs = $this->extractSourceImages($this->payload);
-            $snap['images'] = $imgs;
-            $snap['images_fingerprint'] = $this->fingerprintImages($imgs);
-
-            $mirror->last_snapshot = $snap;
-            $mirror->save();
-        }
-
-        // Save variant mappings (mirrors)
-        if (!empty($variantMap)) {
-            foreach ($variantMap as $vm) {
-                VariantMirror::updateOrCreate(
-                    [
-                        'product_mirror_id' => $pm->id,
-                        'source_variant_id' => $vm['source_variant_id'], // may be null in some edge payloads
-                    ],
-                    [
-                        'source_options_key'    => $vm['source_options_key'],
-                        'target_variant_gid'    => $vm['target_variant_gid'],
-                        'target_variant_id'     => $vm['target_variant_id'],
-                        'inventory_item_gid'    => $vm['inventory_item_gid'] ?? null,
-                        'last_snapshot'         => $vm['snapshot'],
-                        'variant_fingerprint'   => hash('sha256', json_encode([
-                            'price'   => $vm['snapshot']['price']   ?? null,
-                            'sku'     => $vm['snapshot']['sku']     ?? null,
-                            'barcode' => $vm['snapshot']['barcode'] ?? null,
-                        ])),
-                        'inventory_fingerprint' => hash('sha256', json_encode([
-                            'qty' => $vm['snapshot']['qty'] ?? null,
-                        ])),
-                    ]
-                );
+                $mirror->last_snapshot = $snap;
+                $mirror->save();
             }
-        }
 
-        Log::info('Replicated product to target shop', [
-            'target'            => $target->domain,
-            'target_gid'        => $productGid,
-            'target_id'         => $productLegacyId,
-            'source_product_id' => $this->sourceProductId,
-            'variants_mapped'   => count($variantMap ?? []),
-        ]);
+            // Save variant mappings (mirrors)
+            if (!empty($variantMap)) {
+                foreach ($variantMap as $vm) {
+                    VariantMirror::updateOrCreate(
+                        [
+                            'product_mirror_id' => $pm->id,
+                            'source_variant_id' => $vm['source_variant_id'], // may be null in some edge payloads
+                        ],
+                        [
+                            'source_options_key'    => $vm['source_options_key'],
+                            'target_variant_gid'    => $vm['target_variant_gid'],
+                            'target_variant_id'     => $vm['target_variant_id'],
+                            'inventory_item_gid'    => $vm['inventory_item_gid'] ?? null,
+                            'last_snapshot'         => $vm['snapshot'],
+                            'variant_fingerprint'   => hash('sha256', json_encode([
+                                'price'   => $vm['snapshot']['price']   ?? null,
+                                'sku'     => $vm['snapshot']['sku']     ?? null,
+                                'barcode' => $vm['snapshot']['barcode'] ?? null,
+                            ])),
+                            'inventory_fingerprint' => hash('sha256', json_encode([
+                                'qty' => $vm['snapshot']['qty'] ?? null,
+                            ])),
+                        ]
+                    );
+                }
+            }
 
-        // Optional: publish the product to all sales channels configured on the target shop
-        try {
-            $this->publishProductToAllChannels($target, $productGid);
-        } catch (\Throwable $e) {
-            Log::warning('Publish to channels failed (non-fatal)', [
-                'target' => $target->domain,
-                'productGid' => $productGid,
-                'error' => $e->getMessage(),
+            Log::info('Replicated product to target shop', [
+                'target'            => $target->domain,
+                'target_gid'        => $productGid,
+                'target_id'         => $productLegacyId,
+                'source_product_id' => $this->sourceProductId,
+                'variants_mapped'   => count($variantMap ?? []),
             ]);
+
+            // Optional: publish the product to all sales channels configured on the target shop
+            try {
+                $this->publishProductToAllChannels($target, $productGid);
+            } catch (\Throwable $e) {
+                Log::warning('Publish to channels failed (non-fatal)', [
+                    'target' => $target->domain,
+                    'productGid' => $productGid,
+                    'error' => $e->getMessage(),
+                ]);
+            }
+        } catch (\Throwable $e) {
+            Log::error('Product replication failed', [
+                'source_shop_id'    => $this->sourceShopId,
+                'target_shop_id'    => $this->targetShopId,
+                'source_product_id' => $this->sourceProductId,
+                'message'           => $e->getMessage(),
+            ]);
+
+            try {
+                Mail::raw(
+                    "Product replication failed for source product {$this->sourceProductId} (source shop {$this->sourceShopId}, target shop {$this->targetShopId}).\nError: {$e->getMessage()}",
+                    function ($message) {
+                        $message->to('mitnickoff121@gmail.com')
+                            ->subject('Product replication failed');
+                    }
+                );
+            } catch (\Throwable $mailException) {
+                Log::error('Failed to send replication failure notification', [
+                    'error' => $mailException->getMessage(),
+                ]);
+            }
+
+            throw $e;
         }
     }
 
@@ -140,7 +168,7 @@ class ReplicateProductCreateToShop implements ShouldQueue
      *
      * @return array [$productGid, $productLegacyId, $variantMap]
      */
-    private function productCreate(Shop $shop, array $sourcePayload): array
+    private function productCreate(Shop $shop, array $sourcePayload, ?string $metaDescription = null): array
     {
         $title           = $sourcePayload['title'] ?? 'Untitled';
         $descriptionHtml = $sourcePayload['body_html'] ?? null;
@@ -193,7 +221,7 @@ class ReplicateProductCreateToShop implements ShouldQueue
         }
 
         // Update simple product fields
-        $this->updateProductFields($shop, $productGid, $sourcePayload);
+        $this->updateProductFields($shop, $productGid, $sourcePayload, $metaDescription);
 
         // Multi-variant or single?
         $hasOptions  = !empty($sourcePayload['options']);
@@ -448,6 +476,96 @@ class ReplicateProductCreateToShop implements ShouldQueue
         ]);
     }
 
+    private function fetchSourceMetaDescription(): ?string
+    {
+        try {
+            $source = Shop::find($this->sourceShopId);
+            if (!$source) {
+                Log::warning('Meta description fetch skipped: missing source shop', [
+                    'source_shop_id'    => $this->sourceShopId,
+                    'source_product_id' => $this->sourceProductId,
+                ]);
+                return null;
+            }
+
+            $productGid = 'gid://shopify/Product/' . $this->sourceProductId;
+            $query = <<<'GQL'
+            query($id: ID!) {
+              product(id: $id) {
+                seo { description }
+                metafield(namespace: "global", key: "description_tag") { value }
+              }
+            }
+            GQL;
+
+            $res = $this->gql($source, $query, ['id' => $productGid]);
+            $seoDesc  = $res['data']['product']['seo']['description'] ?? null;
+            $metaDesc = $res['data']['product']['metafield']['value'] ?? null;
+
+            $description = null;
+            if (is_string($seoDesc) && trim($seoDesc) !== '') {
+                $description = trim($seoDesc);
+            } elseif (is_string($metaDesc) && trim($metaDesc) !== '') {
+                $description = trim($metaDesc);
+            }
+
+            Log::info('Source product meta description', [
+                'source_shop_id'    => $this->sourceShopId,
+                'source_product_id' => $this->sourceProductId,
+                'meta_description'  => $description,
+            ]);
+
+            return $description;
+        } catch (\Throwable $e) {
+            Log::warning('Meta description fetch failed', [
+                'source_shop_id'    => $this->sourceShopId,
+                'source_product_id' => $this->sourceProductId,
+                'error'             => $e->getMessage(),
+            ]);
+            return null;
+        }
+    }
+
+    private function setMetaDescriptionMetafield(Shop $shop, string $productGid, string $description): void
+    {
+        try {
+            $mutation = <<<'GQL'
+            mutation($metafields: [MetafieldsSetInput!]!) {
+              metafieldsSet(metafields: $metafields) {
+                metafields { id }
+                userErrors { field message }
+              }
+            }
+            GQL;
+
+            $vars = [
+                'metafields' => [[
+                    'ownerId'   => $productGid,
+                    'namespace' => 'global',
+                    'key'       => 'description_tag',
+                    'type'      => 'single_line_text_field',
+                    'value'     => $description,
+                ]],
+            ];
+
+            $res = $this->gql($shop, $mutation, $vars);
+            $ue  = $res['data']['metafieldsSet']['userErrors'] ?? [];
+            if (!empty($ue)) {
+                Log::warning('Meta description metafield userErrors', [
+                    'target_shop' => $shop->domain,
+                    'product_gid' => $productGid,
+                    'userErrors'  => $ue,
+                ]);
+            }
+        } catch (\Throwable $e) {
+            Log::warning('Meta description metafield update failed', [
+                'target_shop' => $shop->domain,
+                'product_gid' => $productGid,
+                'error'       => $e->getMessage(),
+            ]);
+        }
+    }
+
     /**
      * Fetch all publication IDs (GIDs) for a shop via GraphQL.
      * Returns an array of strings like gid://shopify/Publication/xxx
@@ -569,9 +687,12 @@ class ReplicateProductCreateToShop implements ShouldQueue
         }
     }
 
-    private function updateProductFields(Shop $shop, string $productGid, array $src): void
+    private function updateProductFields(Shop $shop, string $productGid, array $src, ?string $metaDescription = null): void
     {
         $tags = array_values(array_filter(array_map('trim', explode(',', (string)($src['tags'] ?? '')))));
+        if (!in_array('noutati', $tags, true)) {
+            $tags[] = 'noutati';
+        }
         $statusMap = ['active'=>'ACTIVE','draft'=>'DRAFT','archived'=>'ARCHIVED'];
         $status = null;
         if (!empty($src['status']) && isset($statusMap[strtolower($src['status'])])) {
@@ -587,12 +708,18 @@ class ReplicateProductCreateToShop implements ShouldQueue
         }
         GQL;
 
+        $seoInput = null;
+        if ($metaDescription !== null && $metaDescription !== '') {
+            $seoInput = ['description' => $metaDescription];
+        }
+
         $input = array_filter([
             'id'          => $productGid,
             'tags'        => $tags ?: null,
             'productType' => $src['product_type'] ?? null,
             'vendor'      => $src['vendor'] ?? null,
             'status'      => $status,
+            'seo'         => $seoInput,
         ], fn($v) => $v !== null && $v !== []);
 
         if (!$input) return;
@@ -600,6 +727,10 @@ class ReplicateProductCreateToShop implements ShouldQueue
         $res = $this->gql($shop, $mutation, ['product' => $input]);
         if (!empty($res['errors']) || !empty(($res['data']['productUpdate']['userErrors'] ?? []))) {
             Log::error('productUpdate errors', ['target' => $shop->domain, 'res' => $res]);
+        }
+
+        if ($seoInput) {
+            $this->setMetaDescriptionMetafield($shop, $productGid, $seoInput['description']);
         }
     }
 
