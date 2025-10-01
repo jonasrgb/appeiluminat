@@ -25,6 +25,13 @@ class ShopifyWebhookController extends Controller
         $webhookId = $request->header('X-Shopify-Webhook-Id');
         $payload = $request->json()->all();
 
+        Log::info('Shopify webhook received', [
+            'topic'      => $topic,
+            'shop'       => $shopDomain,
+            'webhook_id' => $webhookId,
+            'payload'    => $payload,
+        ]);
+
         if (!in_array($topic, $this->allowedTopics, true)) {
             Log::notice('Shopify webhook topic not allowed', [
                 'topic' => $topic,
@@ -56,75 +63,101 @@ class ShopifyWebhookController extends Controller
 
     public function createWebhook()
     {
-        $shopifyStore = env('SHOPIFY_SHOP_EILUMINAT_URL');
-        $accessToken = env('ACCESS_TOKEN_ADMIN_EILUMINAT');
+        $shopifyStore = 'eiluminat.myshopify.com'; // doar domeniul, fără https://
+        $accessToken  = env('ACCESS_TOKEN_ADMIN_EILUMINAT');
 
         if (!$shopifyStore || !$accessToken) {
             Log::error('Missing Shopify credentials in .env file.');
             return response()->json(['error' => 'Shopify credentials are missing'], 500);
         }
 
-        $client = new Client();
-        $url = "https://$shopifyStore/admin/api/2025-01/graphql.json";
+        $client = new \GuzzleHttp\Client();
+        $url    = "https://{$shopifyStore}/admin/api/2025-01/graphql.json";
 
         $query = <<<'GRAPHQL'
         mutation webhookSubscriptionCreate(
-          $topic: WebhookSubscriptionTopic!,
-          $webhookSubscription: WebhookSubscriptionInput!
+        $topic: WebhookSubscriptionTopic!,
+        $webhookSubscription: WebhookSubscriptionInput!
         ) {
-          webhookSubscriptionCreate(
+        webhookSubscriptionCreate(
             topic: $topic,
             webhookSubscription: $webhookSubscription
-          ) {
+        ) {
             webhookSubscription {
-              id
-              endpoint {
+            id
+            format
+            includeFields
+            metafieldNamespaces
+            filter
+            endpoint {
                 __typename
-                ... on WebhookHttpEndpoint {
-                  callbackUrl
-                }
-              }
-              format
+                ... on WebhookHttpEndpoint { callbackUrl }
+            }
             }
             userErrors {
-              field
-              message
+            field
+            message
             }
-          }
+        }
         }
         GRAPHQL;
 
+
         $variables = [
-            "topic" => "PRODUCTS_UPDATE",
-            "webhookSubscription" => [
-                "callbackUrl" => "https://coolify.lustreled.ro/api/webhooks/shopify/update",
-                "format" => "JSON",
-                "metafieldNamespaces" => ["custom"],
-                "filter" => "metafields.namespace:custom AND metafields.key:trigger AND metafields.value:true"
-            ]
+        "topic" => "PRODUCTS_UPDATE",
+        "webhookSubscription" => [
+            "callbackUrl" => "https://coolify.lustreled.ro/api/webhooks/shopify/update",
+            "format" => "JSON",
+            "metafieldNamespaces" => ["custom"],
+            "filter" => "metafields.namespace:custom AND metafields.key:trigger AND metafields.value:true"
+        
+        ]
         ];
 
         try {
             $response = $client->post($url, [
                 'headers' => [
-                    'Content-Type'  => 'application/json',
-                    'X-Shopify-Access-Token' => $accessToken
+                    'Content-Type'            => 'application/json',
+                    'X-Shopify-Access-Token'  => $accessToken,
                 ],
                 'json' => [
-                    'query' => $query,
-                    'variables' => $variables
-                ]
+                    'query'     => $query,
+                    'variables' => $variables,
+                ],
+                'timeout' => 15,
+                'connect_timeout' => 5,
             ]);
 
-            $body = json_decode($response->getBody(), true);
+            $body = json_decode((string) $response->getBody(), true) ?: [];
 
-            // Log response
-            Log::info('Shopify Webhook Response:', $body);
+            // tratează erorile GraphQL (top-level) sau userErrors din mutație
+            if (!empty($body['errors'])) {
+                Log::error('Shopify Webhook GraphQL errors', $body['errors']);
+                return response()->json([
+                    'success' => false,
+                    'message' => 'GraphQL error',
+                    'errors'  => $body['errors'],
+                ], 422);
+            }
 
-            return response()->json($body);
-        } catch (\Exception $e) {
-            Log::error('Shopify Webhook Error: ' . $e->getMessage());
+            $create = $body['data']['webhookSubscriptionCreate'] ?? null;
+            if ($create && !empty($create['userErrors'])) {
+                Log::error('Shopify Webhook userErrors', $create['userErrors']);
+                return response()->json([
+                    'success'    => false,
+                    'message'    => 'Webhook not created',
+                    'userErrors' => $create['userErrors'],
+                ], 422);
+            }
 
+            Log::info('Shopify Webhook created', $body);
+            return response()->json([
+                'success' => true,
+                'data'    => $body['data']['webhookSubscriptionCreate']['webhookSubscription'] ?? null,
+            ]);
+
+        } catch (\Throwable $e) {
+            Log::error('Shopify Webhook Error: ' . $e->getMessage(), ['trace' => $e->getTraceAsString()]);
             return response()->json(['error' => $e->getMessage()], 500);
         }
     }
@@ -201,7 +234,8 @@ class ShopifyWebhookController extends Controller
 
             return response()->json([
                 'success' => true,
-                'webhooks' => $webhooks
+                'webhooks' => $webhooks,
+                'raw' => $body,
             ]);
 
         } catch (\Exception $e) {

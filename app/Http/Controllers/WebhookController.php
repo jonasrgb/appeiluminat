@@ -314,7 +314,6 @@ class WebhookController extends Controller
                             endpoint {
                                 __typename
                                 ... on WebhookHttpEndpoint { callbackUrl }
-                                ... on EventBridgeWebhookEndpoint { arn }
                             }
                         }
                     }
@@ -351,7 +350,6 @@ class WebhookController extends Controller
                     'format' => $n['format'] ?? null,
                     'delivery_method' => $delivery,
                     'callback_url' => $delivery === 'WebhookHttpEndpoint' ? ($n['endpoint']['callbackUrl'] ?? null) : null,
-                    'arn' => $delivery === 'EventBridgeWebhookEndpoint' ? ($n['endpoint']['arn'] ?? null) : null,
                 ];
             }, $edges);
 
@@ -359,7 +357,8 @@ class WebhookController extends Controller
 
             return response()->json([
                 'success' => true,
-                'webhooks' => $webhooks
+                'webhooks' => $webhooks,
+                'raw' => $body,
             ]);
 
         } catch (\Exception $e) {
