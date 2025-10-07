@@ -123,8 +123,8 @@ class ProcessShopifyWebhook implements ShouldQueue
         $variables = [
             'metafields' => [[
                 'ownerId'  => $productGid,
-                'namespace'=> 'custom',
-                'key'      => 'trigger',
+                'namespace'=> 'dont',
+                'key'      => 'trigger2',
                 'type'     => 'boolean',
                 'value'    => 'false',
             ]]
