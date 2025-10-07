@@ -31,6 +31,8 @@ public function handle(): void
 {
     $target = Shop::findOrFail($this->targetShopId);
 
+    $metaDescription = $this->fetchMetaDescriptionFromSource();
+
     $mirror = ProductMirror::where([
         'source_shop_id'    => $this->sourceShopId,
         'target_shop_id'    => $this->targetShopId,
@@ -619,6 +621,10 @@ public function handle(): void
     $mirror->last_snapshot = $newSnap;
     $mirror->save();
 
+    if ($metaDescription !== null && $metaDescription !== '') {
+        $this->applyMetaDescriptionToTarget($target, $mirror->target_product_gid, $metaDescription);
+    }
+
     Log::info('Replicate update done', [
         'target_shop' => $target->domain,
         'target_gid'  => $mirror->target_product_gid,
@@ -936,6 +942,129 @@ public function handle(): void
         if (!$gid) return null;
         $pos = strrpos($gid, '/');
         return $pos === false ? null : substr($gid, $pos + 1);
+    }
+
+
+    private function fetchMetaDescriptionFromSource(): ?string
+    {
+        try {
+            $source = Shop::find($this->sourceShopId);
+            if (!$source) {
+                Log::warning('Meta description fetch skipped: missing source shop (update job)', [
+                    'source_shop_id'    => $this->sourceShopId,
+                    'source_product_id' => $this->sourceProductId,
+                ]);
+                return null;
+            }
+
+            $productGid = 'gid://shopify/Product/' . $this->sourceProductId;
+            $query = <<<'GQL'
+            query($id: ID!) {
+              product(id: $id) {
+                seo { description }
+                metafield(namespace: "global", key: "description_tag") { value }
+              }
+            }
+            GQL;
+
+            $res = $this->gql($source, $query, ['id' => $productGid]);
+            $seoDesc  = $res['data']['product']['seo']['description'] ?? null;
+            $metaDesc = $res['data']['product']['metafield']['value'] ?? null;
+
+            $description = null;
+            if (is_string($seoDesc) && trim($seoDesc) !== '') {
+                $description = trim($seoDesc);
+            } elseif (is_string($metaDesc) && trim($metaDesc) !== '') {
+                $description = trim($metaDesc);
+            }
+
+            Log::info('Source product meta description (update job)', [
+                'source_shop_id'    => $this->sourceShopId,
+                'source_product_id' => $this->sourceProductId,
+                'meta_description'  => $description,
+            ]);
+
+            return $description;
+        } catch (\Throwable $e) {
+            Log::warning('Meta description fetch failed (update job)', [
+                'source_shop_id'    => $this->sourceShopId,
+                'source_product_id' => $this->sourceProductId,
+                'error'             => $e->getMessage(),
+            ]);
+            return null;
+        }
+    }
+
+    private function applyMetaDescriptionToTarget(Shop $shop, string $productGid, string $description): void
+    {
+        try {
+            $mutation = <<<'GQL'
+            mutation($product: ProductUpdateInput!) {
+              productUpdate(product: $product) {
+                product { id }
+                userErrors { field message }
+              }
+            }
+            GQL;
+
+            $input = [
+                'id' => $productGid,
+                'seo' => ['description' => $description],
+            ];
+
+            $res = $this->gql($shop, $mutation, ['product' => $input]);
+            $ue  = $res['data']['productUpdate']['userErrors'] ?? [];
+            if (!empty($ue)) {
+                Log::warning('Meta description SEO update userErrors (update job)', [
+                    'target_shop' => $shop->domain,
+                    'product_gid' => $productGid,
+                    'userErrors'  => $ue,
+                ]);
+            }
+        } catch (\Throwable $e) {
+            Log::warning('Meta description SEO update failed (update job)', [
+                'target_shop' => $shop->domain,
+                'product_gid' => $productGid,
+                'error'       => $e->getMessage(),
+            ]);
+        }
+
+        try {
+            $mutation = <<<'GQL'
+            mutation($metafields: [MetafieldsSetInput!]!) {
+              metafieldsSet(metafields: $metafields) {
+                metafields { id }
+                userErrors { field message }
+              }
+            }
+            GQL;
+
+            $vars = [
+                'metafields' => [[
+                    'ownerId'   => $productGid,
+                    'namespace' => 'global',
+                    'key'       => 'description_tag',
+                    'type'      => 'single_line_text_field',
+                    'value'     => $description,
+                ]],
+            ];
+
+            $res = $this->gql($shop, $mutation, $vars);
+            $ue  = $res['data']['metafieldsSet']['userErrors'] ?? [];
+            if (!empty($ue)) {
+                Log::warning('Meta description metafield userErrors (update job)', [
+                    'target_shop' => $shop->domain,
+                    'product_gid' => $productGid,
+                    'userErrors'  => $ue,
+                ]);
+            }
+        } catch (\Throwable $e) {
+            Log::warning('Meta description metafield update failed (update job)', [
+                'target_shop' => $shop->domain,
+                'product_gid' => $productGid,
+                'error'       => $e->getMessage(),
+            ]);
+        }
     }
 
     /**
