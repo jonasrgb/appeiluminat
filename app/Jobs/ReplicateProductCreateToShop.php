@@ -21,6 +21,15 @@ class ReplicateProductCreateToShop implements ShouldQueue
     public $tries = 5;
     public $backoff = [10, 30, 60, 120];
 
+    /**
+     * Manual collection IDs per target shop domain.
+     * TODO: move to config if the list grows/changing frequently.
+     */
+    private array $manualCollectionMap = [
+        'lustreled.myshopify.com'      => 'gid://shopify/Collection/622468399449',
+        'powerleds-ro.myshopify.com'   => 'gid://shopify/Collection/624000663891',
+    ];
+
     public function __construct(
         public int $targetShopId,
         public int $sourceShopId,
@@ -33,9 +42,17 @@ class ReplicateProductCreateToShop implements ShouldQueue
         try {
             $target = Shop::findOrFail($this->targetShopId);
 
+            Log::info('ReplicateProductCreate target shop debug', [
+                'target_shop_id'   => $this->targetShopId,
+                'target_shop_name' => $target->name ?? null,
+                'target_shop_domain' => $target->domain ?? null,
+            ]);
+
             $metaDescription = $this->fetchSourceMetaDescription();
 
             [$productGid, $productLegacyId, $variantMap] = $this->productCreate($target, $this->payload, $metaDescription);
+
+            $this->attachProductToManualCollection($target, $productGid);
 
             // Save product mapping (mirror)
             $pm = ProductMirror::updateOrCreate(
@@ -524,6 +541,64 @@ class ReplicateProductCreateToShop implements ShouldQueue
             ]);
             return null;
         }
+    }
+
+    private function attachProductToManualCollection(Shop $shop, string $productGid): void
+    {
+        $collectionId = $this->manualCollectionIdForDomain($shop->domain ?? null);
+        if (!$collectionId) {
+            return;
+        }
+
+        $mutation = <<<'GQL'
+        mutation AddProductToCollection($collectionId: ID!, $productIds: [ID!]!) {
+          collectionAddProducts(id: $collectionId, productIds: $productIds) {
+            userErrors { field message }
+          }
+        }
+        GQL;
+
+        try {
+            $res = $this->gql($shop, $mutation, [
+                'collectionId' => $collectionId,
+                'productIds'   => [$productGid],
+            ]);
+
+            $top = $res['errors'] ?? [];
+            $ue  = $res['data']['collectionAddProducts']['userErrors'] ?? [];
+            if (!empty($top) || !empty($ue)) {
+                Log::warning('collectionAddProducts issues', [
+                    'target_shop'   => $shop->domain,
+                    'collection_id' => $collectionId,
+                    'product_gid'   => $productGid,
+                    'errors'        => $top,
+                    'user_errors'   => $ue,
+                ]);
+            } else {
+                Log::info('Product added to manual collection', [
+                    'target_shop'   => $shop->domain,
+                    'collection_id' => $collectionId,
+                    'product_gid'   => $productGid,
+                ]);
+            }
+        } catch (\Throwable $e) {
+            Log::error('collectionAddProducts exception', [
+                'target_shop'   => $shop->domain,
+                'collection_id' => $collectionId,
+                'product_gid'   => $productGid,
+                'error'         => $e->getMessage(),
+            ]);
+        }
+    }
+
+    private function manualCollectionIdForDomain(?string $domain): ?string
+    {
+        if (!$domain) {
+            return null;
+        }
+
+        $key = strtolower($domain);
+        return $this->manualCollectionMap[$key] ?? null;
     }
 
     private function setMetaDescriptionMetafield(Shop $shop, string $productGid, string $description): void
