@@ -25,12 +25,12 @@ class ShopifyWebhookController extends Controller
         $webhookId = $request->header('X-Shopify-Webhook-Id');
         $payload = $request->json()->all();
 
-        Log::info('Shopify webhook received', [
-            'topic'      => $topic,
-            'shop'       => $shopDomain,
-            'webhook_id' => $webhookId,
-            'payload'    => $payload,
-        ]);
+        // Log::info('Shopify webhook received', [
+        //     'topic'      => $topic,
+        //     'shop'       => $shopDomain,
+        //     'webhook_id' => $webhookId,
+        //     'payload'    => $payload,
+        // ]);
 
         if (!in_array($topic, $this->allowedTopics, true)) {
             Log::notice('Shopify webhook topic not allowed', [
