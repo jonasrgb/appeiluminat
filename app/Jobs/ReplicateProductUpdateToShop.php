@@ -20,6 +20,25 @@ class ReplicateProductUpdateToShop implements ShouldQueue
     public $tries = 5;
     public $backoff = [10, 30, 60, 120];
 
+    private const META_NAMESPACE = 'custom';
+
+    /** @var array<int, string> */
+    private const META_KEYS = [
+        'forma',
+        'tip_camera',
+        'dimensiunea_camerei',
+        'model',
+        'culoare_carcasa_finisaj',
+        'tip_de_lumina',
+        'functionalitati',
+        'tip_rama',
+        'dimensiune',
+        'tip',
+    ];
+
+    /** @var array<string, array|null> */
+    private array $targetMetaobjectCache = [];
+
     public function __construct(
         public int $targetShopId,
         public int $sourceShopId,
@@ -616,6 +635,15 @@ public function handle(): void
         }
     }
 
+    if ($mirror->target_product_gid) {
+        $this->syncMetaobjectMetafields(
+            source: $source,
+            target: $target,
+            sourceProductGid: 'gid://shopify/Product/' . $this->sourceProductId,
+            targetProductGid: $mirror->target_product_gid,
+        );
+    }
+
     // === 4) Snapshot nou ===
     $newSnap = $this->normalizeProductSnapshot($this->payload);
     $mirror->last_snapshot = $newSnap;
@@ -646,6 +674,464 @@ public function handle(): void
 
         $resp->throw();
         return $resp->json();
+    }
+
+    private function syncMetaobjectMetafields(?Shop $source, Shop $target, string $sourceProductGid, string $targetProductGid): void
+    {
+        if (!$source) {
+            // Log::warning('Metafield sync skipped: missing source shop', [
+            //     'target_shop' => $target->domain,
+            //     'source_product_gid' => $sourceProductGid,
+            // ]);
+            return;
+        }
+
+        $sourceMeta = $this->fetchSourceMetaobjectData($source, $sourceProductGid);
+        if ($sourceMeta === null) {
+            return;
+        }
+
+        $sourceProductId = $this->numericIdFromGid($sourceProductGid);
+        $targetProductId = $this->numericIdFromGid($targetProductGid);
+
+        $targetMapping = $this->resolveTargetMetaobjects($target, $sourceMeta['metaobjectsByKey']);
+
+        // Log::info('Target metaobject mapping snapshot', [
+        //     'source_shop'         => $source->domain,
+        //     'target_shop'         => $target->domain,
+        //     'source_product_gid'  => $sourceProductGid,
+        //     'source_product_id'   => $sourceProductId,
+        //     'target_product_gid'  => $targetProductGid,
+        //     'target_product_id'   => $targetProductId,
+        //     'mapping'             => $targetMapping['mapping'],
+        // ]);
+
+        $clearInputs = [];
+        foreach (self::META_KEYS as $key) {
+            $clearInputs[] = [
+                'ownerId'   => $targetProductGid,
+                'namespace' => self::META_NAMESPACE,
+                'key'       => $key,
+                'type'      => 'list.metaobject_reference',
+                'value'     => '[]',
+            ];
+        }
+
+        $clearMutation = <<<'GQL'
+        mutation clearMetaobjectReferences($metafields: [MetafieldsSetInput!]!) {
+          metafieldsSet(metafields: $metafields) {
+            userErrors { field message }
+          }
+        }
+        GQL;
+
+        try {
+            $clearResponse = $this->gql($target, $clearMutation, ['metafields' => $clearInputs]);
+        } catch (\Throwable $e) {
+            Log::error('Metafield sync failed: exception during clear step', [
+                'target_shop' => $target->domain,
+                'error'       => $e->getMessage(),
+            ]);
+            return;
+        }
+
+        if (!empty($clearResponse['errors']) || !empty($clearResponse['data']['metafieldsSet']['userErrors'] ?? [])) {
+            Log::error('Metafield sync failed: errors during clear step', [
+                'target_shop' => $target->domain,
+                'errors'      => $clearResponse['errors'] ?? null,
+                'userErrors'  => $clearResponse['data']['metafieldsSet']['userErrors'] ?? [],
+            ]);
+            return;
+        }
+
+        // Log::info('Metafields cleared on target shop', [
+        //     'target_shop'        => $target->domain,
+        //     'target_product_gid' => $targetProductGid,
+        //     'target_product_id'  => $targetProductId,
+        //     'cleared_keys'       => self::META_KEYS,
+        // ]);
+
+        $metafieldsInput = [];
+        $metafieldsLog   = [];
+
+        foreach (self::META_KEYS as $key) {
+            $ids = $targetMapping['idsByKey'][$key] ?? [];
+            if (empty($ids)) {
+                if (!empty($sourceMeta['metaobjectsByKey'][$key])) {
+                    // Log::warning('Metafield sync missing target metaobject', [
+                    //     'target_shop' => $target->domain,
+                    //     'metafield'   => $key,
+                    // ]);
+                }
+                continue;
+            }
+
+            $uniqueIds = array_values(array_unique($ids));
+            $metafieldsInput[] = [
+                'ownerId'   => $targetProductGid,
+                'namespace' => self::META_NAMESPACE,
+                'key'       => $key,
+                'type'      => 'list.metaobject_reference',
+                'value'     => json_encode($uniqueIds, JSON_UNESCAPED_SLASHES),
+            ];
+
+            $metafieldsLog[$key] = $uniqueIds;
+        }
+
+        if (empty($metafieldsInput)) {
+            // Log::info('Metafield sync skipped: no target IDs to set after clear', [
+            //     'target_shop' => $target->domain,
+            //     'target_product_gid' => $targetProductGid,
+            // ]);
+            return;
+        }
+
+        $mutation = <<<'GQL'
+        mutation setMetaobjectReferences($metafields: [MetafieldsSetInput!]!) {
+          metafieldsSet(metafields: $metafields) {
+            metafields { id namespace key value type }
+            userErrors { field message }
+          }
+        }
+        GQL;
+
+        try {
+            $response = $this->gql($target, $mutation, ['metafields' => $metafieldsInput]);
+        } catch (\Throwable $e) {
+            Log::error('Metafield sync failed: exception during metafieldsSet', [
+                'target_shop' => $target->domain,
+                'error'       => $e->getMessage(),
+            ]);
+            return;
+        }
+
+        if (!empty($response['errors'])) {
+            Log::error('Metafield sync failed: GraphQL errors on target', [
+                'target_shop' => $target->domain,
+                'errors'      => $response['errors'],
+            ]);
+            return;
+        }
+
+        $userErrors = $response['data']['metafieldsSet']['userErrors'] ?? [];
+        if (!empty($userErrors)) {
+            Log::error('Metafield sync failed: userErrors on target', [
+                'target_shop' => $target->domain,
+                'userErrors'  => $userErrors,
+            ]);
+            return;
+        }
+
+        // Log::info('Metafields synced to target shop', [
+        //     'target_shop'        => $target->domain,
+        //     'target_product_gid' => $targetProductGid,
+        //     'target_product_id'  => $targetProductId,
+        //     'metafields'         => $metafieldsLog,
+        // ]);
+    }
+
+    private function fetchSourceMetaobjectData(Shop $source, string $productGid): ?array
+    {
+        $selections = [];
+        foreach (self::META_KEYS as $key) {
+            $selections[] = sprintf(
+                '%1$s: metafield(namespace: "%2$s", key: "%3$s") { value type }',
+                $key,
+                self::META_NAMESPACE,
+                $key
+            );
+        }
+
+        $query = sprintf(
+            <<<'GQL'
+            query SourceMetafields($id: ID!) {
+              product(id: $id) {
+                %s
+              }
+            }
+            GQL,
+            implode("\n                ", $selections)
+        );
+
+        try {
+            $result = $this->gql($source, $query, ['id' => $productGid]);
+        } catch (\Throwable $e) {
+            // Log::warning('Source metafield fetch failed: exception', [
+            //     'source_shop' => $source->domain,
+            //     'product_gid' => $productGid,
+            //     'error'       => $e->getMessage(),
+            // ]);
+            return null;
+        }
+
+        if (!empty($result['errors'])) {
+            // Log::warning('Source metafield fetch failed: GraphQL errors', [
+            //     'source_shop' => $source->domain,
+            //     'product_gid' => $productGid,
+            //     'errors'      => $result['errors'],
+            // ]);
+            return null;
+        }
+
+        $productNode = $result['data']['product'] ?? null;
+        if (!$productNode) {
+            // Log::warning('Source metafield fetch: product node missing', [
+            //     'source_shop' => $source->domain,
+            //     'product_gid' => $productGid,
+            // ]);
+            return null;
+        }
+
+        $rawMetafields          = [];
+        $referencesByKey        = [];
+        $metaobjectIdsAggregate = [];
+
+        foreach (self::META_KEYS as $key) {
+            $node  = $productNode[$key] ?? null;
+            $value = $node['value'] ?? null;
+            $type  = (string)($node['type'] ?? '');
+
+            $rawMetafields[$key] = $value;
+
+            if (!is_string($value) || $value === '' || $type === '' || !str_contains($type, 'metaobject_reference')) {
+                continue;
+            }
+
+            $decoded = json_decode($value, true);
+            if (json_last_error() === JSON_ERROR_NONE) {
+                if (is_array($decoded)) {
+                    $ids = array_values(array_filter(array_map('strval', $decoded)));
+                } elseif (is_string($decoded)) {
+                    $ids = [$decoded];
+                } else {
+                    $ids = [];
+                }
+            } else {
+                $ids = [trim($value)];
+            }
+
+            $filtered = array_values(array_filter($ids, fn($id) => is_string($id) && $id !== ''));
+            if (!$filtered) {
+                continue;
+            }
+
+            $referencesByKey[$key] = $filtered;
+            foreach ($filtered as $gid) {
+                $metaobjectIdsAggregate[$gid] = true;
+            }
+        }
+
+        $resolvedMetaobjects = [];
+        if (!empty($metaobjectIdsAggregate)) {
+            $metaobjectIds = array_values(array_keys($metaobjectIdsAggregate));
+
+            $metaobjectQuery = <<<'GQL'
+            query SourceMetaobjects($ids: [ID!]!) {
+              nodes(ids: $ids) {
+                ... on Metaobject {
+                  id
+                  type
+                  handle
+                  displayName
+                  fields {
+                    key
+                    value
+                  }
+                }
+              }
+            }
+            GQL;
+
+            try {
+                $metaobjectResult = $this->gql($source, $metaobjectQuery, ['ids' => $metaobjectIds]);
+            } catch (\Throwable $e) {
+                // Log::warning('Source metaobject fetch failed: exception', [
+                //     'source_shop' => $source->domain,
+                //     'error'       => $e->getMessage(),
+                // ]);
+                $metaobjectResult = null;
+            }
+
+            if ($metaobjectResult) {
+                if (!empty($metaobjectResult['errors'])) {
+                    // Log::warning('Source metaobject fetch failed: GraphQL errors', [
+                    //     'source_shop' => $source->domain,
+                    //     'errors'      => $metaobjectResult['errors'],
+                    // ]);
+                }
+
+                foreach ($metaobjectResult['data']['nodes'] ?? [] as $node) {
+                    if (!$node || !is_array($node)) {
+                        continue;
+                    }
+
+                    $id = $node['id'] ?? null;
+                    if (!$id) {
+                        continue;
+                    }
+
+                    $fieldsAssoc = [];
+                    foreach ($node['fields'] ?? [] as $field) {
+                        $fieldKey = $field['key'] ?? null;
+                        if ($fieldKey === null) {
+                            continue;
+                        }
+                        $fieldsAssoc[$fieldKey] = $field['value'] ?? null;
+                    }
+
+                    $resolvedMetaobjects[$id] = array_filter([
+                        'id'          => $id,
+                        'type'        => $node['type'] ?? null,
+                        'handle'      => $node['handle'] ?? null,
+                        'displayName' => $node['displayName'] ?? null,
+                        'fields'      => $fieldsAssoc ?: null,
+                    ], fn($v) => $v !== null && $v !== []);
+                }
+            }
+        }
+
+        $metaobjectsByKey = [];
+        foreach (self::META_KEYS as $key) {
+            if (!empty($referencesByKey[$key])) {
+                $metaobjectsByKey[$key] = array_map(
+                    fn($gid) => $resolvedMetaobjects[$gid] ?? ['id' => $gid],
+                    $referencesByKey[$key]
+                );
+            } else {
+                $metaobjectsByKey[$key] = null;
+            }
+        }
+
+        $productId = $this->numericIdFromGid($productGid);
+
+        // Log::info('Shopify product metafields snapshot', [
+        //     'shop_domain'        => $source->domain,
+        //     'product_gid'        => $productGid,
+        //     'product_id'         => $productId,
+        //     'metafields_raw'     => $rawMetafields,
+        //     'metafields_resolved'=> $metaobjectsByKey,
+        // ]);
+
+        return [
+            'raw'              => $rawMetafields,
+            'metaobjectsByKey' => $metaobjectsByKey,
+        ];
+    }
+
+    private function resolveTargetMetaobjects(Shop $target, array $metaobjectsByKey): array
+    {
+        $idsByKey = [];
+        $mapping  = [];
+
+        foreach ($metaobjectsByKey as $key => $entries) {
+            if (!is_array($entries) || empty($entries)) {
+                $mapping[$key] = [];
+                continue;
+            }
+
+            foreach ($entries as $entry) {
+                $type      = $entry['type'] ?? null;
+                $handle    = $entry['handle'] ?? null;
+                $sourceId  = $entry['id'] ?? null;
+                $targetMeta = null;
+                $status     = 'mapped';
+
+                if ($type && $handle) {
+                    $targetMeta = $this->fetchTargetMetaobjectByHandle($target, $type, $handle);
+                    if ($targetMeta && !empty($targetMeta['id'])) {
+                        $idsByKey[$key][] = $targetMeta['id'];
+                    } else {
+                        $status = 'not_found';
+                    }
+                } else {
+                    $status = 'missing_type_or_handle';
+                }
+
+                $mapping[$key][] = [
+                    'source_id'           => $sourceId,
+                    'type'                => $type,
+                    'handle'              => $handle,
+                    'target_id'           => $targetMeta['id'] ?? null,
+                    'target_handle'       => $targetMeta['handle'] ?? null,
+                    'target_display_name' => $targetMeta['displayName'] ?? null,
+                    'status'              => $status,
+                ];
+            }
+        }
+
+        return [
+            'idsByKey' => $idsByKey,
+            'mapping'  => $mapping,
+        ];
+    }
+
+    private function fetchTargetMetaobjectByHandle(Shop $shop, string $type, string $handle): ?array
+    {
+        $cacheKey = strtolower($type).'|'.strtolower($handle);
+        if (array_key_exists($cacheKey, $this->targetMetaobjectCache)) {
+            return $this->targetMetaobjectCache[$cacheKey];
+        }
+
+        $query = <<<'GQL'
+        query TargetMetaobjectByHandle($handle: MetaobjectHandleInput!) {
+          metaobjectByHandle(handle: $handle) {
+            id
+            type
+            handle
+            displayName
+            fields {
+              key
+              value
+            }
+          }
+        }
+        GQL;
+
+        try {
+            $result = $this->gql($shop, $query, ['handle' => ['type' => $type, 'handle' => $handle]]);
+        } catch (\Throwable $e) {
+            // Log::warning('Target metaobject lookup failed: exception', [
+            //     'target_shop' => $shop->domain,
+            //     'type'        => $type,
+            //     'handle'      => $handle,
+            //     'error'       => $e->getMessage(),
+            // ]);
+            return $this->targetMetaobjectCache[$cacheKey] = null;
+        }
+
+        if (!empty($result['errors'])) {
+            // Log::warning('Target metaobject lookup failed: GraphQL errors', [
+            //     'target_shop' => $shop->domain,
+            //     'type'        => $type,
+            //     'handle'      => $handle,
+            //     'errors'      => $result['errors'],
+            // ]);
+            return $this->targetMetaobjectCache[$cacheKey] = null;
+        }
+
+        $node = $result['data']['metaobjectByHandle'] ?? null;
+        if (!$node) {
+            return $this->targetMetaobjectCache[$cacheKey] = null;
+        }
+
+        $fieldsAssoc = [];
+        foreach ($node['fields'] ?? [] as $field) {
+            $fieldKey = $field['key'] ?? null;
+            if ($fieldKey === null) {
+                continue;
+            }
+            $fieldsAssoc[$fieldKey] = $field['value'] ?? null;
+        }
+
+        $normalized = array_filter([
+            'id'          => $node['id'] ?? null,
+            'type'        => $node['type'] ?? null,
+            'handle'      => $node['handle'] ?? null,
+            'displayName' => $node['displayName'] ?? null,
+            'fields'      => $fieldsAssoc ?: null,
+        ], fn($v) => $v !== null && $v !== []);
+
+        return $this->targetMetaobjectCache[$cacheKey] = $normalized;
     }
 
     // === Product-level ===
