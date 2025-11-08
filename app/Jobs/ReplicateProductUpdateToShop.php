@@ -34,6 +34,7 @@ class ReplicateProductUpdateToShop implements ShouldQueue
         'tip_rama',
         'dimensiune',
         'tip',
+        'fasung'
     ];
 
     /** @var array<string, array|null> */
@@ -696,15 +697,15 @@ public function handle(): void
 
         $targetMapping = $this->resolveTargetMetaobjects($target, $sourceMeta['metaobjectsByKey']);
 
-        // Log::info('Target metaobject mapping snapshot', [
-        //     'source_shop'         => $source->domain,
-        //     'target_shop'         => $target->domain,
-        //     'source_product_gid'  => $sourceProductGid,
-        //     'source_product_id'   => $sourceProductId,
-        //     'target_product_gid'  => $targetProductGid,
-        //     'target_product_id'   => $targetProductId,
-        //     'mapping'             => $targetMapping['mapping'],
-        // ]);
+        Log::info('Target metaobject mapping snapshot', [
+            'source_shop'         => $source->domain,
+            'target_shop'         => $target->domain,
+            'source_product_gid'  => $sourceProductGid,
+            'source_product_id'   => $sourceProductId,
+            'target_product_gid'  => $targetProductGid,
+            'target_product_id'   => $targetProductId,
+            'mapping'             => $targetMapping['mapping'],
+        ]);
 
         $clearInputs = [];
         foreach (self::META_KEYS as $key) {
@@ -744,12 +745,12 @@ public function handle(): void
             return;
         }
 
-        // Log::info('Metafields cleared on target shop', [
-        //     'target_shop'        => $target->domain,
-        //     'target_product_gid' => $targetProductGid,
-        //     'target_product_id'  => $targetProductId,
-        //     'cleared_keys'       => self::META_KEYS,
-        // ]);
+        Log::info('Metafields cleared on target shop', [
+            'target_shop'        => $target->domain,
+            'target_product_gid' => $targetProductGid,
+            'target_product_id'  => $targetProductId,
+            'cleared_keys'       => self::META_KEYS,
+        ]);
 
         $metafieldsInput = [];
         $metafieldsLog   = [];
@@ -758,10 +759,10 @@ public function handle(): void
             $ids = $targetMapping['idsByKey'][$key] ?? [];
             if (empty($ids)) {
                 if (!empty($sourceMeta['metaobjectsByKey'][$key])) {
-                    // Log::warning('Metafield sync missing target metaobject', [
-                    //     'target_shop' => $target->domain,
-                    //     'metafield'   => $key,
-                    // ]);
+                    Log::warning('Metafield sync missing target metaobject', [
+                        'target_shop' => $target->domain,
+                        'metafield'   => $key,
+                    ]);
                 }
                 continue;
             }
@@ -779,10 +780,10 @@ public function handle(): void
         }
 
         if (empty($metafieldsInput)) {
-            // Log::info('Metafield sync skipped: no target IDs to set after clear', [
-            //     'target_shop' => $target->domain,
-            //     'target_product_gid' => $targetProductGid,
-            // ]);
+            Log::info('Metafield sync skipped: no target IDs to set after clear', [
+                'target_shop' => $target->domain,
+                'target_product_gid' => $targetProductGid,
+            ]);
             return;
         }
 

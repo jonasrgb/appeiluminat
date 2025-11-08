@@ -4,7 +4,7 @@ use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Route;
 use App\Http\Controllers\ShopifyOrderController;
 use App\Http\Controllers\ShopifyWebhookController;
-
+use App\Http\Controllers\ShopifyCustomerController; 
 /*
 |--------------------------------------------------------------------------
 | API Routes
@@ -29,3 +29,4 @@ Route::post('/webhooks/shopify', [ShopifyWebhookController::class, 'handle'])
 
 Route::post('/webhooks/shopify/update', [ShopifyWebhookController::class, 'handle'])
     ->middleware('shopify.webhook:products/update');
+
