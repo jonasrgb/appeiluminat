@@ -209,6 +209,7 @@ public function handle(): void
         }
     }
 
+    $updateSucceeded = false;
     Log::info('Replicate update start', [
         'target_shop' => $target->domain,
         'target_gid'  => $mirror->target_product_gid,
@@ -223,152 +224,146 @@ public function handle(): void
         $lastSnap = [];
     }
 
-    $productDiff = $this->computeProductDiff($this->payload, $lastSnap);
-    if (!empty($productDiff)) {
-        $this->productUpdate($target, $mirror->target_product_gid, $productDiff);
-        Log::info('Product core updated', ['fields' => array_keys($productDiff)]);
-    } else {
-        Log::info('Product core no-op (no changes)');
-    }
+    try {
+    $productDiff = $this->computeProductDiff($this->payload);
+        if (!empty($productDiff)) {
+            $this->productUpdate($target, $mirror->target_product_gid, $productDiff);
+            Log::info('Product core updated', ['fields' => array_keys($productDiff)]);
+        } else {
+            Log::info('Product core no-op (no changes)');
+        }
 
-    // === 1.1) Options diff (raport) ===
-    $srcOptions = $this->normalizeOptionsFromPayload($this->payload);
-    $currOptFp  = $this->optionsFingerprint($srcOptions);
-    $prevOptFp  = $lastSnap['options_fingerprint'] ?? null;
+        // === 1.1) Options diff (raport) ===
+        $srcOptions = $this->normalizeOptionsFromPayload($this->payload);
+        $currOptFp  = $this->optionsFingerprint($srcOptions);
+        $prevOptFp  = $lastSnap['options_fingerprint'] ?? null;
 
-    if ($currOptFp !== $prevOptFp) {
-        Log::info('Options changed → syncing', [
-            'target_shop' => $target->domain,
-            'names'       => array_map(fn($o) => $o['name'], $srcOptions),
+        if ($currOptFp !== $prevOptFp) {
+            Log::info('Options changed → syncing', [
+                'target_shop' => $target->domain,
+                'names'       => array_map(fn($o) => $o['name'], $srcOptions),
+            ]);
+            // lăsăm doar raport aici; crearea efectivă doar dacă target are "Default Title"
+        } else {
+            Log::info('Options unchanged, skipping', ['target_shop' => $target->domain]);
+        }
+
+        // === 1.2) Variant diff (raport) ===
+        $variantDiff = $this->computeVariantDiff($this->payload, $mirror, $srcOptions);
+        Log::info('Variant diff report', [
+            'toCreate' => array_keys($variantDiff['toCreate']),
+            'toUpdate' => array_keys($variantDiff['toUpdate']),
+            'toDelete' => array_keys($variantDiff['toDelete']),
         ]);
-        // lăsăm doar raport aici; crearea efectivă doar dacă target are "Default Title"
-    } else {
-        Log::info('Options unchanged, skipping', ['target_shop' => $target->domain]);
-    }
 
-    // === 1.2) Variant diff (raport) ===
-    $variantDiff = $this->computeVariantDiff($this->payload, $mirror, $srcOptions);
-    Log::info('Variant diff report', [
-        'toCreate' => array_keys($variantDiff['toCreate']),
-        'toUpdate' => array_keys($variantDiff['toUpdate']),
-        'toDelete' => array_keys($variantDiff['toDelete']),
-    ]);
-
-    // === 2) Images diff (fingerprint) & sync ===
-    $srcImages = $this->extractSourceImages($this->payload);
-    $currFp    = $this->fingerprintImages($srcImages);
-    $prevFp    = $lastSnap['images_fingerprint'] ?? null;
-
-    if ($currFp !== $prevFp) {
-        Log::info('Images changed → syncing', [
+        // === 2) Images sync (always replace) ===
+        $srcImages = $this->extractSourceImages($this->payload);
+        Log::info('Images syncing (force replace)', [
             'target_shop' => $target->domain,
-            'changed'     => true,
+            'count'       => count($srcImages),
         ]);
         $this->syncImagesReplaceAll($target, $mirror->target_product_gid, $srcImages);
         Log::info('Images synced', [
             'target_shop' => $target->domain,
             'count'       => count($srcImages),
         ]);
-    } else {
-        Log::info('Images unchanged, skipping sync', ['target_shop' => $target->domain]);
-    }
 
-    // === 2.1) Dacă target are "Default Title", creăm schema de opțiuni (fără variante) ===
-    $desiredOptions = $this->buildOptionCreateInputsFromPayload($this->payload);
-    if (!empty($desiredOptions)) {
-        $targetOptions = $this->fetchTargetOptions($target, $mirror->target_product_gid);
+        // === 2.1) Dacă target are "Default Title", creăm schema de opțiuni (fără variante) ===
+        $desiredOptions = $this->buildOptionCreateInputsFromPayload($this->payload);
+        if (!empty($desiredOptions)) {
+            $targetOptions = $this->fetchTargetOptions($target, $mirror->target_product_gid);
 
-        $hasOnlyDefaultTitle = false;
-        if (count($targetOptions) === 1) {
-            $only = $targetOptions[0];
-            $name = strtolower($only['name'] ?? '');
-            $vals = array_map('strval', $only['values'] ?? []);
-            $hasOnlyDefaultTitle = ($name === 'title') || ($vals === ['Default Title']);
-        }
+            $hasOnlyDefaultTitle = false;
+            if (count($targetOptions) === 1) {
+                $only = $targetOptions[0];
+                $name = strtolower($only['name'] ?? '');
+                $vals = array_map('strval', $only['values'] ?? []);
+                $hasOnlyDefaultTitle = ($name === 'title') || ($vals === ['Default Title']);
+            }
 
-        if ($hasOnlyDefaultTitle) {
-            Log::info('Options changed → creating on target', [
-                'target_shop' => $target->domain,
-                'names' => array_map(fn($o) => $o['name'] ?? null, $desiredOptions),
-            ]);
-            $this->productOptionsCreate(
-                shop: $target,
-                productGid: $mirror->target_product_gid,
-                options: $desiredOptions,
-                variantStrategy: 'LEAVE_AS_IS'
-            );
-        } else {
-            Log::info('Options exist on target → applying set (rename/reorder/add/remove)', [
-                'target_shop' => $target->domain,
-                'names' => array_map(fn($o) => $o['name'] ?? null, $desiredOptions),
-            ]);
-            // Încercăm schema nouă productOptionsSet; dacă nu există în versiunea de API, logăm și continuăm fără a arunca.
-            try {
-                $this->productOptionsSet(
+            if ($hasOnlyDefaultTitle) {
+                Log::info('Options changed → creating on target', [
+                    'target_shop' => $target->domain,
+                    'names' => array_map(fn($o) => $o['name'] ?? null, $desiredOptions),
+                ]);
+                $this->productOptionsCreate(
                     shop: $target,
                     productGid: $mirror->target_product_gid,
                     options: $desiredOptions,
                     variantStrategy: 'LEAVE_AS_IS'
                 );
-            } catch (\Throwable $e) {
-                Log::warning('productOptionsSet unavailable or failed; options not updated via Set', [
+            } else {
+                Log::info('Options exist on target → applying set (rename/reorder/add/remove)', [
                     'target_shop' => $target->domain,
+                    'names' => array_map(fn($o) => $o['name'] ?? null, $desiredOptions),
+                ]);
+                // Încercăm schema nouă productOptionsSet; dacă nu există în versiunea de API, logăm și continuăm fără a arunca.
+                try {
+                    $this->productOptionsSet(
+                        shop: $target,
+                        productGid: $mirror->target_product_gid,
+                        options: $desiredOptions,
+                        variantStrategy: 'LEAVE_AS_IS'
+                    );
+                } catch (\Throwable $e) {
+                    Log::warning('productOptionsSet unavailable or failed; options not updated via Set', [
+                        'target_shop' => $target->domain,
+                        'error' => $e->getMessage(),
+                    ]);
+                }
+            }
+        }
+
+        // === 3) Variants: map + bulk economic + SKU/barcode (productSet) + inventory ===
+        $srcOptions   = $this->normalizeOptionsFromPayload($this->payload);
+        $srcVariants  = $this->normalizeSourceVariants($this->payload, $srcOptions);
+        $isDefaultProduct = $this->isDefaultProduct($srcOptions);
+
+        // Încearcă să recuperezi starea reală "tracked" din shop-ul sursă (pentru a replica Track quantity)
+        $source = Shop::find($this->sourceShopId);
+        $sourceTrackedByKey = [];
+        if ($source) {
+            try {
+                $sourceProductGid = 'gid://shopify/Product/' . $this->sourceProductId;
+                $sourceTrackedByKey = $this->fetchTrackedMapByKey(
+                    $source,
+                    $sourceProductGid,
+                    array_map(fn($o) => $o['name'], $srcOptions)
+                );
+            } catch (\Throwable $e) {
+                Log::warning('Source tracked fetch failed; using payload fallback', [
+                    'source_shop' => $source?->domain,
                     'error' => $e->getMessage(),
                 ]);
             }
         }
-    }
 
-    // === 3) Variants: map + bulk economic + SKU/barcode (productSet) + inventory ===
-    $srcOptions   = $this->normalizeOptionsFromPayload($this->payload);
-    $srcVariants  = $this->normalizeSourceVariants($this->payload, $srcOptions);
-    $isDefaultProduct = $this->isDefaultProduct($srcOptions);
+        // 3.0) Asigură maparea VariantMirror (prima rulare)
+        $this->ensureVariantMirrors($mirror, $target, $srcOptions, $srcVariants);
 
-    // Încearcă să recuperezi starea reală "tracked" din shop-ul sursă (pentru a replica Track quantity)
-    $source = Shop::find($this->sourceShopId);
-    $sourceTrackedByKey = [];
-    if ($source) {
-        try {
-            $sourceProductGid = 'gid://shopify/Product/' . $this->sourceProductId;
-            $sourceTrackedByKey = $this->fetchTrackedMapByKey(
-                $source,
-                $sourceProductGid,
-                array_map(fn($o) => $o['name'], $srcOptions)
-            );
-        } catch (\Throwable $e) {
-            Log::warning('Source tracked fetch failed; using payload fallback', [
-                'source_shop' => $source?->domain,
-                'error' => $e->getMessage(),
-            ]);
-        }
-    }
-
-    // 3.0) Asigură maparea VariantMirror (prima rulare)
-    $this->ensureVariantMirrors($mirror, $target, $srcOptions, $srcVariants);
-
-    // 3.0.1) Șterge variantele care nu mai există în sursă (toDelete)
-    if (!empty($variantDiff['toDelete'])) {
-        foreach ($variantDiff['toDelete'] as $rawKey => $vmDel) {
-            try {
-                $gid = $vmDel->target_variant_gid ?? null;
-                if (!$gid) continue;
-                $this->productVariantDelete($target, $gid);
-                // Curăță mirror-ul
-                $vmDel->delete();
-                Log::info('Variant deleted on target', [
-                    'target_shop' => $target->domain,
-                    'key'         => $this->canonKey($rawKey),
-                    'variant_gid' => $gid,
-                ]);
-            } catch (\Throwable $e) {
-                Log::error('Variant delete failed', [
-                    'target_shop' => $target->domain,
-                    'key'         => $rawKey,
-                    'error'       => $e->getMessage(),
-                ]);
+        // 3.0.1) Șterge variantele care nu mai există în sursă (toDelete)
+        if (!empty($variantDiff['toDelete'])) {
+            foreach ($variantDiff['toDelete'] as $rawKey => $vmDel) {
+                try {
+                    $gid = $vmDel->target_variant_gid ?? null;
+                    if (!$gid) continue;
+                    $this->productVariantDelete($target, $gid);
+                    // Curăță mirror-ul
+                    $vmDel->delete();
+                    Log::info('Variant deleted on target', [
+                        'target_shop' => $target->domain,
+                        'key'         => $this->canonKey($rawKey),
+                        'variant_gid' => $gid,
+                    ]);
+                } catch (\Throwable $e) {
+                    Log::error('Variant delete failed', [
+                        'target_shop' => $target->domain,
+                        'key'         => $rawKey,
+                        'error'       => $e->getMessage(),
+                    ]);
+                }
             }
         }
-    }
 
     // 3.0.2) Creează variante lipsă în target (toCreate) – folosind productVariantsBulkCreate (compatibil cu 2025-01)
     if (!empty($variantDiff['toCreate'])) {
@@ -465,14 +460,14 @@ public function handle(): void
 
     // 3.2) BULK economic (price/compareAt/taxable/inventoryPolicy [+ greutate dacă decizi în builder])
     $bulkUpdates = [];
-    foreach ($srcVariants as $key => $sv) {
-        $ckey = $this->canonKey($key);
-        $vm   = $mirrorByKey[$ckey] ?? null;
-        if (!$vm || empty($vm->target_variant_gid)) continue;
+    foreach ($variantDiff['toUpdate'] as $rawKey => $entry) {
+        $vm = $entry['mirror'] ?? null;
+        $sv = $entry['src'] ?? null;
+        if (!$vm || !$sv || empty($vm->target_variant_gid)) continue;
 
-        if ((string)$vm->variant_fingerprint !== (string)$sv['variant_fingerprint']) {
-            $inp = $this->buildVariantUpdateInput($vm->target_variant_gid, $sv);
-            if (!empty($inp)) $bulkUpdates[] = $inp;
+        $inp = $this->buildVariantUpdateInput($vm->target_variant_gid, $sv);
+        if (!empty($inp)) {
+            $bulkUpdates[] = $inp;
         }
     }
 
@@ -636,28 +631,32 @@ public function handle(): void
         }
     }
 
-    if ($mirror->target_product_gid) {
-        $this->syncMetaobjectMetafields(
-            source: $source,
-            target: $target,
-            sourceProductGid: 'gid://shopify/Product/' . $this->sourceProductId,
-            targetProductGid: $mirror->target_product_gid,
-        );
+        if ($mirror->target_product_gid) {
+            $this->syncMetaobjectMetafields(
+                source: $source,
+                target: $target,
+                sourceProductGid: 'gid://shopify/Product/' . $this->sourceProductId,
+                targetProductGid: $mirror->target_product_gid,
+            );
+        }
+
+        if ($metaDescription !== null && $metaDescription !== '') {
+            $this->applyMetaDescriptionToTarget($target, $mirror->target_product_gid, $metaDescription);
+        }
+
+        $updateSucceeded = true;
+
+        Log::info('Replicate update done', [
+            'target_shop' => $target->domain,
+            'target_gid'  => $mirror->target_product_gid,
+        ]);
+    } finally {
+        if ($updateSucceeded) {
+            $newSnap = $this->normalizeProductSnapshot($this->payload);
+            $mirror->last_snapshot = $newSnap;
+            $mirror->save();
+        }
     }
-
-    // === 4) Snapshot nou ===
-    $newSnap = $this->normalizeProductSnapshot($this->payload);
-    $mirror->last_snapshot = $newSnap;
-    $mirror->save();
-
-    if ($metaDescription !== null && $metaDescription !== '') {
-        $this->applyMetaDescriptionToTarget($target, $mirror->target_product_gid, $metaDescription);
-    }
-
-    Log::info('Replicate update done', [
-        'target_shop' => $target->domain,
-        'target_gid'  => $mirror->target_product_gid,
-    ]);
 }
 
 
@@ -1137,49 +1136,45 @@ public function handle(): void
 
     // === Product-level ===
 
-    private function computeProductDiff(array $payload, array $lastSnapshot): array
+    private function computeProductDiff(array $payload): array
     {
         $diff = [];
 
         // title
         $title = $payload['title'] ?? null;
-        if ($title !== null && ($lastSnapshot['title'] ?? null) !== $title) {
+        if ($title !== null) {
             $diff['title'] = $title;
         }
 
         // body_html -> descriptionHtml
         $desc = $payload['body_html'] ?? null;
-        if ($desc !== null && ($lastSnapshot['body_html'] ?? null) !== $desc) {
+        if ($desc !== null) {
             $diff['descriptionHtml'] = $desc;
         }
 
         // vendor
         $vendor = $payload['vendor'] ?? null;
-        if ($vendor !== null && ($lastSnapshot['vendor'] ?? null) !== $vendor) {
+        if ($vendor !== null) {
             $diff['vendor'] = $vendor;
         }
 
         // product_type -> productType
         $ptype = $payload['product_type'] ?? null;
-        if ($ptype !== null && ($lastSnapshot['product_type'] ?? null) !== $ptype) {
+        if ($ptype !== null) {
             $diff['productType'] = $ptype;
         }
 
         // tags (string comma) -> set
         if (array_key_exists('tags', $payload)) {
             $newTags = $this->splitTags($payload['tags'] ?? '');
-            $oldTags = $this->splitTags($lastSnapshot['tags'] ?? '');
-            if ($newTags !== $oldTags) {
-                $diff['tags'] = $newTags; // GraphQL acceptă array de stringuri
-            }
+            $diff['tags'] = $newTags;
         }
 
         // status (REST: active/draft/archived) -> enum
         if (array_key_exists('status', $payload)) {
             $map = ['active' => 'ACTIVE', 'draft' => 'DRAFT', 'archived' => 'ARCHIVED'];
             $new = $map[strtolower((string)$payload['status'])] ?? null;
-            $old = $map[strtolower((string)($lastSnapshot['status'] ?? ''))] ?? null;
-            if ($new && $new !== $old) {
+            if ($new) {
                 $diff['status'] = $new;
             }
         }
@@ -1976,7 +1971,6 @@ public function handle(): void
         $toUpdate = [];
         $toDelete = [];
 
-        // Create/Update
         foreach ($srcVariants as $key => $sv) {
             $mirror = $mirrorByKey[$key] ?? null;
             if (!$mirror) {
@@ -1984,20 +1978,20 @@ public function handle(): void
                 continue;
             }
 
-            $oldFp = (string)($mirror->variant_fingerprint ?? '');
-            if ($oldFp !== (string)$sv['variant_fingerprint']) {
-                $toUpdate[$key] = [
-                    'src'    => $sv,
-                    'mirror' => $mirror,
-                ];
-            }
-            // inventarul îl tratăm separat (M5), deci îl ignorăm în acest diff
-            unset($mirrorByKey[$key]); // consumat
+            $toUpdate[$key] = [
+                'src'    => $sv,
+                'mirror' => $mirror,
+            ];
+
+            unset($mirrorByKey[$key]);
         }
 
-        // Delete (ce a rămas în mirror și nu mai e în sursă)
-        foreach ($mirrorByKey as $key => $mirror) {
-            $toDelete[$key] = $mirror;
+        // Nu mai ștergem variante automat; orice orfan rămâne logged pentru analiză.
+        if (!empty($mirrorByKey)) {
+            Log::info('Variant mirrors without source counterparts (skipping delete)', [
+                'product_mirror_id' => $pm->id,
+                'keys'              => array_keys($mirrorByKey),
+            ]);
         }
 
         return compact('toCreate','toUpdate','toDelete');
