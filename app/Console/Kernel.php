@@ -26,6 +26,14 @@ class Kernel extends ConsoleKernel
         ->everyMinute()  
         ->withoutOverlapping() 
         ->runInBackground();  
+        $schedule->command('emails:sync-inbox-raw-powerleds')
+        ->everyMinute()  
+        ->withoutOverlapping() 
+        ->runInBackground();
+        $schedule->command('emails:sync-inbox-raw-industrial')
+        ->everyMinute()  
+        ->withoutOverlapping() 
+        ->runInBackground();  
     }
 
     /**

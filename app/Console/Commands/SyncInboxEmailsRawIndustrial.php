@@ -8,22 +8,22 @@ use Illuminate\Support\Facades\Log;
 use Illuminate\Support\Facades\Http;
 use Illuminate\Support\Facades\Mail;
 
-class SyncInboxEmailsRaw extends Command
+class SyncInboxEmailsRawIndustrial extends Command
 {
-    protected $signature = 'emails:sync-inbox-raw';
+    protected $signature = 'emails:sync-inbox-raw-industrial';
     protected $description = 'Proceseaza DOAR emailurile noi din INBOX (IMAP raw) si le afiseaza in log daca nu se incadreaza in regulile de ignorare';
 
     public function handle(): int
     {
         $this->info('Pornesc sync INBOX RAW (numai emailuri noi)...');
-        //Log::info('emails:sync-inbox-raw a pornit', ['time' => now()->toDateTimeString()]);
+        //Log::info('emails:sync-inbox-raw a pornit industrial', ['time' => now()->toDateTimeString()]);
         $delayMs = (int) env('MINICRM_DELAY_MS', 1000);
-        $forwardTo = trim((string) env('FORWARD_TO_EMAIL', ''));
+        $forwardTo = trim((string) env('FORWARD_TO_EMAIL_INDUSTRIAL', ''));
 
-        $host     = env('IMAP_HOST', 'imap.gmail.com');
-        $port     = (int) env('IMAP_PORT', 993);
-        $username = env('IMAP_USERNAME');
-        $password = env('IMAP_PASSWORD');
+        $host     = env('INDUSTRIAL_IMAP_HOST', env('IMAP_HOST', 'imap.gmail.com'));
+        $port     = (int) env('INDUSTRIAL_IMAP_PORT', env('IMAP_PORT', 993));
+        $username = env('INDUSTRIAL_IMAP_USERNAME', env('IMAP_USERNAME'));
+        $password = env('INDUSTRIAL_IMAP_PASSWORD', env('IMAP_PASSWORD'));
 
         $mailbox = sprintf('{%s:%d/imap/ssl}INBOX', $host, $port);
 
@@ -34,7 +34,7 @@ class SyncInboxEmailsRaw extends Command
             return self::FAILURE;
         }
 
-        $mailboxKey = 'gmail-INBOX';
+        $mailboxKey = 'gmail-INBOX-industrial';
 
         // salvam DOAR last_uid, nu emailurile
         $state = EmailSyncState::firstOrCreate(
