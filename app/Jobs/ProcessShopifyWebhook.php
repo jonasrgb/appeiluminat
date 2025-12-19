@@ -14,6 +14,7 @@ use App\Models\ProductMirror;
 use App\Jobs\ReplicateProductUpdateToShop;
 use Illuminate\Support\Facades\Log;
 use Illuminate\Support\Facades\Http;
+use App\Services\Shopify\ProductImagesBackupService;
 
 class ProcessShopifyWebhook implements ShouldQueue
 {
@@ -56,6 +57,8 @@ class ProcessShopifyWebhook implements ShouldQueue
         $sourceProductId = (int)($payload['id'] ?? 0);
         if (!$sourceProductId) return;
 
+        $this->backupSourceImages($sourceShop, $payload);
+
         $targets = ShopConnection::where('source_shop_id', $sourceShop->id)
             ->with('target')->get()->pluck('target')->filter(fn($s) => $s->is_active);
 
@@ -76,6 +79,8 @@ class ProcessShopifyWebhook implements ShouldQueue
             \Log::warning('fanOutUpdate: missing source product id', ['shop' => $sourceShop->domain]);
             return;
         }
+
+        $this->backupSourceImages($sourceShop, $payload);
 
         // 1) Doar pentru magazinul sursă: setează metafieldul custom.trigger=false ca să previi bucle
         try {
@@ -101,6 +106,65 @@ class ProcessShopifyWebhook implements ShouldQueue
             'targets'     => $targets->pluck('domain')->values(),
             'product_id'  => $sourceProductId,
         ]);
+    }
+
+    private function backupSourceImages(Shop $shop, array $payload): void
+    {
+        $productId = (int)($payload['id'] ?? 0);
+        $productGid = $payload['admin_graphql_api_id'] ?? ($productId ? "gid://shopify/Product/{$productId}" : null);
+
+        if (!$productGid) {
+            return;
+        }
+
+        $images = $this->extractImagesFromPayload($payload);
+        if (empty($images)) {
+            return;
+        }
+
+        ProductImagesBackupService::syncFromImages($shop, $productGid, $images);
+    }
+
+    /**
+     * @return array<int, array{position:int,url:string}>
+     */
+    private function extractImagesFromPayload(array $payload): array
+    {
+        $out = [];
+
+        if (!empty($payload['images']) && is_array($payload['images'])) {
+            foreach ($payload['images'] as $index => $img) {
+                $url = $img['src'] ?? null;
+                if (!$url) {
+                    continue;
+                }
+
+                $out[] = [
+                    'position' => (int)($img['position'] ?? ($index + 1)),
+                    'url' => $url,
+                ];
+            }
+        } elseif (!empty($payload['media']) && is_array($payload['media'])) {
+            foreach ($payload['media'] as $index => $entry) {
+                if (($entry['media_content_type'] ?? '') !== 'IMAGE') {
+                    continue;
+                }
+
+                $url = $entry['preview_image']['src'] ?? null;
+                if (!$url) {
+                    continue;
+                }
+
+                $out[] = [
+                    'position' => (int)($entry['position'] ?? ($index + 1)),
+                    'url' => $url,
+                ];
+            }
+        }
+
+        usort($out, fn ($a, $b) => $a['position'] <=> $b['position']);
+
+        return $out;
     }
 
     /**

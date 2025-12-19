@@ -13,6 +13,7 @@ use Illuminate\Queue\SerializesModels;
 use Illuminate\Support\Facades\Http;
 use Illuminate\Support\Facades\Log;
 use Illuminate\Support\Facades\Mail;
+use App\Services\Shopify\ProductImagesBackupService;
 
 class ReplicateProductCreateToShop implements ShouldQueue
 {
@@ -74,18 +75,22 @@ class ReplicateProductCreateToShop implements ShouldQueue
                 'target_shop_id'    => $target->id,
             ])->first();
 
+            $imgs = $this->extractSourceImages($this->payload);
+
             if ($mirror) {
                 $snap = is_array($mirror->last_snapshot ?? null)
                     ? $mirror->last_snapshot
                     : (is_string($mirror->last_snapshot) ? (json_decode($mirror->last_snapshot, true) ?: []) : []);
 
-                $imgs = $this->extractSourceImages($this->payload);
                 $snap['images'] = $imgs;
                 $snap['images_fingerprint'] = $this->fingerprintImages($imgs);
 
                 $mirror->last_snapshot = $snap;
                 $mirror->save();
             }
+
+            // Persist backup of images metadata into the target shop metafield
+            ProductImagesBackupService::syncFromImages($target, $productGid, $imgs);
 
             // Save variant mappings (mirrors)
             if (!empty($variantMap)) {
@@ -114,13 +119,13 @@ class ReplicateProductCreateToShop implements ShouldQueue
                 }
             }
 
-            Log::info('Replicated product to target shop', [
-                'target'            => $target->domain,
-                'target_gid'        => $productGid,
-                'target_id'         => $productLegacyId,
-                'source_product_id' => $this->sourceProductId,
-                'variants_mapped'   => count($variantMap ?? []),
-            ]);
+            // Log::info('Replicated product to target shop', [
+            //     'target'            => $target->domain,
+            //     'target_gid'        => $productGid,
+            //     'target_id'         => $productLegacyId,
+            //     'source_product_id' => $this->sourceProductId,
+            //     'variants_mapped'   => count($variantMap ?? []),
+            // ]);
 
             // Optional: publish the product to all sales channels configured on the target shop
             try {
@@ -467,12 +472,12 @@ class ReplicateProductCreateToShop implements ShouldQueue
             ]],
         ];
 
-        Log::info('Inventory setQuantities begin', [
-            'target_shop'     => $shop->domain,
-            'inventoryItemId' => $inventoryItemId,
-            'locationGid'     => $locationGid,
-            'quantity'        => $desired,
-        ]);
+        // Log::info('Inventory setQuantities begin', [
+        //     'target_shop'     => $shop->domain,
+        //     'inventoryItemId' => $inventoryItemId,
+        //     'locationGid'     => $locationGid,
+        //     'quantity'        => $desired,
+        // ]);
 
         $res = $this->gql($shop, $mutation, ['input' => $input]);
 
@@ -486,11 +491,11 @@ class ReplicateProductCreateToShop implements ShouldQueue
             throw new \RuntimeException('inventorySetQuantities userErrors: '.json_encode($ue));
         }
 
-        Log::info('inventorySetQuantities OK', [
-            'target_shop' => $shop->domain,
-            'changes'     => $res['data']['inventorySetQuantities']['inventoryAdjustmentGroup']['changes'] ?? null,
-            'reason'      => $res['data']['inventorySetQuantities']['inventoryAdjustmentGroup']['reason'] ?? null,
-        ]);
+        // Log::info('inventorySetQuantities OK', [
+        //     'target_shop' => $shop->domain,
+        //     'changes'     => $res['data']['inventorySetQuantities']['inventoryAdjustmentGroup']['changes'] ?? null,
+        //     'reason'      => $res['data']['inventorySetQuantities']['inventoryAdjustmentGroup']['reason'] ?? null,
+        // ]);
     }
 
     private function fetchSourceMetaDescription(): ?string
@@ -526,11 +531,11 @@ class ReplicateProductCreateToShop implements ShouldQueue
                 $description = trim($metaDesc);
             }
 
-            Log::info('Source product meta description', [
-                'source_shop_id'    => $this->sourceShopId,
-                'source_product_id' => $this->sourceProductId,
-                'meta_description'  => $description,
-            ]);
+            // Log::info('Source product meta description', [
+            //     'source_shop_id'    => $this->sourceShopId,
+            //     'source_product_id' => $this->sourceProductId,
+            //     'meta_description'  => $description,
+            // ]);
 
             return $description;
         } catch (\Throwable $e) {
@@ -575,11 +580,11 @@ class ReplicateProductCreateToShop implements ShouldQueue
                     'user_errors'   => $ue,
                 ]);
             } else {
-                Log::info('Product added to manual collection', [
-                    'target_shop'   => $shop->domain,
-                    'collection_id' => $collectionId,
-                    'product_gid'   => $productGid,
-                ]);
+                // Log::info('Product added to manual collection', [
+                //     'target_shop'   => $shop->domain,
+                //     'collection_id' => $collectionId,
+                //     'product_gid'   => $productGid,
+                // ]);
             }
         } catch (\Throwable $e) {
             Log::error('collectionAddProducts exception', [
@@ -703,11 +708,11 @@ class ReplicateProductCreateToShop implements ShouldQueue
                         'userErrors' => $ue,
                     ]);
                 } else {
-                    Log::info('Published product to publication', [
-                        'target' => $shop->domain,
-                        'product' => $productGid,
-                        'publication' => $pubId,
-                    ]);
+                    // Log::info('Published product to publication', [
+                    //     'target' => $shop->domain,
+                    //     'product' => $productGid,
+                    //     'publication' => $pubId,
+                    // ]);
                 }
             } catch (\Throwable $e) {
                 Log::error('publishablePublish exception', [

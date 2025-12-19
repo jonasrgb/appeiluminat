@@ -1460,11 +1460,11 @@ public function handle(): void
                 $description = trim($metaDesc);
             }
 
-            Log::info('Source product meta description (update job)', [
-                'source_shop_id'    => $this->sourceShopId,
-                'source_product_id' => $this->sourceProductId,
-                'meta_description'  => $description,
-            ]);
+            // Log::info('Source product meta description (update job)', [
+            //     'source_shop_id'    => $this->sourceShopId,
+            //     'source_product_id' => $this->sourceProductId,
+            //     'meta_description'  => $description,
+            // ]);
 
             return $description;
         } catch (\Throwable $e) {
