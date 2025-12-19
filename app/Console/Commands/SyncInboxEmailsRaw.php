@@ -16,7 +16,7 @@ class SyncInboxEmailsRaw extends Command
     public function handle(): int
     {
         $this->info('Pornesc sync INBOX RAW (numai emailuri noi)...');
-        //Log::info('emails:sync-inbox-raw a pornit', ['time' => now()->toDateTimeString()]);
+        Log::info('emails:sync-inbox-raw a pornit', ['time' => now()->toDateTimeString()]);
         $delayMs = (int) env('MINICRM_DELAY_MS', 1000);
         $forwardTo = trim((string) env('FORWARD_TO_EMAIL', ''));
 
@@ -215,7 +215,10 @@ class SyncInboxEmailsRaw extends Command
             'easybox@sameday.ro',
             'noreply@olx.ro',
             'noreply@conectx.net',
-            'no-reply@email.glovostore.com'
+            'no-reply@email.glovostore.com',
+            'no-reply@puratos.com',
+            'recommendations@explore.pinterest.com',
+            'no-reply@notifications.tiktok.com',
         ];
 
         // 1) daca e una din adresele exacte

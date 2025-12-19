@@ -215,7 +215,10 @@ class SyncInboxEmailsRawPowerleds extends Command
             'easybox@sameday.ro',
             'noreply@olx.ro',
             'noreply@conectx.net',
-            'no-reply@email.glovostore.com'
+            'no-reply@email.glovostore.com',
+            'no-reply@puratos.com',
+            'recommendations@explore.pinterest.com',
+            'no-reply@notifications.tiktok.com',
         ];
 
         // 1) daca e una din adresele exacte
