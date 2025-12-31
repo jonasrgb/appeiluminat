@@ -8,22 +8,22 @@ use Illuminate\Support\Facades\Log;
 use Illuminate\Support\Facades\Http;
 use Illuminate\Support\Facades\Mail;
 
-class SyncInboxEmailsRaw extends Command
+class SyncInboxEmailsRawEiluminat extends Command
 {
-    protected $signature = 'emails:sync-inbox-raw';
+    protected $signature = 'emails:sync-inbox-raw-eiluminat';
     protected $description = 'Proceseaza DOAR emailurile noi din INBOX (IMAP raw) si le afiseaza in log daca nu se incadreaza in regulile de ignorare';
 
     public function handle(): int
     {
         $this->info('Pornesc sync INBOX RAW (numai emailuri noi)...');
-        Log::info('emails:sync-inbox-raw a pornit', ['time' => now()->toDateTimeString()]);
+        Log::info('emails:sync-inbox-raw a pornit Eiluminat', ['time' => now()->toDateTimeString()]);
         $delayMs = (int) env('MINICRM_DELAY_MS', 1000);
-        $forwardTo = trim((string) env('FORWARD_TO_EMAIL', ''));
+        $forwardTo = trim((string) env('FORWARD_TO_EMAIL_EILUMINATL', ''));
 
-        $host     = env('IMAP_HOST', 'imap.gmail.com');
-        $port     = (int) env('IMAP_PORT', 993);
-        $username = env('IMAP_USERNAME');
-        $password = env('IMAP_PASSWORD');
+        $host     = env('EILUMINAT_IMAP_HOST', 'imap.gmail.com');
+        $port     = (int) env('EILUMINAT_IMAP_PORT', 993);
+        $username = env('EILUMINAT_IMAP_USERNAME', 'office@eiluminat.ro');
+        $password = env('EILUMINAT_IMAP_PASSWORD');
 
         $mailbox = sprintf('{%s:%d/imap/ssl}INBOX', $host, $port);
 
@@ -34,7 +34,7 @@ class SyncInboxEmailsRaw extends Command
             return self::FAILURE;
         }
 
-        $mailboxKey = 'gmail-INBOX';
+        $mailboxKey = 'Eiluminat-INBOX';
 
         // salvam DOAR last_uid, nu emailurile
         $state = EmailSyncState::firstOrCreate(
@@ -127,8 +127,8 @@ class SyncInboxEmailsRaw extends Command
             }
 
             // 2) DOAR pentru emailurile NE-ignorate citim body-ul
-            $body        = $this->getPlainTextBody($stream, $uid);
-            $attachments = $this->getAttachments($stream, $uid);
+            $body         = $this->getPlainTextBody($stream, $uid);
+            $attachments  = $this->getAttachments($stream, $uid);
 
             $processed++;
 
@@ -205,7 +205,9 @@ class SyncInboxEmailsRaw extends Command
             'lustreledro@gmail.com',
             'no-reply@loox.io',
             'mailer-daemon@googlemail.com',
+            'office@eiluminat.ro',
             'recommendations@discover.pinterest.com',
+            'store+60473671846@t.shopifyemail.com',
             // 'noreply@xconnector.app',
             'noreply@euplatesc.ro',
             'noreply@info.pinterest.com',
@@ -221,6 +223,7 @@ class SyncInboxEmailsRaw extends Command
             'recommendations@explore.pinterest.com',
             'no-reply@notifications.tiktok.com',
             'mailer@shopify.com',
+            'store+60473671846@t.shopifyemail.com',
         ];
 
         // 1) daca e una din adresele exacte
@@ -372,12 +375,12 @@ class SyncInboxEmailsRaw extends Command
     {
         $attachments = [];
 
-        $filename     = $this->getAttachmentFilename($part);
+        $filename = $this->getAttachmentFilename($part);
         $isAttachment = $filename !== null || (!isset($part->parts) && ($part->type ?? TYPETEXT) !== TYPETEXT);
 
         if ($isAttachment) {
-            $pn      = $partNumber !== '' ? $partNumber : '1';
-            $data    = imap_fetchbody($stream, (string) $uid, $pn, FT_UID);
+            $pn = $partNumber !== '' ? $partNumber : '1';
+            $data = imap_fetchbody($stream, (string) $uid, $pn, FT_UID);
             $content = $this->decodePartBody($data, $part->encoding ?? 0);
 
             if ($content !== null) {

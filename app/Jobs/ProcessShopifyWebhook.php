@@ -5,6 +5,8 @@ namespace App\Jobs;
 use App\Models\Shop;
 use App\Models\ShopConnection;
 use App\Models\ShopifyWebhookEvent;
+use App\Jobs\CoordinateSourceWatermark;
+use App\Models\ProductMediaProcess;
 use Illuminate\Bus\Queueable;
 use Illuminate\Contracts\Queue\ShouldQueue;
 use Illuminate\Foundation\Bus\Dispatchable;
@@ -45,6 +47,12 @@ class ProcessShopifyWebhook implements ShouldQueue
         $sourceShop = Shop::where('domain', $this->shopDomain)->where('is_source', true)->first();
         if (!$sourceShop) return;
 
+        // Log::info('ProcessShopifyWebhook payload', [
+        //     'topic' => $this->topic,
+        //     'shop'  => $this->shopDomain,
+        //     'payload' => $this->payload,
+        // ]);
+
         match ($this->topic) {
             'products/create' => $this->fanOutCreate($sourceShop, $this->payload),
             'products/update' => $this->fanOutUpdate($sourceShop, $this->payload),
@@ -59,6 +67,26 @@ class ProcessShopifyWebhook implements ShouldQueue
 
         $this->backupSourceImages($sourceShop, $payload);
 
+        $sourceImages = $this->extractImagesFromPayload($payload);
+        $sourceProductGid = $payload['admin_graphql_api_id'] ?? "gid://shopify/Product/{$sourceProductId}";
+
+        ProductMediaProcess::updateOrCreate(
+            [
+                'shop_domain' => $sourceShop->domain,
+                'product_id' => $sourceProductId,
+            ],
+            [
+                'shop_id' => $sourceShop->id,
+                'product_gid' => $sourceProductGid,
+                'status' => ProductMediaProcess::STATUS_PENDING,
+                'images_count' => count($sourceImages),
+                'processed_count' => 0,
+                'last_error' => null,
+                'started_at' => null,
+                'completed_at' => null,
+            ]
+        );
+
         $targets = ShopConnection::where('source_shop_id', $sourceShop->id)
             ->with('target')->get()->pluck('target')->filter(fn($s) => $s->is_active);
 
@@ -70,6 +98,13 @@ class ProcessShopifyWebhook implements ShouldQueue
                 $payload
             )->onQueue('replication');
         }
+
+        CoordinateSourceWatermark::dispatch(
+            sourceShopId: $sourceShop->id,
+            sourceProductId: $sourceProductId,
+            payload: $payload
+        )->delay(now()->addSeconds(60))
+         ->onQueue('watermarks');
     }
 
     protected function fanOutUpdate(Shop $sourceShop, array $payload): void

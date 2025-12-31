@@ -127,7 +127,8 @@ class SyncInboxEmailsRawIndustrial extends Command
             }
 
             // 2) DOAR pentru emailurile NE-ignorate citim body-ul
-            $body = $this->getPlainTextBody($stream, $uid);
+            $body        = $this->getPlainTextBody($stream, $uid);
+            $attachments = $this->getAttachments($stream, $uid);
 
             $processed++;
 
@@ -161,7 +162,7 @@ class SyncInboxEmailsRawIndustrial extends Command
             // }
 
             if (!empty($forwardTo)) {
-                $fwdOk = $this->forwardEmail($forwardTo, $fromEmail, $subject, $date, $body);
+                $fwdOk = $this->forwardEmail($forwardTo, $fromEmail, $subject, $date, $body, $attachments);
 
                 if ($fwdOk) {
                     $this->info('Forward trimis catre '.$forwardTo);
@@ -219,6 +220,7 @@ class SyncInboxEmailsRawIndustrial extends Command
             'no-reply@puratos.com',
             'recommendations@explore.pinterest.com',
             'no-reply@notifications.tiktok.com',
+            'mailer@shopify.com',
         ];
 
         // 1) daca e una din adresele exacte
@@ -355,12 +357,99 @@ class SyncInboxEmailsRawIndustrial extends Command
         }
     }
 
+    protected function getAttachments($stream, int $uid): array
+    {
+        $structure = imap_fetchstructure($stream, (string) $uid, FT_UID);
+
+        if (!$structure) {
+            return [];
+        }
+
+        return $this->extractAttachments($stream, $uid, $structure);
+    }
+
+    protected function extractAttachments($stream, int $uid, \stdClass $part, string $partNumber = ''): array
+    {
+        $attachments = [];
+
+        $filename     = $this->getAttachmentFilename($part);
+        $isAttachment = $filename !== null || (!isset($part->parts) && ($part->type ?? TYPETEXT) !== TYPETEXT);
+
+        if ($isAttachment) {
+            $pn      = $partNumber !== '' ? $partNumber : '1';
+            $data    = imap_fetchbody($stream, (string) $uid, $pn, FT_UID);
+            $content = $this->decodePartBody($data, $part->encoding ?? 0);
+
+            if ($content !== null) {
+                $attachments[] = [
+                    'filename' => $filename ?? 'attachment-'.$pn,
+                    'mime'     => $this->resolveMimeType($part),
+                    'content'  => $content,
+                ];
+            }
+        }
+
+        if (isset($part->parts) && is_array($part->parts)) {
+            foreach ($part->parts as $index => $subPart) {
+                $pn = $partNumber === '' ? (string) ($index + 1) : $partNumber.'.'.($index + 1);
+                $attachments = array_merge($attachments, $this->extractAttachments($stream, $uid, $subPart, $pn));
+            }
+        }
+
+        return $attachments;
+    }
+
+    protected function getAttachmentFilename(\stdClass $part): ?string
+    {
+        $filename = null;
+
+        if (!empty($part->ifdparameters) && isset($part->dparameters)) {
+            foreach ($part->dparameters as $param) {
+                if (strtolower($param->attribute ?? '') === 'filename' && !empty($param->value)) {
+                    $filename = $param->value;
+                    break;
+                }
+            }
+        }
+
+        if ($filename === null && !empty($part->ifparameters) && isset($part->parameters)) {
+            foreach ($part->parameters as $param) {
+                if (strtolower($param->attribute ?? '') === 'name' && !empty($param->value)) {
+                    $filename = $param->value;
+                    break;
+                }
+            }
+        }
+
+        return $filename ? imap_utf8($filename) : null;
+    }
+
+    protected function resolveMimeType(\stdClass $part): string
+    {
+        $types = [
+            TYPETEXT       => 'text',
+            TYPEMULTIPART  => 'multipart',
+            TYPEMESSAGE    => 'message',
+            TYPEAPPLICATION=> 'application',
+            TYPEAUDIO      => 'audio',
+            TYPEIMAGE      => 'image',
+            TYPEVIDEO      => 'video',
+            TYPEOTHER      => 'application',
+        ];
+
+        $primary = $types[$part->type ?? TYPEOTHER] ?? 'application';
+        $subtype = strtolower($part->subtype ?? 'octet-stream');
+
+        return $primary.'/'.$subtype;
+    }
+
     protected function forwardEmail(
         string $forwardTo,
         string $originalFrom,
         string $originalSubject,
         string $originalDate,
-        string $body
+        string $body,
+        array $attachments = []
     ): bool {
         try {
             // optional: adresa ta, doar pentru header "Sender" / tracking
@@ -370,13 +459,24 @@ class SyncInboxEmailsRawIndustrial extends Command
             $subject = $originalSubject;
             $text    = $body; // DOAR continutul original
 
-            Mail::raw($text, function ($message) use ($forwardTo, $originalFrom, $systemAddress, $systemName, $subject) {
+            Mail::raw($text, function ($message) use ($forwardTo, $originalFrom, $systemAddress, $systemName, $subject, $attachments) {
                 $message->to($forwardTo)
                     // cheie: CRM va considera acest "From" ca fiind clientul
                     ->from($originalFrom)
                     // optional: cine a facut redirect-ul
                     ->sender($systemAddress, $systemName)
                     ->subject($subject);
+
+                foreach ($attachments as $attachment) {
+                    if (empty($attachment['content'])) {
+                        continue;
+                    }
+
+                    $filename = $attachment['filename'] ?? 'attachment';
+                    $mime     = $attachment['mime'] ?? 'application/octet-stream';
+
+                    $message->attachData($attachment['content'], $filename, ['mime' => $mime]);
+                }
             });
 
             return true;

@@ -111,52 +111,63 @@ class RunCustomScript2 implements ShouldQueue
      */
     private function removeProductsFromCollection(array $productIds, $collectionId, $client)
     {
-        try {
-            $productGids = array_map(function ($productId) {
-                return 'gid://shopify/Product/' . $productId;
-            }, $productIds);
+        $chunks = array_chunk($productIds, 250);
+        $totalChunks = count($chunks);
 
-            $query = <<<GRAPHQL
-            mutation CollectionRemoveProducts(\$id: ID!, \$productIds: [ID!]!) {
-                collectionRemoveProducts(id: \$id, productIds: \$productIds) {
-                    job {
-                        done
-                        id
-                    }
-                    userErrors {
-                        field
-                        message
-                    }
-                }
+        foreach ($chunks as $index => $chunk) {
+            try {
+                $this->dispatchChunkRemoval($chunk, $collectionId, $client);
+                \Log::info('Products chunk removed from collection powerleds', [
+                    'chunk' => $index + 1,
+                    'of' => $totalChunks,
+                    'count' => count($chunk),
+                ]);
+            } catch (\Exception $e) {
+                \Log::error('Failed to remove chunk from collection: ' . $e->getMessage(), [
+                    'chunk' => $index + 1,
+                ]);
             }
-            GRAPHQL;
+        }
+    }
 
-            $variables = [
-                'id' => 'gid://shopify/Collection/' . $collectionId,
-                'productIds' => array_values($productGids),
-            ];
+    private function dispatchChunkRemoval(array $productIds, $collectionId, Client $client): void
+    {
+        $productGids = array_map(fn ($productId) => 'gid://shopify/Product/' . $productId, $productIds);
 
-            $response = $client->request('POST', 'graphql.json', [
-                'json' => ['query' => $query, 'variables' => $variables]
-            ]);
-
-            $statusCode = $response->getStatusCode();
-            $body = json_decode($response->getBody(), true);
-
-            if ($statusCode >= 400) {
-                throw new \Exception('Shopify GraphQL API returned error: ' . $statusCode);
+        $query = <<<GRAPHQL
+        mutation CollectionRemoveProducts(\$id: ID!, \$productIds: [ID!]!) {
+            collectionRemoveProducts(id: \$id, productIds: \$productIds) {
+                job { done id }
+                userErrors { field message }
             }
+        }
+        GRAPHQL;
 
-            if (!empty($body['errors'])) {
-                $errorMessages = array_map(function ($error) {
-                    return $error['message'];
-                }, $body['errors']);
-                throw new \Exception('GraphQL errors: ' . implode(', ', $errorMessages));
-            }
+        $variables = [
+            'id' => 'gid://shopify/Collection/' . $collectionId,
+            'productIds' => array_values($productGids),
+        ];
 
-            \Log::info('Products removed successfully from collection powerleds');
-        } catch (\Exception $e) {
-            \Log::error('Failed to remove products from collection: ' . $e->getMessage());
+        $response = $client->request('POST', 'graphql.json', [
+            'json' => ['query' => $query, 'variables' => $variables],
+        ]);
+
+        $statusCode = $response->getStatusCode();
+        $body = json_decode($response->getBody(), true);
+
+        if ($statusCode >= 400) {
+            throw new \Exception('Shopify GraphQL API returned error: ' . $statusCode);
+        }
+
+        if (!empty($body['errors'])) {
+            $errorMessages = array_map(fn ($error) => $error['message'], $body['errors']);
+            throw new \Exception('GraphQL errors: ' . implode(', ', $errorMessages));
+        }
+
+        $userErrors = $body['data']['collectionRemoveProducts']['userErrors'] ?? [];
+        if (!empty($userErrors)) {
+            $messages = array_map(fn ($error) => $error['message'] ?? 'Unknown error', $userErrors);
+            throw new \Exception('GraphQL user errors: ' . implode(', ', $messages));
         }
     }
 

@@ -29,6 +29,7 @@ class ReplicateProductCreateToShop implements ShouldQueue
     private array $manualCollectionMap = [
         'lustreled.myshopify.com'      => 'gid://shopify/Collection/622468399449',
         'powerleds-ro.myshopify.com'   => 'gid://shopify/Collection/624000663891',
+        'eiluminatbackup.myshopify.com'   =>   'gid://shopify/Collection/631556800884',
     ];
 
     public function __construct(

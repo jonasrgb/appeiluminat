@@ -31,6 +31,9 @@ class Kernel extends ConsoleKernel
         $schedule->command('emails:sync-inbox-raw-industrial')
         ->everyFiveMinutes()  
         ->withoutOverlapping();  
+        $schedule->command('emails:sync-inbox-raw-eiluminat')
+        ->everyFiveMinutes()  
+        ->withoutOverlapping(); 
     }
 
     /**

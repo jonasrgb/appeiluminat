@@ -16,5 +16,6 @@ class VerifyCsrfToken extends Middleware
          '/app/testwebhook',
          '/app/product-create',
          '/app/product-update',
+         '/webhooks/shopify/products',
     ];
 }

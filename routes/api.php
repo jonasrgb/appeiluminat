@@ -2,6 +2,7 @@
 
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Route;
+use App\Http\Controllers\MultiShopProductWebhookController;
 use App\Http\Controllers\ShopifyOrderController;
 use App\Http\Controllers\ShopifyWebhookController;
 use App\Http\Controllers\ShopifyCustomerController; 
@@ -30,3 +31,5 @@ Route::post('/webhooks/shopify', [ShopifyWebhookController::class, 'handle'])
 Route::post('/webhooks/shopify/update', [ShopifyWebhookController::class, 'handle'])
     ->middleware('shopify.webhook:products/update');
 
+Route::post('/webhooks/shopify/products', MultiShopProductWebhookController::class)
+    ->middleware('shopify.webhook');
