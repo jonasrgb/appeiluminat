@@ -23,21 +23,12 @@ class VerifyShopifyWebhook
             return response('', 204);
         }
 
-        // 1) Alege secretul în funcție de domeniu (fallback pe logica veche)
-        $shopSecrets = [
-            'eiluminat.myshopify.com'    => env('SHOPIFY_WEBHOOK_SECRET_EILUMINAT_BKP'),
-            'lustreled.myshopify.com'    => env('SHOPIFY_WEBHOOK_SECRET_LUSTRELED_BKP'),
-            'powerleds-ro.myshopify.com' => env('SHOPIFY_WEBHOOK_SECRET_POWERLED_BKP'),
-        ];
-        $secret = $shopSecrets[strtolower($shopDomain)] ?? null;
+        // 1) Alege secretul în funcție de topic (sau parametrul primit)
+        $isUpdate = $expectedTopic === 'products/update' || $topic === 'products/update';
 
-        if (!$secret) {
-            $isUpdate = $expectedTopic === 'products/update' || $topic === 'products/update';
-
-            $secret = $isUpdate
-                ? config('services.shopify.app_webhook_secret')            // bottom secret (Custom App)
-                : config('services.shopify.notifications_webhook_secret'); // Notifications secret
-        }
+        $secret = $isUpdate
+            ? config('services.shopify.app_webhook_secret')            // bottom secret (Custom App)
+            : config('services.shopify.notifications_webhook_secret'); // Notifications secret
 
         if (!$secret) {
             \Log::warning('Shopify webhook secret missing', compact('shopDomain','topic'));

@@ -70,14 +70,14 @@ public function handle(): void
                     if ($sku !== null && $sku !== '') $skus[] = (string)$sku;
                 }
             }
-            Log::notice('Mirror missing: auto-bootstrap feature enabled (dry-run may suppress writes)', [
-                'target_shop' => $target->domain,
-                'source_shop' => $this->sourceShopId,
-                'source_pid'  => $this->sourceProductId,
-                'dry_run'     => (bool)config('features.mirror_bootstrap.dry_run'),
-                'handle'      => $handle,
-                'skus'        => $skus,
-            ]);
+            // Log::notice('Mirror missing: auto-bootstrap feature enabled (dry-run may suppress writes)', [
+            //     'target_shop' => $target->domain,
+            //     'source_shop' => $this->sourceShopId,
+            //     'source_pid'  => $this->sourceProductId,
+            //     'dry_run'     => (bool)config('features.mirror_bootstrap.dry_run'),
+            //     'handle'      => $handle,
+            //     'skus'        => $skus,
+            // ]);
             // Read-only discovery (handle first, then SKUs). Always logs; no writes in this step.
             try {
                 $candidate = null;
@@ -210,11 +210,11 @@ public function handle(): void
     }
 
     $updateSucceeded = false;
-    Log::info('Replicate update start', [
-        'target_shop' => $target->domain,
-        'target_gid'  => $mirror->target_product_gid,
-        'source_pid'  => $this->sourceProductId,
-    ]);
+    // Log::info('Replicate update start', [
+    //     'target_shop' => $target->domain,
+    //     'target_gid'  => $mirror->target_product_gid,
+    //     'source_pid'  => $this->sourceProductId,
+    // ]);
 
     // === 1) Core product diff & patch ===
     $lastSnap = $mirror->last_snapshot;
@@ -239,34 +239,26 @@ public function handle(): void
         $prevOptFp  = $lastSnap['options_fingerprint'] ?? null;
 
         if ($currOptFp !== $prevOptFp) {
-            Log::info('Options changed → syncing', [
-                'target_shop' => $target->domain,
-                'names'       => array_map(fn($o) => $o['name'], $srcOptions),
-            ]);
+            // Log::info('Options changed → syncing', [
+            //     'target_shop' => $target->domain,
+            //     'names'       => array_map(fn($o) => $o['name'], $srcOptions),
+            // ]);
             // lăsăm doar raport aici; crearea efectivă doar dacă target are "Default Title"
         } else {
             Log::info('Options unchanged, skipping', ['target_shop' => $target->domain]);
         }
 
-        // === 1.2) Variant diff (raport) ===
-        $variantDiff = $this->computeVariantDiff($this->payload, $mirror, $srcOptions);
-        Log::info('Variant diff report', [
-            'toCreate' => array_keys($variantDiff['toCreate']),
-            'toUpdate' => array_keys($variantDiff['toUpdate']),
-            'toDelete' => array_keys($variantDiff['toDelete']),
-        ]);
-
         // === 2) Images sync (always replace) ===
         $srcImages = $this->extractSourceImages($this->payload);
-        Log::info('Images syncing (force replace)', [
-            'target_shop' => $target->domain,
-            'count'       => count($srcImages),
-        ]);
+        // Log::info('Images syncing (force replace)', [
+        //     'target_shop' => $target->domain,
+        //     'count'       => count($srcImages),
+        // ]);
         $this->syncImagesReplaceAll($target, $mirror->target_product_gid, $srcImages);
-        Log::info('Images synced', [
-            'target_shop' => $target->domain,
-            'count'       => count($srcImages),
-        ]);
+        // Log::info('Images synced', [
+        //     'target_shop' => $target->domain,
+        //     'count'       => count($srcImages),
+        // ]);
 
         // === 2.1) Dacă target are "Default Title", creăm schema de opțiuni (fără variante) ===
         $desiredOptions = $this->buildOptionCreateInputsFromPayload($this->payload);
@@ -340,6 +332,14 @@ public function handle(): void
 
         // 3.0) Asigură maparea VariantMirror (prima rulare)
         $this->ensureVariantMirrors($mirror, $target, $srcOptions, $srcVariants);
+
+        // 3.0.a) Recalculează difful acum că mirror-ul e sincronizat
+        $variantDiff = $this->computeVariantDiff($this->payload, $mirror, $srcOptions);
+        Log::info('Variant diff recalculated', [
+            'toCreate' => array_keys($variantDiff['toCreate']),
+            'toUpdate' => array_keys($variantDiff['toUpdate']),
+            'toDelete' => array_keys($variantDiff['toDelete']),
+        ]);
 
         // 3.0.1) Șterge variantele care nu mai există în sursă (toDelete)
         if (!empty($variantDiff['toDelete'])) {
@@ -527,11 +527,11 @@ public function handle(): void
     }
 
     if (!empty($variantsForSet)) {
-        Log::info('productSet variants payload (identities)', array_map(fn($s) => [
-            'id'      => $s['id'] ?? null,
-            'sku'     => $s['sku'] ?? null,
-            'barcode' => array_key_exists('barcode', $s) ? $s['barcode'] : '(not set)',
-        ], $variantsForSet));
+        // Log::info('productSet variants payload (identities)', array_map(fn($s) => [
+        //     'id'      => $s['id'] ?? null,
+        //     'sku'     => $s['sku'] ?? null,
+        //     'barcode' => array_key_exists('barcode', $s) ? $s['barcode'] : '(not set)',
+        // ], $variantsForSet));
 
         // Folosim helperul local productSet() care gestionează erorile
         $this->productSet($target, [
@@ -550,10 +550,10 @@ public function handle(): void
         // Preferăm starea din sursă (dacă am putut să o citim). Altfel, cădem pe payload.
         if (array_key_exists($ckey, $sourceTrackedByKey)) {
             $trackedWanted = (bool)$sourceTrackedByKey[$ckey];
-            Log::debug('Track qty: using source tracked state', [
-                'key' => $ckey,
-                'tracked' => $trackedWanted,
-            ]);
+            // Log::debug('Track qty: using source tracked state', [
+            //     'key' => $ckey,
+            //     'tracked' => $trackedWanted,
+            // ]);
         } else {
             $present = (bool)($sv['inventory_management_present'] ?? false);
             if (!$present) {
@@ -565,11 +565,11 @@ public function handle(): void
             }
             $imVal = strtolower((string)($sv['inventory_management'] ?? ''));
             $trackedWanted = ($imVal === 'shopify');
-            Log::debug('Track qty: using payload inventory_management', [
-                'key' => $ckey,
-                'value' => $sv['inventory_management'] ?? null,
-                'tracked' => $trackedWanted,
-            ]);
+            // Log::debug('Track qty: using payload inventory_management', [
+            //     'key' => $ckey,
+            //     'value' => $sv['inventory_management'] ?? null,
+            //     'tracked' => $trackedWanted,
+            // ]);
         }
         $trackedWantedByKey[$ckey] = $trackedWanted;
 
@@ -578,17 +578,17 @@ public function handle(): void
             // 3.35.1) InventoryItem.tracked este suficient în versiunea actuală de API pentru a reflecta checkbox-ul în Admin.
             // Unele versiuni nu expun productVariantUpdate/productVariantsUpdate, deci evităm apelul care produce erori.
             $invMgmt = $trackedWanted ? 'SHOPIFY' : 'NOT_MANAGED';
-            Log::debug('Track qty: skipping variant inventoryManagement mutation (unsupported on this API); relying on InventoryItem.tracked', [
-                'key' => $ckey,
-                'variant_gid' => $vm->target_variant_gid,
-                'inventoryManagement_intended' => $invMgmt,
-            ]);
+            // Log::debug('Track qty: skipping variant inventoryManagement mutation (unsupported on this API); relying on InventoryItem.tracked', [
+            //     'key' => $ckey,
+            //     'variant_gid' => $vm->target_variant_gid,
+            //     'inventoryManagement_intended' => $invMgmt,
+            // ]);
 
-            Log::debug('Track qty: applying', [
-                'key' => $ckey,
-                'inventory_management' => $sv['inventory_management'] ?? null,
-                'tracked' => $trackedWanted,
-            ]);
+            // Log::debug('Track qty: applying', [
+            //     'key' => $ckey,
+            //     'inventory_management' => $sv['inventory_management'] ?? null,
+            //     'tracked' => $trackedWanted,
+            // ]);
             $this->inventoryItemUpdate($target, $itemId, $trackedWanted);
         } else {
             Log::warning('Track qty: no inventoryItemId found', [
@@ -646,10 +646,10 @@ public function handle(): void
 
         $updateSucceeded = true;
 
-        Log::info('Replicate update done', [
-            'target_shop' => $target->domain,
-            'target_gid'  => $mirror->target_product_gid,
-        ]);
+        // Log::info('Replicate update done', [
+        //     'target_shop' => $target->domain,
+        //     'target_gid'  => $mirror->target_product_gid,
+        // ]);
     } finally {
         if ($updateSucceeded) {
             $newSnap = $this->normalizeProductSnapshot($this->payload);
@@ -696,15 +696,15 @@ public function handle(): void
 
         $targetMapping = $this->resolveTargetMetaobjects($target, $sourceMeta['metaobjectsByKey']);
 
-        Log::info('Target metaobject mapping snapshot', [
-            'source_shop'         => $source->domain,
-            'target_shop'         => $target->domain,
-            'source_product_gid'  => $sourceProductGid,
-            'source_product_id'   => $sourceProductId,
-            'target_product_gid'  => $targetProductGid,
-            'target_product_id'   => $targetProductId,
-            'mapping'             => $targetMapping['mapping'],
-        ]);
+        // Log::info('Target metaobject mapping snapshot', [
+        //     'source_shop'         => $source->domain,
+        //     'target_shop'         => $target->domain,
+        //     'source_product_gid'  => $sourceProductGid,
+        //     'source_product_id'   => $sourceProductId,
+        //     'target_product_gid'  => $targetProductGid,
+        //     'target_product_id'   => $targetProductId,
+        //     'mapping'             => $targetMapping['mapping'],
+        // ]);
 
         $clearInputs = [];
         foreach (self::META_KEYS as $key) {
@@ -744,12 +744,12 @@ public function handle(): void
             return;
         }
 
-        Log::info('Metafields cleared on target shop', [
-            'target_shop'        => $target->domain,
-            'target_product_gid' => $targetProductGid,
-            'target_product_id'  => $targetProductId,
-            'cleared_keys'       => self::META_KEYS,
-        ]);
+        // Log::info('Metafields cleared on target shop', [
+        //     'target_shop'        => $target->domain,
+        //     'target_product_gid' => $targetProductGid,
+        //     'target_product_id'  => $targetProductId,
+        //     'cleared_keys'       => self::META_KEYS,
+        // ]);
 
         $metafieldsInput = [];
         $metafieldsLog   = [];
@@ -1195,7 +1195,7 @@ public function handle(): void
 
         $input = array_merge(['id' => $targetProductGid], $patch);
 
-        Log::info('productUpdate payload', ['target' => $shop->domain, 'fields' => array_keys($patch)]);
+        //Log::info('productUpdate payload', ['target' => $shop->domain, 'fields' => array_keys($patch)]);
         $res = $this->gql($shop, $mutation, ['product' => $input]);
 
         if (!empty($res['errors'])) {
@@ -1583,11 +1583,11 @@ public function handle(): void
                         'body'     => $resp->body(),
                     ]);
                 } else {
-                    Log::info('REST deleted ProductImage', [
-                        'target'  => $shop->domain,
-                        'product' => $productId,
-                        'image'   => $imageId,
-                    ]);
+                    // Log::info('REST deleted ProductImage', [
+                    //     'target'  => $shop->domain,
+                    //     'product' => $productId,
+                    //     'image'   => $imageId,
+                    // ]);
                 }
             } catch (\Throwable $e) {
                 Log::error('REST delete ProductImage exception', [
@@ -1986,12 +1986,15 @@ public function handle(): void
             unset($mirrorByKey[$key]);
         }
 
-        // Nu mai ștergem variante automat; orice orfan rămâne logged pentru analiză.
+        // Resturile din $mirrorByKey reprezintă variantele care nu mai există în payload.
         if (!empty($mirrorByKey)) {
-            Log::info('Variant mirrors without source counterparts (skipping delete)', [
+            Log::info('Variant mirrors without source counterparts', [
                 'product_mirror_id' => $pm->id,
                 'keys'              => array_keys($mirrorByKey),
             ]);
+            foreach ($mirrorByKey as $key => $mirror) {
+                $toDelete[$key] = $mirror;
+            }
         }
 
         return compact('toCreate','toUpdate','toDelete');
@@ -2280,11 +2283,11 @@ private function ensureVariantMirrors(
 
             if ($dirty) {
                 $vm->save();
-                \Log::info('ensureVariantMirrors: updated', [
-                    'product_mirror_id' => $pm->id,
-                    'key'               => $ckey,
-                    'target_gid'        => $vm->target_variant_gid,
-                ]);
+                // \Log::info('ensureVariantMirrors: updated', [
+                //     'product_mirror_id' => $pm->id,
+                //     'key'               => $ckey,
+                //     'target_gid'        => $vm->target_variant_gid,
+                // ]);
             }
         }
     }
@@ -2487,11 +2490,11 @@ private function ensureVariantMirrors(
             'tracked' => $tracked,
         ];
 
-        \Log::debug('inventoryItemUpdate call', [
-            'target'  => $shop->domain,
-            'item_id' => $inventoryItemId,
-            'tracked' => $tracked,
-        ]);
+        // \Log::debug('inventoryItemUpdate call', [
+        //     'target'  => $shop->domain,
+        //     'item_id' => $inventoryItemId,
+        //     'tracked' => $tracked,
+        // ]);
 
         $res = $this->gql($shop, $m, $vars);
 
@@ -2505,11 +2508,11 @@ private function ensureVariantMirrors(
             throw new \RuntimeException('inventoryItemUpdate userErrors: '.json_encode($ue));
         }
 
-        \Log::debug('inventoryItemUpdate OK', [
-            'target'  => $shop->domain,
-            'item_id' => $inventoryItemId,
-            'tracked' => $tracked,
-        ]);
+        // \Log::debug('inventoryItemUpdate OK', [
+        //     'target'  => $shop->domain,
+        //     'item_id' => $inventoryItemId,
+        //     'tracked' => $tracked,
+        // ]);
     }
 
     // Actualizează o variantă individuală (ex. pentru inventoryManagement)

@@ -158,14 +158,14 @@ class LogShopifyProductImages implements ShouldQueue
                     ]
                 );
 
-                ApplyProductWatermark::dispatchSync(
-                    shopDomain: $this->shopDomain,
-                    productId: $this->productId,
-                    handle: $this->handle,
-                    title: $this->title,
-                    images: $watermarkImages,
-                    processId: $process->id
-                );
+                // ApplyProductWatermark::dispatchSync(
+                //     shopDomain: $this->shopDomain,
+                //     productId: $this->productId,
+                //     handle: $this->handle,
+                //     title: $this->title,
+                //     images: $watermarkImages,
+                //     processId: $process->id
+                // );
             }
         } catch (\Throwable $e) {
             Log::error('Product images GraphQL exception', [

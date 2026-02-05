@@ -99,12 +99,12 @@ class ProcessShopifyWebhook implements ShouldQueue
             )->onQueue('replication');
         }
 
-        CoordinateSourceWatermark::dispatch(
-            sourceShopId: $sourceShop->id,
-            sourceProductId: $sourceProductId,
-            payload: $payload
-        )->delay(now()->addSeconds(60))
-         ->onQueue('watermarks');
+        // CoordinateSourceWatermark::dispatch(
+        //     sourceShopId: $sourceShop->id,
+        //     sourceProductId: $sourceProductId,
+        //     payload: $payload
+        // )->delay(now()->addSeconds(60))
+        //  ->onQueue('watermarks');
     }
 
     protected function fanOutUpdate(Shop $sourceShop, array $payload): void
