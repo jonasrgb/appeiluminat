@@ -298,10 +298,25 @@ public function handle(): void
                         variantStrategy: 'LEAVE_AS_IS'
                     );
                 } catch (\Throwable $e) {
-                    Log::warning('productOptionsSet unavailable or failed; options not updated via Set', [
+                    Log::warning('productOptionsSet unavailable or failed; attempting REST fallback', [
                         'target_shop' => $target->domain,
                         'error' => $e->getMessage(),
                     ]);
+                    $fallback = $this->productOptionsRestUpdate(
+                        shop: $target,
+                        productGid: $mirror->target_product_gid,
+                        options: $desiredOptions
+                    );
+                    if ($fallback) {
+                        Log::notice('Product options updated via REST fallback', [
+                            'target_shop' => $target->domain,
+                            'names' => array_map(fn($o) => $o['name'] ?? null, $desiredOptions),
+                        ]);
+                    } else {
+                        Log::error('Product options REST fallback failed; target schema unchanged', [
+                            'target_shop' => $target->domain,
+                        ]);
+                    }
                 }
             }
         }
@@ -2123,6 +2138,85 @@ public function handle(): void
             Log::error('productOptionsSet userErrors', ['target' => $shop->domain, 'userErrors' => $ue]);
             throw new \RuntimeException('productOptionsSet userErrors: ' . json_encode($ue));
         }
+    }
+
+    /**
+     * Fallback REST update pentru opțiuni atunci când productOptionsSet nu este disponibil.
+     */
+    private function productOptionsRestUpdate(Shop $shop, string $productGid, array $options): bool
+    {
+        $productId = $this->numericIdFromGid($productGid);
+        if (!$productId) {
+            Log::warning('REST fallback: invalid product gid', [
+                'target_shop' => $shop->domain,
+                'product_gid' => $productGid,
+            ]);
+            return false;
+        }
+
+        $payloadOptions = [];
+        foreach ($options as $opt) {
+            $name = $opt['name'] ?? null;
+            if (!$name) continue;
+
+            $values = [];
+            foreach (($opt['values'] ?? []) as $value) {
+                if (is_array($value) && isset($value['name'])) {
+                    $val = (string)$value['name'];
+                } else {
+                    $val = (string)$value;
+                }
+                if ($val !== '') {
+                    $values[] = $val;
+                }
+            }
+
+            $payloadOptions[] = array_filter([
+                'name'     => $name,
+                'position' => $opt['position'] ?? null,
+                'values'   => $values ?: null,
+            ], fn($v) => $v !== null);
+        }
+
+        if (empty($payloadOptions)) {
+            Log::warning('REST fallback: no valid options to apply', [
+                'target_shop' => $shop->domain,
+                'product_gid' => $productGid,
+            ]);
+            return false;
+        }
+
+        $version = $shop->api_version ?: '2025-01';
+        $url = "https://{$shop->domain}/admin/api/{$version}/products/{$productId}.json";
+
+        try {
+            $resp = Http::withHeaders([
+                'X-Shopify-Access-Token' => $shop->access_token,
+                'Content-Type'           => 'application/json',
+            ])->put($url, [
+                'product' => [
+                    'id'      => (int)$productId,
+                    'options' => $payloadOptions,
+                ],
+            ]);
+        } catch (\Throwable $e) {
+            Log::error('REST fallback: exception updating options', [
+                'target_shop' => $shop->domain,
+                'error'       => $e->getMessage(),
+            ]);
+            return false;
+        }
+
+        if ($resp->failed()) {
+            Log::error('REST fallback: request failed', [
+                'target_shop' => $shop->domain,
+                'status'      => $resp->status(),
+                'body'        => $resp->body(),
+            ]);
+            return false;
+        }
+
+        return true;
     }
 
     // --- Target variants: citire și mapare pe cheie canonică ---
