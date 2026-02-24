@@ -50,6 +50,14 @@ class ReplicateProductUpdateToShop implements ShouldQueue
 public function handle(): void
 {
     $target = Shop::findOrFail($this->targetShopId);
+    if ((int)$target->id === 8 || $target->domain === 'eiluminat-bg.myshopify.com') {
+        Log::info('ReplicateProductUpdateToShop skipped for BG store', [
+            'target_shop' => $target->domain,
+            'source_shop' => $this->sourceShopId,
+            'source_product_id' => $this->sourceProductId,
+        ]);
+        return;
+    }
 
     $metaDescription = $this->fetchMetaDescriptionFromSource();
 

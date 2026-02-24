@@ -44,6 +44,15 @@ class ReplicateProductCreateToShop implements ShouldQueue
         try {
             $target = Shop::findOrFail($this->targetShopId);
 
+            if ((int)$target->id === 8 || $target->domain === 'eiluminat-bg.myshopify.com') {
+                Log::info('ReplicateProductCreate skipped for BG store', [
+                    'target_shop_id' => $target->id,
+                    'target_shop_domain' => $target->domain,
+                    'source_product_id' => $this->sourceProductId,
+                ]);
+                return;
+            }
+
             Log::info('ReplicateProductCreate target shop debug', [
                 'target_shop_id'   => $this->targetShopId,
                 'target_shop_name' => $target->name ?? null,
@@ -774,10 +783,17 @@ class ReplicateProductCreateToShop implements ShouldQueue
         if (!in_array('noutati', $tags, true)) {
             $tags[] = 'noutati';
         }
+        if (!in_array('de_tradus', $tags, true)) {
+            $tags[] = 'de_tradus';
+        }
         $statusMap = ['active'=>'ACTIVE','draft'=>'DRAFT','archived'=>'ARCHIVED'];
-        $status = null;
-        if (!empty($src['status']) && isset($statusMap[strtolower($src['status'])])) {
-            $status = $statusMap[strtolower($src['status'])];
+        if ((int)$shop->id === 8 || $shop->domain === 'eiluminat-bg.myshopify.com') {
+            $status = 'DRAFT';
+        } else {
+            $status = null;
+            if (!empty($src['status']) && isset($statusMap[strtolower($src['status'])])) {
+                $status = $statusMap[strtolower($src['status'])];
+            }
         }
 
         $mutation = <<<'GQL'

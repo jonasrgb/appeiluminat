@@ -91,6 +91,14 @@ class ProcessShopifyWebhook implements ShouldQueue
             ->with('target')->get()->pluck('target')->filter(fn($s) => $s->is_active);
 
         foreach ($targets as $target) {
+            if ((int)$target->id === 7 || $target->domain === 'iluminat-industrial.myshopify.com') {
+                Log::info('fanOutCreate: skipping Industrial target for auto-create', [
+                    'product_id' => $sourceProductId,
+                    'target_shop' => $target->domain,
+                ]);
+                continue;
+            }
+
             \App\Jobs\ReplicateProductCreateToShop::dispatch(
                 $target->id,
                 $sourceShop->id,
@@ -118,14 +126,34 @@ class ProcessShopifyWebhook implements ShouldQueue
         $this->backupSourceImages($sourceShop, $payload);
 
         // 1) Doar pentru magazinul sursă: setează metafieldul custom.trigger=false ca să previi bucle
+        $productGid = "gid://shopify/Product/{$sourceProductId}";
         try {
-            $this->setTriggerMetafieldFalse($sourceShop, "gid://shopify/Product/{$sourceProductId}");
+            $this->setTriggerMetafieldFalse($sourceShop, $productGid);
         } catch (\Throwable $e) {
             \Log::warning('setTrigger=false failed on source', ['shop' => $sourceShop->domain, 'product' => $sourceProductId, 'error' => $e->getMessage()]);
         }
 
+        // Resetăm și store.update_industrial la false după fiecare update
+        try {
+            $this->setIndustrialFlagFalse($sourceShop, $productGid);
+        } catch (\Throwable $e) {
+            \Log::warning('setIndustrialFlag=false failed on source', ['shop' => $sourceShop->domain, 'product' => $sourceProductId, 'error' => $e->getMessage()]);
+        }
+
         $targets = \App\Models\ShopConnection::where('source_shop_id', $sourceShop->id)
             ->with('target')->get()->pluck('target')->filter(fn($s) => $s && $s->is_active);
+
+        // Dacă metafieldul store.update_industrial este true, adaugă forțat shop-ul Industrial (id=7)
+        if ($this->shouldUpdateIndustrial($this->payload)) {
+            $industrial = Shop::find(7);
+            if ($industrial && $industrial->is_active && $targets->where('id', $industrial->id)->isEmpty()) {
+                $targets->push($industrial);
+                \Log::info('fanOutUpdate: forced Industrial target via metafield', [
+                    'product_id' => $sourceProductId,
+                    'target_shop' => $industrial->domain,
+                ]);
+            }
+        }
 
         foreach ($targets as $target) {
             \App\Jobs\ReplicateProductUpdateToShop::dispatch(
@@ -141,6 +169,36 @@ class ProcessShopifyWebhook implements ShouldQueue
             'targets'     => $targets->pluck('domain')->values(),
             'product_id'  => $sourceProductId,
         ]);
+    }
+
+    private function shouldUpdateIndustrial(array $payload): bool
+    {
+        $metafields = $payload['metafields'] ?? [];
+        if (!is_array($metafields)) {
+            return false;
+        }
+
+        foreach ($metafields as $meta) {
+            $namespace = $meta['namespace'] ?? null;
+            $key       = $meta['key'] ?? null;
+            if ($namespace !== 'store' || $key !== 'update_industrial') {
+                continue;
+            }
+
+            $value = $meta['value'] ?? null;
+            if (is_bool($value)) {
+                return $value;
+            }
+            if (is_numeric($value)) {
+                return (int)$value === 1;
+            }
+            if (is_string($value)) {
+                $normalized = strtolower(trim($value));
+                return in_array($normalized, ['1', 'true', 'yes', 'on'], true);
+            }
+        }
+
+        return false;
     }
 
     private function backupSourceImages(Shop $shop, array $payload): void
@@ -207,6 +265,16 @@ class ProcessShopifyWebhook implements ShouldQueue
      */
     private function setTriggerMetafieldFalse(Shop $shop, string $productGid): void
     {
+        $this->setBooleanMetafield($shop, $productGid, 'dont', 'trigger2', false, 'setTrigger=false');
+    }
+
+    private function setIndustrialFlagFalse(Shop $shop, string $productGid): void
+    {
+        $this->setBooleanMetafield($shop, $productGid, 'store', 'update_industrial', false, 'setIndustrialFlag=false');
+    }
+
+    private function setBooleanMetafield(Shop $shop, string $productGid, string $namespace, string $key, bool $value, string $logContext): void
+    {
         $version  = $shop->api_version ?: '2025-01';
         $endpoint = "https://{$shop->domain}/admin/api/{$version}/graphql.json";
 
@@ -222,10 +290,10 @@ class ProcessShopifyWebhook implements ShouldQueue
         $variables = [
             'metafields' => [[
                 'ownerId'  => $productGid,
-                'namespace'=> 'dont',
-                'key'      => 'trigger2',
+                'namespace'=> $namespace,
+                'key'      => $key,
                 'type'     => 'boolean',
-                'value'    => 'false',
+                'value'    => $value ? 'true' : 'false',
             ]]
         ];
 
@@ -236,13 +304,13 @@ class ProcessShopifyWebhook implements ShouldQueue
 
         $body = $resp->json();
         if (!$resp->successful() || !empty($body['errors']) || !empty($body['data']['metafieldsSet']['userErrors'] ?? [])) {
-            \Log::warning('setTrigger=false metafieldsSet issues', [
+            \Log::warning("{$logContext} metafieldsSet issues", [
                 'shop' => $shop->domain,
                 'status' => $resp->status(),
                 'body' => $body,
             ]);
         } else {
-            \Log::info('setTrigger=false applied', ['shop' => $shop->domain, 'product' => $productGid]);
+            \Log::info("{$logContext} applied", ['shop' => $shop->domain, 'product' => $productGid]);
         }
     }
 

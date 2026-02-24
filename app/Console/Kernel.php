@@ -21,6 +21,10 @@ class Kernel extends ConsoleKernel
         $schedule->job(new RunCustomScript2)->dailyAt('00:00');
         $schedule->job(new RunCustomScript3)->dailyAt('00:00');
         $schedule->job(new RunCustomScript4)->dailyAt('00:00');
+        $schedule->command('shopify:bulk-missing-images --send-minicrm')
+            ->dailyAt('00:00')
+            ->timezone('Europe/Bucharest')
+            ->withoutOverlapping();
         //$schedule->command('app:check-products-count')->sundays()->at('00:00');
         $schedule->command('emails:sync-inbox-raw')
         ->everyFiveMinutes()  
