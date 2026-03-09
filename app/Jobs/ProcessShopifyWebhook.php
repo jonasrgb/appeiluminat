@@ -14,6 +14,7 @@ use Illuminate\Queue\InteractsWithQueue;
 use Illuminate\Queue\SerializesModels;
 use App\Models\ProductMirror;
 use App\Jobs\ReplicateProductUpdateToShop;
+use App\Jobs\ReplicateStockOnlyToShop8;
 use Illuminate\Support\Facades\Log;
 use Illuminate\Support\Facades\Http;
 use App\Services\Shopify\ProductImagesBackupService;
@@ -156,7 +157,17 @@ class ProcessShopifyWebhook implements ShouldQueue
         }
 
         foreach ($targets as $target) {
-            \App\Jobs\ReplicateProductUpdateToShop::dispatch(
+            if ((int)$target->id === 8) {
+                ReplicateStockOnlyToShop8::dispatch(
+                    targetShopId: $target->id,
+                    sourceShopId: $sourceShop->id,
+                    sourceProductId: $sourceProductId,
+                    payload: $payload
+                )->onQueue('replication');
+                continue;
+            }
+
+            ReplicateProductUpdateToShop::dispatch(
                 targetShopId: $target->id,
                 sourceShopId: $sourceShop->id,
                 sourceProductId: $sourceProductId,

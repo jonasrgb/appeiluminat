@@ -7,5 +7,8 @@ return [
         // Dry-run: when true, only log intended actions; no DB writes or Shopify mutations
         'dry_run' => env('MIRROR_BOOTSTRAP_DRY_RUN', true),
     ],
+    'stock_only_bg' => [
+        // Temporary deep debug for BG stock-only sync
+        'debug' => env('SHOP8_STOCK_DEBUG', false),
+    ],
 ];
-
