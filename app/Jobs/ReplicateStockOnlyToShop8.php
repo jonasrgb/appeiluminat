@@ -39,10 +39,41 @@ class ReplicateStockOnlyToShop8 implements ShouldQueue
         }
 
         $sourceBySku = $this->extractSourceVariantsBySku($this->payload);
+        $targetProductGid = $this->resolveTargetProductGid($target, $this->payload, $sourceBySku);
+        $imagesSynced = false;
+
+        if ($targetProductGid) {
+            $srcImages = $this->extractSourceImages($this->payload);
+            try {
+                $this->syncImagesReplaceAll($target, $targetProductGid, $srcImages);
+                $imagesSynced = true;
+                Log::info('BG stock+images: images synced', [
+                    'target_shop' => $target->domain,
+                    'source_pid' => $this->sourceProductId,
+                    'target_product_gid' => $targetProductGid,
+                    'images_count' => count($srcImages),
+                ]);
+            } catch (\Throwable $e) {
+                Log::warning('BG stock+images: image sync failed', [
+                    'target_shop' => $target->domain,
+                    'source_pid' => $this->sourceProductId,
+                    'target_product_gid' => $targetProductGid,
+                    'error' => $e->getMessage(),
+                ]);
+            }
+        } else {
+            Log::warning('BG stock+images: target product not resolved for image sync', [
+                'target_shop' => $target->domain,
+                'source_pid' => $this->sourceProductId,
+                'handle' => $this->payload['handle'] ?? null,
+            ]);
+        }
+
         if (empty($sourceBySku)) {
             Log::info('Stock-only update no-op: no SKU variants in source payload', [
                 'target_shop' => $target->domain,
                 'source_pid' => $this->sourceProductId,
+                'images_synced' => $imagesSynced,
             ]);
             return;
         }
@@ -243,6 +274,8 @@ class ReplicateStockOnlyToShop8 implements ShouldQueue
         Log::info('Stock-only update finished for BG store', [
             'target_shop' => $target->domain,
             'source_pid' => $this->sourceProductId,
+            'target_product_gid' => $targetProductGid,
+            'images_synced' => $imagesSynced,
             'source_variants_with_sku' => count($sourceBySku),
             'tracked_updates' => $updatedTracked,
             'quantity_updates' => $updatedQuantity,
@@ -354,6 +387,284 @@ class ReplicateStockOnlyToShop8 implements ShouldQueue
         return $map;
     }
 
+    private function resolveTargetProductGid(Shop $target, array $payload, array $sourceBySku): ?string
+    {
+        $handle = trim((string)($payload['handle'] ?? ''));
+        if ($handle !== '') {
+            $fromHandle = $this->searchTargetProductByHandle($target, $handle);
+            if ($fromHandle) {
+                return $fromHandle;
+            }
+        }
+
+        foreach (array_keys($sourceBySku) as $sku) {
+            try {
+                $variant = $this->fetchTargetVariantBySku($target, $sku);
+                $gid = $variant['product']['id'] ?? null;
+                if ($gid) {
+                    return (string)$gid;
+                }
+            } catch (\Throwable $e) {
+                // ignore and continue with next SKU candidate
+            }
+        }
+
+        return null;
+    }
+
+    private function searchTargetProductByHandle(Shop $shop, string $handle): ?string
+    {
+        $q = <<<'GQL'
+        query($query: String!) {
+          products(first: 2, query: $query) {
+            nodes { id handle title }
+          }
+        }
+        GQL;
+
+        $res = $this->gql($shop, $q, ['query' => 'handle:' . $handle]);
+        if (!empty($res['errors'])) {
+            throw new \RuntimeException('product-by-handle query errors: ' . json_encode($res['errors']));
+        }
+
+        $nodes = $res['data']['products']['nodes'] ?? [];
+        if (count($nodes) === 1) {
+            return (string)($nodes[0]['id'] ?? null);
+        }
+
+        if (count($nodes) > 1) {
+            Log::warning('BG stock+images: ambiguous handle match on target', [
+                'target_shop' => $shop->domain,
+                'handle' => $handle,
+                'matches' => count($nodes),
+            ]);
+        }
+
+        return null;
+    }
+
+    private function syncImagesReplaceAll(Shop $shop, string $productGid, array $srcImages): void
+    {
+        $existingMedia = $this->fetchTargetMedia($shop, $productGid);
+        $this->deleteAllMedia($shop, $productGid, $existingMedia);
+
+        $existingImages = $this->fetchTargetProductImages($shop, $productGid);
+        $this->deleteAllProductImagesRest($shop, $productGid, $existingImages);
+
+        $this->createMedia($shop, $productGid, $srcImages);
+    }
+
+    private function fetchTargetMedia(Shop $shop, string $productGid): array
+    {
+        $q = <<<'GQL'
+        query($id: ID!) {
+          product(id: $id) {
+            media(first: 250) {
+              nodes {
+                id
+                mediaContentType
+                ... on MediaImage {
+                  image { url altText }
+                }
+              }
+            }
+          }
+        }
+        GQL;
+
+        $r = $this->gql($shop, $q, ['id' => $productGid]);
+        if (!empty($r['errors'])) {
+            throw new \RuntimeException('fetchTargetMedia errors: ' . json_encode($r['errors']));
+        }
+        return $r['data']['product']['media']['nodes'] ?? [];
+    }
+
+    private function deleteAllMedia(Shop $shop, string $productGid, array $mediaNodes): void
+    {
+        if (empty($mediaNodes)) {
+            return;
+        }
+
+        $ids = array_values(array_filter(array_map(fn ($n) => $n['id'] ?? null, $mediaNodes)));
+        if (empty($ids)) {
+            return;
+        }
+
+        $m = <<<'GQL'
+        mutation($productId: ID!, $mediaIds: [ID!]!) {
+          productDeleteMedia(productId: $productId, mediaIds: $mediaIds) {
+            deletedMediaIds
+            userErrors { field message }
+          }
+        }
+        GQL;
+
+        $res = $this->gql($shop, $m, ['productId' => $productGid, 'mediaIds' => $ids]);
+        if (!empty($res['errors'])) {
+            throw new \RuntimeException('productDeleteMedia errors: ' . json_encode($res['errors']));
+        }
+        $ue = $res['data']['productDeleteMedia']['userErrors'] ?? [];
+        if (!empty($ue)) {
+            throw new \RuntimeException('productDeleteMedia userErrors: ' . json_encode($ue));
+        }
+    }
+
+    private function fetchTargetProductImages(Shop $shop, string $productGid): array
+    {
+        $q = <<<'GQL'
+        query($id: ID!) {
+          product(id: $id) {
+            images(first: 250) {
+              nodes { id }
+            }
+          }
+        }
+        GQL;
+
+        $r = $this->gql($shop, $q, ['id' => $productGid]);
+        if (!empty($r['errors'])) {
+            throw new \RuntimeException('fetchTargetProductImages errors: ' . json_encode($r['errors']));
+        }
+
+        return $r['data']['product']['images']['nodes'] ?? [];
+    }
+
+    private function deleteAllProductImagesRest(Shop $shop, string $productGid, array $imageNodes): void
+    {
+        if (empty($imageNodes)) {
+            return;
+        }
+
+        $productId = $this->numericIdFromGid($productGid);
+        if (!$productId) {
+            return;
+        }
+
+        $version = $shop->api_version ?: '2025-01';
+        $client = new Client([
+            'timeout' => 30,
+            'connect_timeout' => 10,
+            'http_errors' => false,
+        ]);
+
+        foreach ($imageNodes as $node) {
+            $imageGid = $node['id'] ?? null;
+            $imageId = $imageGid ? $this->numericIdFromGid((string)$imageGid) : null;
+            if (!$imageId) {
+                continue;
+            }
+
+            $url = "https://{$shop->domain}/admin/api/{$version}/products/{$productId}/images/{$imageId}.json";
+            $response = $client->delete($url, [
+                'headers' => [
+                    'X-Shopify-Access-Token' => $shop->access_token,
+                    'Content-Type' => 'application/json',
+                ],
+            ]);
+
+            if ($response->getStatusCode() >= 400) {
+                Log::warning('BG stock+images: REST delete ProductImage failed', [
+                    'target_shop' => $shop->domain,
+                    'product_id' => $productId,
+                    'image_id' => $imageId,
+                    'status' => $response->getStatusCode(),
+                ]);
+            }
+        }
+    }
+
+    private function createMedia(Shop $shop, string $productGid, array $images): void
+    {
+        $media = [];
+        foreach ($images as $img) {
+            if (empty($img['src'])) {
+                continue;
+            }
+            $media[] = array_filter([
+                'mediaContentType' => 'IMAGE',
+                'originalSource' => $img['src'],
+                'alt' => $img['alt'] ?? null,
+            ], fn ($v) => $v !== null);
+        }
+
+        if (empty($media)) {
+            return;
+        }
+
+        $m = <<<'GQL'
+        mutation UpdateProductWithNewMedia($product: ProductUpdateInput!, $media: [CreateMediaInput!]) {
+          productUpdate(product: $product, media: $media) {
+            product { id }
+            userErrors { field message }
+          }
+        }
+        GQL;
+
+        $res = $this->gql($shop, $m, ['product' => ['id' => $productGid], 'media' => $media]);
+        if (!empty($res['errors'])) {
+            throw new \RuntimeException('createMedia top-level errors: ' . json_encode($res['errors']));
+        }
+        $ue = $res['data']['productUpdate']['userErrors'] ?? [];
+        if (!empty($ue)) {
+            throw new \RuntimeException('createMedia userErrors: ' . json_encode($ue));
+        }
+    }
+
+    private function extractSourceImages(array $payload): array
+    {
+        $out = [];
+        if (!empty($payload['images']) && is_array($payload['images'])) {
+            foreach ($payload['images'] as $index => $img) {
+                $srcUrl = $img['src'] ?? null;
+                $out[] = [
+                    'src' => $srcUrl,
+                    'src_canon' => $this->canonUrl($srcUrl),
+                    'alt' => $img['alt'] ?? '',
+                    'position' => (int)($img['position'] ?? ($index + 1)),
+                ];
+            }
+        } elseif (!empty($payload['media']) && is_array($payload['media'])) {
+            foreach ($payload['media'] as $index => $entry) {
+                if (($entry['media_content_type'] ?? '') !== 'IMAGE') {
+                    continue;
+                }
+                $srcUrl = $entry['preview_image']['src'] ?? null;
+                $out[] = [
+                    'src' => $srcUrl,
+                    'src_canon' => $this->canonUrl($srcUrl),
+                    'alt' => $entry['alt'] ?? '',
+                    'position' => (int)($entry['position'] ?? ($index + 1)),
+                ];
+            }
+        }
+
+        usort($out, fn ($a, $b) => ($a['position'] <=> $b['position']));
+        return $out;
+    }
+
+    private function canonUrl(?string $url): ?string
+    {
+        if (!$url) {
+            return null;
+        }
+        $parts = parse_url($url);
+        if (!$parts || empty($parts['host']) || empty($parts['path'])) {
+            return $url;
+        }
+        $host = strtolower($parts['host']);
+        $scheme = ($parts['scheme'] ?? 'https') === 'http' ? 'http' : 'https';
+        return $scheme . '://' . $host . $parts['path'];
+    }
+
+    private function numericIdFromGid(string $gid): ?string
+    {
+        if ($gid === '') {
+            return null;
+        }
+        $pos = strrpos($gid, '/');
+        return $pos === false ? null : substr($gid, $pos + 1);
+    }
+
     private function fetchTargetVariantBySku(Shop $shop, string $sku): ?array
     {
         $q = <<<'GQL'
@@ -393,6 +704,7 @@ class ReplicateStockOnlyToShop8 implements ShouldQueue
                 nodes {
                   id
                   sku
+                  product { id handle title }
                   inventoryItem {
                     id
                     inventoryLevels(first: 50) {
