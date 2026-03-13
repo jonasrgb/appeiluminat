@@ -2400,18 +2400,33 @@ private function ensureVariantMirrors(
     // --- Construiește input pentru BulkUpdate din payload-ul sursă normalizat ---
     private function buildVariantUpdateInput(string $targetVariantGid, array $src): array
     {
-        return array_filter([
-            'id'              => $targetVariantGid,
-            'price'           => isset($src['price']) ? (string)$src['price'] : null,
-            'compareAtPrice'  => isset($src['compare_at_price']) ? (string)$src['compare_at_price'] : null,
-            'taxable'         => isset($src['taxable']) ? (bool)$src['taxable'] : null,
-            'inventoryPolicy' => isset($src['inventory_policy'])
-                ? (strtolower($src['inventory_policy']) === 'continue' ? 'CONTINUE' : 'DENY')
-                : null,
-            // dacă vrei și greutatea (acceptată în bulk), poți păstra:
-            // 'weight'      => $src['weight'] ?? null,
-            // 'weightUnit'  => $this->mapWeightUnit($src['weight_unit'] ?? null),
-        ], fn($v) => $v !== null);
+        $input = [
+            'id' => $targetVariantGid,
+        ];
+
+        if (array_key_exists('price', $src) && $src['price'] !== null && $src['price'] !== '') {
+            $input['price'] = (string)$src['price'];
+        }
+
+        // Important: dacă sursa trimite explicit null, trimitem null ca să ștergem compareAtPrice pe target.
+        if (array_key_exists('compare_at_price', $src)) {
+            $cap = $src['compare_at_price'];
+            $input['compareAtPrice'] = ($cap === null || $cap === '') ? null : (string)$cap;
+        }
+
+        if (array_key_exists('taxable', $src) && $src['taxable'] !== null) {
+            $input['taxable'] = (bool)$src['taxable'];
+        }
+
+        if (array_key_exists('inventory_policy', $src) && $src['inventory_policy'] !== null && $src['inventory_policy'] !== '') {
+            $input['inventoryPolicy'] = (strtolower((string)$src['inventory_policy']) === 'continue') ? 'CONTINUE' : 'DENY';
+        }
+
+        // dacă vrei și greutatea (acceptată în bulk), poți păstra:
+        // $input['weight'] = $src['weight'] ?? null;
+        // $input['weightUnit'] = $this->mapWeightUnit($src['weight_unit'] ?? null);
+
+        return $input;
     }
 
 
