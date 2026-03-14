@@ -2,6 +2,7 @@
 
 namespace App\Console\Commands;
 
+use App\Console\Commands\Concerns\ConfiguresEmailSyncTimeouts;
 use App\Models\EmailSyncState;
 use Illuminate\Console\Command;
 use Illuminate\Support\Facades\Log;
@@ -10,6 +11,8 @@ use Illuminate\Support\Facades\Mail;
 
 class SyncInboxEmailsRawEiluminat extends Command
 {
+    use ConfiguresEmailSyncTimeouts;
+
     protected $signature = 'emails:sync-inbox-raw-eiluminat';
     protected $description = 'Proceseaza DOAR emailurile noi din INBOX (IMAP raw) si le afiseaza in log daca nu se incadreaza in regulile de ignorare';
 
@@ -17,6 +20,7 @@ class SyncInboxEmailsRawEiluminat extends Command
     {
         $this->info('Pornesc sync INBOX RAW (numai emailuri noi)...');
         Log::info('emails:sync-inbox-raw a pornit Eiluminat', ['time' => now()->toDateTimeString()]);
+        $this->configureEmailSyncTimeouts();
         $delayMs = (int) env('MINICRM_DELAY_MS', 1000);
         $forwardTo = trim((string) env('FORWARD_TO_EMAIL_EILUMINATL', ''));
 

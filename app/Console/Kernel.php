@@ -24,20 +24,25 @@ class Kernel extends ConsoleKernel
         $schedule->command('shopify:bulk-missing-images --send-minicrm')
             ->dailyAt('00:00')
             ->timezone('Europe/Bucharest')
-            ->withoutOverlapping();
+            ->withoutOverlapping()
+            ->runInBackground();
         //$schedule->command('app:check-products-count')->sundays()->at('00:00');
         $schedule->command('emails:sync-inbox-raw')
-        ->everyFiveMinutes()  
-        ->withoutOverlapping();  
+        ->everyFiveMinutes()
+        ->withoutOverlapping()
+        ->runInBackground();
         $schedule->command('emails:sync-inbox-raw-powerleds')
-        ->everyFiveMinutes()  
-        ->withoutOverlapping();
+        ->everyFiveMinutes()
+        ->withoutOverlapping()
+        ->runInBackground();
         $schedule->command('emails:sync-inbox-raw-industrial')
-        ->everyFiveMinutes()  
-        ->withoutOverlapping();  
+        ->everyFiveMinutes()
+        ->withoutOverlapping()
+        ->runInBackground();
         $schedule->command('emails:sync-inbox-raw-eiluminat')
-        ->everyFiveMinutes()  
-        ->withoutOverlapping(); 
+        ->everyFiveMinutes()
+        ->withoutOverlapping()
+        ->runInBackground();
     }
 
     /**
