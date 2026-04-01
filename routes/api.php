@@ -6,6 +6,7 @@ use App\Http\Controllers\MultiShopProductWebhookController;
 use App\Http\Controllers\ShopifyOrderController;
 use App\Http\Controllers\ShopifyWebhookController;
 use App\Http\Controllers\ShopifyCustomerController; 
+use App\Http\Controllers\StockWebhookController;
 /*
 |--------------------------------------------------------------------------
 | API Routes
@@ -33,3 +34,5 @@ Route::post('/webhooks/shopify/update', [ShopifyWebhookController::class, 'handl
 
 Route::post('/webhooks/shopify/products', MultiShopProductWebhookController::class)
     ->middleware('shopify.webhook');
+
+Route::post('/stock', [StockWebhookController::class, 'handle']);

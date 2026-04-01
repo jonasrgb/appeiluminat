@@ -12,9 +12,14 @@ class ShopifyOrderController extends Controller
     {
         // 1) Validare input business
         $request->validate([
-            'telefon'    => 'required|string',
+            'telefon'    => 'nullable|string',
+            'email'      => 'nullable|email',
             'id_comanda' => 'required|string',
         ]);
+
+        if (empty($request->telefon) && empty($request->email)) {
+            return response()->json(['error' => 'Trebuie să furnizezi cel puțin un număr de telefon sau o adresă de email.'], 422);
+        }
 
         
         $storeKey = $store
@@ -113,10 +118,11 @@ class ShopifyOrderController extends Controller
 
                 $order = $shopifyData['data']['orders']['edges'][0]['node'];
 
-                if (
-                    (isset($order['phone']) && str_ends_with($order['phone'], $request->telefon)) &&
-                    strtolower(ltrim($order['name'], '#')) === strtolower(ltrim($request->id_comanda, '#'))
-                ) {
+                $orderNameMatch = strtolower(ltrim($order['name'], '#')) === strtolower(ltrim($request->id_comanda, '#'));
+                $phoneMatch     = !empty($request->telefon) && isset($order['phone']) && str_ends_with($order['phone'], $request->telefon);
+                $emailMatch     = !empty($request->email) && isset($order['email']) && strtolower($order['email']) === strtolower($request->email);
+
+                if ($orderNameMatch && ($phoneMatch || $emailMatch)) {
                     $tags    = isset($order['tags']) && is_array($order['tags']) ? $order['tags'] : [];
                     $isCOD   = in_array('releasit_cod_form', $tags) ? "Plata la livrare" : "Alte metode de plată";
 
