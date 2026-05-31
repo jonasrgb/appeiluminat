@@ -97,7 +97,7 @@ class BemShopifyStagedUploadService
         $mediaIds = $this->fetchProductMediaIds($target, $productGid);
         $this->replaceMedia($target, $productGid, $mediaIds, $mediaInputs);
 
-        $shopifyImages = $this->fetchProductImages($target, $productGid);
+        $shopifyImages = $this->waitForProductImages($target, $productGid, count($uploadable));
         foreach ($uploadable as $index => $image) {
             $shopifyImage = $shopifyImages[$index] ?? null;
             if (!empty($shopifyImage['url'])) {
@@ -107,6 +107,44 @@ class BemShopifyStagedUploadService
         }
 
         return $uploadable;
+    }
+
+    /**
+     * Replaces product media using existing remote image URLs, without applying a watermark.
+     *
+     * @param array<int, array<string, mixed>> $images
+     * @return array<int, array<string, mixed>>
+     */
+    public function replaceProductImagesFromUrls(Shop $target, string $productGid, array $images): array
+    {
+        $images = array_values(array_filter(
+            $images,
+            static fn ($image) => !empty($image['source_url'])
+        ));
+
+        if (empty($images)) {
+            throw new \RuntimeException('No BEM source images to upload from URLs');
+        }
+
+        $mediaInputs = array_map(static fn ($image) => [
+            'alt' => $image['alt'] ?? null,
+            'mediaContentType' => 'IMAGE',
+            'originalSource' => $image['source_url'],
+        ], $images);
+
+        $mediaIds = $this->fetchProductMediaIds($target, $productGid);
+        $this->replaceMedia($target, $productGid, $mediaIds, $mediaInputs);
+
+        $shopifyImages = $this->waitForProductImages($target, $productGid, count($images));
+        foreach ($images as $index => $image) {
+            $shopifyImage = $shopifyImages[$index] ?? null;
+            if (!empty($shopifyImage['url'])) {
+                $images[$index]['uploaded_url'] = $shopifyImage['url'];
+            }
+            $images[$index]['status'] = 'completed';
+        }
+
+        return $images;
     }
 
     /**
@@ -395,6 +433,34 @@ class BemShopifyStagedUploadService
             'id' => $node['id'] ?? null,
             'url' => $node['url'] ?? null,
         ], $nodes);
+    }
+
+    /**
+     * @return array<int, array{url: string|null, id: string|null}>
+     */
+    private function waitForProductImages(Shop $target, string $productGid, int $expectedCount): array
+    {
+        $images = [];
+
+        for ($attempt = 1; $attempt <= 8; $attempt++) {
+            $images = $this->fetchProductImages($target, $productGid);
+            $ready = count($images) >= $expectedCount;
+
+            foreach (array_slice($images, 0, $expectedCount) as $image) {
+                if (empty($image['url'])) {
+                    $ready = false;
+                    break;
+                }
+            }
+
+            if ($ready) {
+                return $images;
+            }
+
+            usleep(500000);
+        }
+
+        return $images;
     }
 
     /**

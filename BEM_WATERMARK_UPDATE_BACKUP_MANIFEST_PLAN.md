@@ -183,6 +183,14 @@ Coada:
 watermarks
 ```
 
+Status implementare: inceput. A fost adaugat flag-ul:
+
+```env
+BEM_WATERMARK_UPDATE_MANIFEST_ENABLED=false
+```
+
+Cand flag-ul este activ si produsul este eligibil, `ProcessShopifyWebhook` pune in coada `BemSyncBackupManifestFromSourceUpdate`. In stadiul curent job-ul incarca manifestul si clasifica imaginile, dar nu modifica media din backup pana la etapa `Backup Sync`.
+
 ### 2. Sync Backup Manifest
 
 Job nou:
@@ -253,6 +261,7 @@ Schimbari propuse:
   - nu mai ruleaza `syncImagesReplaceAll()` folosind imaginile din payload source
   - lasa update-ul de media in seama joburilor BEM
   - continua sa actualizeze titlu, descriere, preturi, variante, metafield-uri si inventar
+  - pastreaza snapshot-ul existent de imagini in `product_mirrors.last_snapshot`, ca payload-ul source cu watermark `eiluminat` sa nu contamineze snapshot-urile target
 
 ## Fisiere Noi Propuse
 
@@ -369,11 +378,23 @@ Reguli obligatorii:
 - adauga `image_uuid`
 - testeaza read/write JSON si validare structura
 
+Status implementare: inceput. Au fost adaugate:
+
+- `app/Services/Shopify/BemWatermark/BemBackupManifestService.php`
+- `app/Services/Shopify/BemWatermark/BemImageIdentityService.php`
+- `tests/Feature/BemWatermarkUpdateManifestTest.php`
+
 ### Etapa 2 - Classifier Update Source
 
 - creeaza `BemSourceUpdateImageClassifier`
 - clasifica imagini: existing, new_clean, deleted, unknown_watermarked, reordered
 - teste cu scenariul 11 imagini, 2 sterse, 2 noi
+
+Status implementare: inceput. Au fost adaugate:
+
+- `app/Services/Shopify/BemWatermark/BemSourceUpdateImageClassifier.php`
+- test pentru scenariul 11 imagini, 2 sterse, 2 noi curate
+- test pentru blocarea unei imagini watermark-uite necunoscute
 
 ### Etapa 3 - Backup Sync
 
@@ -403,6 +424,8 @@ Reguli obligatorii:
 - `ReplicateProductUpdateToShop` sare peste image sync direct pentru BEM
 - update-urile non-media raman neschimbate
 - `ProcessShopifyWebhook` declanseaza manifest sync pe update
+
+Status implementare: partial. Dispatch-ul catre `BemSyncBackupManifestFromSourceUpdate` exista in spatele flag-ului `BEM_WATERMARK_UPDATE_MANIFEST_ENABLED=false`. `ReplicateProductUpdateToShop` sare acum peste image sync direct pentru BEM si nu mai rescrie snapshot-ul de imagini cu payload-ul watermark-uit din source.
 
 ## Criterii De Acceptare
 

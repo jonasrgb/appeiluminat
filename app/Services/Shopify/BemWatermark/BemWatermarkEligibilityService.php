@@ -16,6 +16,11 @@ class BemWatermarkEligibilityService
         return (bool) config('features.bem_watermark_sync.dry_run', true);
     }
 
+    public function isUpdateManifestEnabled(): bool
+    {
+        return (bool) config('features.bem_watermark_sync.update_manifest_enabled', false);
+    }
+
     public function isEligiblePayloadForTarget(array $payload, Shop $target): bool
     {
         if (!$this->isEnabled()) {

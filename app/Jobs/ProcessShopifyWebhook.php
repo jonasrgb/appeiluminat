@@ -13,6 +13,7 @@ use Illuminate\Queue\InteractsWithQueue;
 use Illuminate\Queue\SerializesModels;
 use App\Models\ProductMirror;
 use App\Jobs\BemApplySourceProductWatermark;
+use App\Jobs\BemSyncBackupManifestFromSourceUpdate;
 use App\Jobs\ReplicateProductUpdateToShop;
 use App\Jobs\ReplicateStockOnlyToShop8;
 use App\Services\Shopify\BemWatermark\BemWatermarkEligibilityService;
@@ -128,6 +129,8 @@ class ProcessShopifyWebhook implements ShouldQueue
 
         // 1) Doar pentru magazinul sursă: setează metafieldul custom.trigger=false ca să previi bucle
         $productGid = "gid://shopify/Product/{$sourceProductId}";
+        $this->dispatchBackupManifestSyncForUpdate($sourceShop, $payload, $productGid, $sourceProductId);
+
         try {
             $this->setTriggerMetafieldFalse($sourceShop, $productGid);
         } catch (\Throwable $e) {
@@ -304,6 +307,35 @@ class ProcessShopifyWebhook implements ShouldQueue
             'source_shop' => $sourceShop->domain,
             'source_product_id' => $sourceProductId,
             'images_count' => count($sourceImages),
+        ]);
+    }
+
+    private function dispatchBackupManifestSyncForUpdate(
+        Shop $sourceShop,
+        array $payload,
+        string $sourceProductGid,
+        int $sourceProductId
+    ): void {
+        $eligibility = app(BemWatermarkEligibilityService::class);
+        if (!$eligibility->isUpdateManifestEnabled()) {
+            return;
+        }
+
+        if (!$eligibility->isEligiblePayloadForSource($payload, $sourceShop)) {
+            return;
+        }
+
+        BemSyncBackupManifestFromSourceUpdate::dispatch(
+            sourceShopId: $sourceShop->id,
+            sourceProductId: $sourceProductId,
+            sourceProductGid: $sourceProductGid,
+            title: (string) ($payload['title'] ?? 'product'),
+            sourcePayload: $payload
+        )->onQueue('watermarks');
+
+        Log::info('BEM update manifest sync job queued', [
+            'source_shop' => $sourceShop->domain,
+            'source_product_id' => $sourceProductId,
         ]);
     }
 

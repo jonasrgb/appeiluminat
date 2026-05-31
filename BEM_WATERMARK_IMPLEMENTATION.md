@@ -352,6 +352,44 @@ Comanda citeste `prod.watermarked.images[*].source_url` si inlocuieste imaginile
 }
 ```
 
+Rollback-ul restaureaza imaginile originale pe produsul target. Pentru cazul in care update-ul vechi a contaminat magazinele target cu watermark-ul magazinului sursa, se foloseste comanda de repair de mai jos, nu rollback-ul simplu.
+
+## Repair Dupa Contaminare Update
+
+Comanda Artisan:
+
+```bash
+php artisan bem-watermark:repair-from-source-history {source_product_id}
+```
+
+Ce face:
+
+- citeste istoricul din `prod.watermarked` de pe produsul sursa
+- pastreaza doar imaginile care inca exista pe produsul sursa
+- rescrie produsul din backup cu imaginile originale curate
+- regenereaza watermark-ul corect pentru fiecare magazin target
+- actualizeaza `prod.watermarked` si snapshot-ul din `ProductMirror`
+
+Dry-run:
+
+```bash
+php artisan bem-watermark:repair-from-source-history 10869099168090 --dry-run
+```
+
+Repair live pentru toate target-urile BEM ale produsului:
+
+```bash
+php artisan bem-watermark:repair-from-source-history 10869099168090
+```
+
+Repair live pentru un singur target:
+
+```bash
+php artisan bem-watermark:repair-from-source-history 10869099168090 --shop=powerleds-ro.myshopify.com
+```
+
+Aceasta comanda nu foloseste imaginile contaminate din target-uri. Mapping-ul se face din fisierele/URL-urile watermark-uite de pe source catre `prod.watermarked.images[*].source_url`.
+
 ## Comenzi Rulate
 
 ```bash
@@ -360,6 +398,7 @@ CACHE_DRIVER=array php artisan optimize:clear
 TELESCOPE_ENABLED=false CACHE_DRIVER=array php artisan optimize:clear
 pm2 restart laravel-queue
 php artisan test --filter=BemWatermarkFlowTest
+php artisan test --filter=BemWatermarkUpdateManifestTest
 ```
 
 Nota: o rulare `php artisan optimize:clear` fara `CACHE_DRIVER=array` a incercat sa foloseasca MySQL pentru cache/Telescope si a scris o eroare in `laravel.log`. Comanda a fost rerulata corect cu `TELESCOPE_ENABLED=false CACHE_DRIVER=array`.

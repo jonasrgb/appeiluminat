@@ -12,6 +12,7 @@ use Illuminate\Queue\InteractsWithQueue;
 use Illuminate\Queue\SerializesModels;
 use Illuminate\Support\Facades\Http;
 use Illuminate\Support\Facades\Log;
+use App\Services\Shopify\BemWatermark\BemWatermarkEligibilityService;
 
 class ReplicateProductUpdateToShop implements ShouldQueue
 {
@@ -60,6 +61,7 @@ public function handle(): void
     }
 
     $metaDescription = $this->fetchMetaDescriptionFromSource();
+    $skipDirectImageSyncForBem = $this->shouldSkipDirectImageSyncForBem();
 
     $mirror = ProductMirror::where([
         'source_shop_id'    => $this->sourceShopId,
@@ -257,16 +259,25 @@ public function handle(): void
         }
 
         // === 2) Images sync (always replace) ===
-        $srcImages = $this->extractSourceImages($this->payload);
-        // Log::info('Images syncing (force replace)', [
-        //     'target_shop' => $target->domain,
-        //     'count'       => count($srcImages),
-        // ]);
-        $this->syncImagesReplaceAll($target, $mirror->target_product_gid, $srcImages);
-        // Log::info('Images synced', [
-        //     'target_shop' => $target->domain,
-        //     'count'       => count($srcImages),
-        // ]);
+        if ($skipDirectImageSyncForBem) {
+            Log::warning('BEM update image sync skipped: source payload images may be watermarked', [
+                'target_shop' => $target->domain,
+                'source_shop_id' => $this->sourceShopId,
+                'source_product_id' => $this->sourceProductId,
+                'target_product_gid' => $mirror->target_product_gid,
+            ]);
+        } else {
+            $srcImages = $this->extractSourceImages($this->payload);
+            // Log::info('Images syncing (force replace)', [
+            //     'target_shop' => $target->domain,
+            //     'count'       => count($srcImages),
+            // ]);
+            $this->syncImagesReplaceAll($target, $mirror->target_product_gid, $srcImages);
+            // Log::info('Images synced', [
+            //     'target_shop' => $target->domain,
+            //     'count'       => count($srcImages),
+            // ]);
+        }
 
         // === 2.1) Dacă target are "Default Title", creăm schema de opțiuni (fără variante) ===
         $desiredOptions = $this->buildOptionCreateInputsFromPayload($this->payload);
@@ -679,6 +690,11 @@ public function handle(): void
     } finally {
         if ($updateSucceeded) {
             $newSnap = $this->normalizeProductSnapshot($this->payload);
+            if ($skipDirectImageSyncForBem) {
+                $previousImages = $mirror->last_snapshot['images'] ?? [];
+                $newSnap['images'] = $previousImages;
+                $newSnap['images_fingerprint'] = $this->fingerprintImages($previousImages);
+            }
             $mirror->last_snapshot = $newSnap;
             $mirror->save();
         }
@@ -700,6 +716,23 @@ public function handle(): void
 
         $resp->throw();
         return $resp->json();
+    }
+
+    private function shouldSkipDirectImageSyncForBem(): bool
+    {
+        try {
+            $eligibility = app(BemWatermarkEligibilityService::class);
+
+            return $eligibility->isEnabled() && $eligibility->hasRequiredTag($this->payload);
+        } catch (\Throwable $e) {
+            Log::warning('BEM update image sync guard failed; keeping legacy image sync enabled', [
+                'source_shop_id' => $this->sourceShopId,
+                'source_product_id' => $this->sourceProductId,
+                'error' => $e->getMessage(),
+            ]);
+
+            return false;
+        }
     }
 
     private function syncMetaobjectMetafields(?Shop $source, Shop $target, string $sourceProductGid, string $targetProductGid): void

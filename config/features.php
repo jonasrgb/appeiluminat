@@ -19,6 +19,7 @@ return [
         'notification_email' => env('BEM_WATERMARK_NOTIFICATION_EMAIL', 'mitnickoff121@gmail.com'),
         'width_ratio' => env('BEM_WATERMARK_WIDTH_RATIO', 0.25),
         'opacity' => env('BEM_WATERMARK_OPACITY', 15),
+        'update_manifest_enabled' => env('BEM_WATERMARK_UPDATE_MANIFEST_ENABLED', false),
         'target_shop_domains' => array_values(array_filter(array_map(
             'trim',
             explode(',', env('BEM_WATERMARK_TARGET_SHOP_DOMAINS', ''))
