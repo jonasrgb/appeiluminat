@@ -438,7 +438,7 @@ public function handle(): void
             // Sărim explicit create-ul pentru default variant
         } else {
             try {
-                $createdMap = $this->productVariantsBulkCreateForUpdate($target, $mirror->target_product_gid, $variantDiff['toCreate'], $srcOptions);
+                $createdMap = $this->productVariantsBulkCreateForUpdate($target, $mirror->target_product_gid, $variantDiff['toCreate'], $srcOptions, !empty($variantDiff['toUpdate']));
                 foreach ($variantDiff['toCreate'] as $rawKey => $sv) {
                     $ckey = $this->canonKey($rawKey);
                     $newGid = $createdMap[$ckey]['variant_gid'] ?? null;
@@ -478,13 +478,16 @@ public function handle(): void
         }
     }
 
-    // 3.1) Reîncarcă mapul după eventualele inserări
+    // 3.1) Re-sincronizează mirror-ul cu starea reală de pe Shopify după eventualele create/delete
+    // (crearea de variante noi poate schimba GID-urile variantelor existente pe target)
+    $this->ensureVariantMirrors($mirror, $target, $srcOptions, $srcVariants);
     $mirrorByKey = $this->loadVariantMirrorMap($mirror);
 
     // 3.2) BULK economic (price/compareAt/taxable/inventoryPolicy [+ greutate dacă decizi în builder])
     $bulkUpdates = [];
     foreach ($variantDiff['toUpdate'] as $rawKey => $entry) {
-        $vm = $entry['mirror'] ?? null;
+        $ckey = $this->canonKey($rawKey);
+        $vm = $mirrorByKey[$ckey] ?? null;  // folosim mirror-ul proaspăt, nu obiectul vechi
         $sv = $entry['src'] ?? null;
         if (!$vm || !$sv || empty($vm->target_variant_gid)) continue;
 
@@ -1884,7 +1887,7 @@ public function handle(): void
      * Bulk create variants for update flow using ProductVariantsBulkCreate.
      * Returns map: canonKey => ['variant_gid'=>..., 'inventory_item_gid'=>...]
      */
-    private function productVariantsBulkCreateForUpdate(Shop $shop, string $productGid, array $toCreate, array $srcOptions): array
+    private function productVariantsBulkCreateForUpdate(Shop $shop, string $productGid, array $toCreate, array $srcOptions, bool $hasExistingVariants = false): array
     {
         if (empty($toCreate)) return [];
 
@@ -1923,20 +1926,32 @@ public function handle(): void
             ], fn($x) => $x !== null && $x !== []);
         }
 
-        $mutation = <<<'GQL'
-        mutation CreateVariants($productId: ID!, $variants: [ProductVariantsBulkInput!]!, $strategy: ProductVariantsBulkCreateStrategy!) {
-          productVariantsBulkCreate(productId: $productId, variants: $variants, strategy: $strategy) {
-            productVariants { id selectedOptions { name value } inventoryItem { id } }
-            userErrors { field message }
-          }
+        // REMOVE_STANDALONE_VARIANT șterge varianta existentă dacă produsul are o singură variantă
+        // ("standalone"). Când target-ul deja are variante reale (hasExistingVariants=true),
+        // nu trimitem strategia ca Shopify să nu distrugă variantele existente.
+        if ($hasExistingVariants) {
+            $mutation = <<<'GQL'
+            mutation CreateVariants($productId: ID!, $variants: [ProductVariantsBulkInput!]!) {
+              productVariantsBulkCreate(productId: $productId, variants: $variants) {
+                productVariants { id selectedOptions { name value } inventoryItem { id } }
+                userErrors { field message }
+              }
+            }
+            GQL;
+            $gqlVars = ['productId' => $productGid, 'variants' => $variantsInput];
+        } else {
+            $mutation = <<<'GQL'
+            mutation CreateVariants($productId: ID!, $variants: [ProductVariantsBulkInput!]!, $strategy: ProductVariantsBulkCreateStrategy!) {
+              productVariantsBulkCreate(productId: $productId, variants: $variants, strategy: $strategy) {
+                productVariants { id selectedOptions { name value } inventoryItem { id } }
+                userErrors { field message }
+              }
+            }
+            GQL;
+            $gqlVars = ['productId' => $productGid, 'variants' => $variantsInput, 'strategy' => 'REMOVE_STANDALONE_VARIANT'];
         }
-        GQL;
 
-        $res = $this->gql($shop, $mutation, [
-            'productId' => $productGid,
-            'variants'  => $variantsInput,
-            'strategy'  => 'REMOVE_STANDALONE_VARIANT',
-        ]);
+        $res = $this->gql($shop, $mutation, $gqlVars);
 
         if (!empty($res['errors'])) {
             Log::error('productVariantsBulkCreate top-level errors', ['target'=>$shop->domain, 'errors'=>$res['errors']]);
@@ -2367,9 +2382,19 @@ private function ensureVariantMirrors(
                 $dirty = true;
             }
 
-            if (empty($vm->target_variant_gid) && $targetGid) {
+            if ($targetGid && $vm->target_variant_gid !== $targetGid) {
                 $vm->target_variant_gid = $targetGid;
                 $dirty = true;
+            } elseif (!$targetGid && !empty($vm->target_variant_gid)) {
+                // Varianta nu mai există pe target (a fost ștearsă sau nu a fost creată niciodată).
+                // Ștergem intrarea din mirror ca să fie tratată ca toCreate la pasul următor.
+                $vm->delete();
+                \Log::info('ensureVariantMirrors: stale GID cleared (variant not found on target)', [
+                    'product_mirror_id' => $pm->id,
+                    'key'               => $ckey,
+                    'stale_gid'         => $vm->target_variant_gid,
+                ]);
+                continue;
             }
 
             // nu suprascriem fingerprint-urile dacă sunt deja puse;

@@ -5,7 +5,6 @@ namespace App\Http\Controllers;
 use App\Jobs\ProcessShopifyWebhook;
 use App\Models\Shop;
 use App\Models\ShopifyWebhookEvent;
-use App\Services\Shopify\ProductWebhookPipeline;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Log;
@@ -65,16 +64,6 @@ class MultiShopProductWebhookController extends Controller
                 'webhook_id' => $webhookId,
             ]);
             return response()->json(['status' => 'duplicate']);
-        }
-
-        $shopModel = Shop::whereRaw('LOWER(domain) = ?', [strtolower($shopDomain)])->first();
-        if (!$shopModel || !$shopModel->is_source) {
-            ProductWebhookPipeline::dispatchImages(
-                shopDomain: $shopDomain,
-                payload: $payload,
-                delaySeconds: 30,
-                queue: 'webhooks'
-            );
         }
 
         Log::info('Shopify product webhook queued', [

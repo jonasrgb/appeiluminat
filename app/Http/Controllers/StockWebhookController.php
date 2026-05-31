@@ -30,6 +30,10 @@ class StockWebhookController extends Controller
             'sku' => ['nullable', 'string'],
         ]);
 
+        if (($payload['sku'] ?? '') === 'cod-fee') {
+            return response()->json(['status' => 'skipped'], 200);
+        }
+
         ProcessStockWebhook::dispatch($payload)->onQueue('stock');
 
         Log::info('Stock webhook queued', [

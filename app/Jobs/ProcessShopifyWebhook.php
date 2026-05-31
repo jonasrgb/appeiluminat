@@ -5,7 +5,6 @@ namespace App\Jobs;
 use App\Models\Shop;
 use App\Models\ShopConnection;
 use App\Models\ShopifyWebhookEvent;
-use App\Jobs\CoordinateSourceWatermark;
 use App\Models\ProductMediaProcess;
 use Illuminate\Bus\Queueable;
 use Illuminate\Contracts\Queue\ShouldQueue;
@@ -108,12 +107,6 @@ class ProcessShopifyWebhook implements ShouldQueue
             )->onQueue('replication');
         }
 
-        // CoordinateSourceWatermark::dispatch(
-        //     sourceShopId: $sourceShop->id,
-        //     sourceProductId: $sourceProductId,
-        //     payload: $payload
-        // )->delay(now()->addSeconds(60))
-        //  ->onQueue('watermarks');
     }
 
     protected function fanOutUpdate(Shop $sourceShop, array $payload): void
@@ -122,6 +115,10 @@ class ProcessShopifyWebhook implements ShouldQueue
         if (!$sourceProductId) {
             \Log::warning('fanOutUpdate: missing source product id', ['shop' => $sourceShop->domain]);
             return;
+        }
+
+        if ($this->hasTrigger2Active($payload)) {
+            $this->notifyEcap($sourceProductId);
         }
 
         $this->backupSourceImages($sourceShop, $payload);
@@ -210,6 +207,53 @@ class ProcessShopifyWebhook implements ShouldQueue
         }
 
         return false;
+    }
+
+    private function hasTrigger2Active(array $payload): bool
+    {
+        $metafields = $payload['metafields'] ?? [];
+        if (!is_array($metafields)) {
+            return false;
+        }
+
+        foreach ($metafields as $meta) {
+            if (($meta['namespace'] ?? null) !== 'dont' || ($meta['key'] ?? null) !== 'trigger2') {
+                continue;
+            }
+
+            $value = $meta['value'] ?? null;
+            if (is_bool($value)) return $value;
+            if (is_numeric($value)) return (int)$value === 1;
+            if (is_string($value)) {
+                return in_array(strtolower(trim($value)), ['1', 'true', 'yes', 'on'], true);
+            }
+        }
+
+        return false;
+    }
+
+    private function notifyEcap(int $productId): void
+    {
+        $url = 'https://order-api.ecap.ro/api/Products/UpdateProductPriceInErp?saleChannelId=1642&ecapToken=GnaakFud6FpFb3jA7VuqBWMFusYlYXfglvf2wOnn0eJ7ZmQytndQ0cZ/4JYYtbaSOmY4pSmOqVuxhoBj6AcWu0srMB3P6bOpSF5+jXvTUniKA87DJTE30rsvtVO7UTFGCA05WkP8uTq7JeOVXUONrimQTv25dKjB64jr5D4gKu7wMEnj0Kip7tUNCvmyJ/BI74KVLS3OjbUfHxfaipP64wWxAIFM1MBfIXznTYiJ3yrZDfO6D63GEYgkVen8fA/rgB9j6v+oZd028X1Nc+A4gDN2BCpVzpHG8iUjDNQomJVqPKIaETOJEahiDti7k2DJzVFgCATYJ1MeWr/biHfmAwQwwqEpJimSQJKrD1+H2tGeQ38pl0DvBpWiVMd36EXUsRRTFrAIuRcvgmTASzLr+8CntrMoJHGENFiRc/ykVDkE7AM77yp77fFjrA55XkacKfZTO2d40u1eb7/mM6Kd7/pfIb2bBTZBHKa5AdJQ52U=';
+
+        try {
+            $response = Http::post($url, ['id' => $productId]);
+
+            if (!$response->successful()) {
+                \Log::warning('notifyEcap: request failed', [
+                    'product_id' => $productId,
+                    'status'     => $response->status(),
+                    'body'       => $response->body(),
+                ]);
+            } else {
+                \Log::info('notifyEcap: success', ['product_id' => $productId]);
+            }
+        } catch (\Throwable $e) {
+            \Log::error('notifyEcap: exception', [
+                'product_id' => $productId,
+                'error'      => $e->getMessage(),
+            ]);
+        }
     }
 
     private function backupSourceImages(Shop $shop, array $payload): void
