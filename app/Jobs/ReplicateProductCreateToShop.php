@@ -14,6 +14,12 @@ use Illuminate\Support\Facades\Http;
 use Illuminate\Support\Facades\Log;
 use Illuminate\Support\Facades\Mail;
 use App\Services\Shopify\ProductImagesBackupService;
+use App\Jobs\BemApplyProductWatermark;
+use App\Services\Shopify\BemWatermark\BemBackupProductImageResolver;
+use App\Services\Shopify\BemWatermark\BemProductWatermarkMetafieldService;
+use App\Services\Shopify\BemWatermark\BemShopifyStagedUploadService;
+use App\Services\Shopify\BemWatermark\BemWatermarkEligibilityService;
+use App\Services\Shopify\BemWatermark\BemWatermarkImageProcessor;
 
 class ReplicateProductCreateToShop implements ShouldQueue
 {
@@ -41,6 +47,8 @@ class ReplicateProductCreateToShop implements ShouldQueue
 
     public function handle(): void
     {
+        $bemTempPaths = [];
+
         try {
             $target = Shop::findOrFail($this->targetShopId);
 
@@ -59,9 +67,38 @@ class ReplicateProductCreateToShop implements ShouldQueue
                 'target_shop_domain' => $target->domain ?? null,
             ]);
 
-            $metaDescription = $this->fetchSourceMetaDescription();
+            if ($existingMirror = $this->existingCreatedMirror($target)) {
+                Log::warning('ReplicateProductCreate skipped: existing mirror found, preventing duplicate create', [
+                    'target_shop_id' => $target->id,
+                    'target_shop_domain' => $target->domain,
+                    'source_product_id' => $this->sourceProductId,
+                    'target_product_id' => $existingMirror->target_product_id,
+                    'target_product_gid' => $existingMirror->target_product_gid,
+                ]);
 
-            [$productGid, $productLegacyId, $variantMap] = $this->productCreate($target, $this->payload, $metaDescription);
+                if ($existingMirror->target_product_gid) {
+                    $this->dispatchBemWatermarkIfEligible(
+                        $target,
+                        $existingMirror->target_product_gid,
+                        $existingMirror->target_product_id ? (int) $existingMirror->target_product_id : null
+                    );
+                }
+
+                return;
+            }
+
+            $metaDescription = $this->fetchSourceMetaDescription();
+            $bemCreate = $this->prepareBemWatermarkedCreate($target);
+            if (($bemCreate['released'] ?? false) === true) {
+                return;
+            }
+
+            $bemTempPaths = $bemCreate['temp_paths'] ?? [];
+            $payloadForCreate = $bemCreate
+                ? $this->payloadWithBemWatermarkedImages($this->payload, $bemCreate['images'])
+                : $this->payload;
+
+            [$productGid, $productLegacyId, $variantMap] = $this->productCreate($target, $payloadForCreate, $metaDescription);
 
             $this->attachProductToManualCollection($target, $productGid);
 
@@ -101,6 +138,12 @@ class ReplicateProductCreateToShop implements ShouldQueue
 
             // Persist backup of images metadata into the target shop metafield
             ProductImagesBackupService::syncFromImages($target, $productGid, $imgs);
+
+            if ($bemCreate) {
+                $this->finalizeBemWatermarkedCreate($target, $productGid, $productLegacyId, $bemCreate);
+            } else {
+                $this->dispatchBemWatermarkIfEligible($target, $productGid, $productLegacyId);
+            }
 
             // Save variant mappings (mirrors)
             if (!empty($variantMap)) {
@@ -170,6 +213,19 @@ class ReplicateProductCreateToShop implements ShouldQueue
             }
 
             throw $e;
+        } finally {
+            if (!empty($bemTempPaths)) {
+                try {
+                    app(BemWatermarkImageProcessor::class)->cleanup($bemTempPaths);
+                } catch (\Throwable $cleanupException) {
+                    Log::warning('BEM watermark temp cleanup failed', [
+                        'source_shop_id' => $this->sourceShopId,
+                        'target_shop_id' => $this->targetShopId,
+                        'source_product_id' => $this->sourceProductId,
+                        'error' => $cleanupException->getMessage(),
+                    ]);
+                }
+            }
         }
     }
 
@@ -193,6 +249,236 @@ class ReplicateProductCreateToShop implements ShouldQueue
 
         $resp->throw();
         return $resp->json();
+    }
+
+    private function existingCreatedMirror(Shop $target): ?ProductMirror
+    {
+        return ProductMirror::where([
+            'source_shop_id' => $this->sourceShopId,
+            'source_product_id' => $this->sourceProductId,
+            'target_shop_id' => $target->id,
+        ])
+            ->whereNotNull('target_product_gid')
+            ->first();
+    }
+
+    private function dispatchBemWatermarkIfEligible(Shop $target, string $productGid, ?int $productLegacyId): void
+    {
+        try {
+            $eligibility = app(BemWatermarkEligibilityService::class);
+            if (!$eligibility->isEligiblePayloadForTarget($this->payload, $target)) {
+                return;
+            }
+
+            BemApplyProductWatermark::dispatch(
+                targetShopId: $target->id,
+                sourceShopId: $this->sourceShopId,
+                sourceProductId: $this->sourceProductId,
+                targetProductGid: $productGid,
+                targetProductId: $productLegacyId,
+                title: (string) ($this->payload['title'] ?? 'product'),
+                sourcePayload: $this->payload
+            )->onQueue('watermarks');
+
+            Log::info('BEM watermark job queued', [
+                'target_shop' => $target->domain,
+                'source_product_id' => $this->sourceProductId,
+                'target_product_gid' => $productGid,
+            ]);
+        } catch (\Throwable $e) {
+            Log::error('BEM watermark dispatch failed', [
+                'target_shop' => $target->domain,
+                'source_product_id' => $this->sourceProductId,
+                'target_product_gid' => $productGid,
+                'error' => $e->getMessage(),
+            ]);
+        }
+    }
+
+    private function prepareBemWatermarkedCreate(Shop $target): ?array
+    {
+        $eligibility = app(BemWatermarkEligibilityService::class);
+        if (!$eligibility->isEligiblePayloadForTarget($this->payload, $target)) {
+            return null;
+        }
+
+        if ($eligibility->isDryRun()) {
+            return null;
+        }
+
+        $backupImages = app(BemBackupProductImageResolver::class)->resolve(
+            $this->sourceShopId,
+            $this->sourceProductId
+        );
+
+        if (!$backupImages->ready) {
+            Log::warning('BEM direct create waiting for backup product', [
+                'target_shop' => $target->domain,
+                'source_shop_id' => $this->sourceShopId,
+                'source_product_id' => $this->sourceProductId,
+                'attempt' => $this->attempts(),
+                'reason' => $backupImages->reason,
+            ]);
+
+            if ($this->attempts() >= $this->tries) {
+                throw new \RuntimeException('BEM direct create backup product not ready: '.($backupImages->reason ?: 'unknown'));
+            }
+
+            $this->release(60);
+            return ['released' => true, 'temp_paths' => []];
+        }
+
+        $imageProcessor = app(BemWatermarkImageProcessor::class);
+        $processedResult = $imageProcessor->process(
+            $target,
+            (string) ($this->payload['title'] ?? 'product'),
+            $backupImages->images
+        );
+
+        $uploadedImages = app(BemShopifyStagedUploadService::class)->uploadProcessedImagesForProductCreate(
+            $target,
+            $processedResult['processed']
+        );
+
+        Log::info('BEM direct create watermarked images prepared', [
+            'target_shop' => $target->domain,
+            'source_product_id' => $this->sourceProductId,
+            'images_count' => count($uploadedImages),
+        ]);
+
+        return [
+            'backup_shop' => $backupImages->backupShop,
+            'backup_source_product_id' => $backupImages->sourceProductId,
+            'backup_source_product_gid' => $backupImages->sourceProductGid,
+            'images' => $uploadedImages,
+            'temp_paths' => $processedResult['temp_paths'],
+        ];
+    }
+
+    private function payloadWithBemWatermarkedImages(array $payload, array $images): array
+    {
+        $title = $payload['title'] ?? null;
+
+        $payload['images'] = array_map(static fn ($image) => array_filter([
+            'src' => $image['watermarked_url'] ?? null,
+            'alt' => $image['alt'] ?? $title,
+            'position' => $image['position'] ?? null,
+        ], static fn ($value) => $value !== null), $images);
+
+        return $payload;
+    }
+
+    private function finalizeBemWatermarkedCreate(Shop $target, string $productGid, ?int $productLegacyId, array $bemCreate): void
+    {
+        try {
+            $uploadService = app(BemShopifyStagedUploadService::class);
+            $images = $this->ensureBemWatermarkedMediaAttached(
+                target: $target,
+                productGid: $productGid,
+                images: $bemCreate['images'],
+                uploadService: $uploadService
+            );
+
+            $images = $uploadService->applyFinalProductImageUrls(
+                $target,
+                $productGid,
+                $images
+            );
+
+            app(BemProductWatermarkMetafieldService::class)->update($target, $productGid, [
+                'source_shop' => $bemCreate['backup_shop']?->domain,
+                'source_product_id' => $bemCreate['backup_source_product_id'],
+                'source_product_gid' => $bemCreate['backup_source_product_gid'],
+                'target_shop' => $target->domain,
+                'target_product_id' => $productLegacyId,
+                'target_product_gid' => $productGid,
+                'updated_at' => now()->toIso8601String(),
+                'dry_run' => false,
+                'mode' => 'direct_create',
+                'images' => $this->bemMetafieldImages($images),
+            ]);
+
+            Log::info('BEM direct create completed', [
+                'target_shop' => $target->domain,
+                'target_product_gid' => $productGid,
+                'images_count' => count($images),
+            ]);
+        } catch (\Throwable $e) {
+            Log::error('BEM direct create metafield/final URL update failed', [
+                'target_shop' => $target->domain,
+                'target_product_gid' => $productGid,
+                'error' => $e->getMessage(),
+            ]);
+
+            throw $e;
+        }
+    }
+
+    private function ensureBemWatermarkedMediaAttached(
+        Shop $target,
+        string $productGid,
+        array $images,
+        BemShopifyStagedUploadService $uploadService
+    ): array {
+        $expected = count($images);
+        if ($expected === 0) {
+            return $images;
+        }
+
+        $actual = count($uploadService->fetchProductImages($target, $productGid));
+        if ($actual >= $expected) {
+            return $images;
+        }
+
+        sleep(5);
+        $actual = count($uploadService->fetchProductImages($target, $productGid));
+        if ($actual >= $expected) {
+            return $images;
+        }
+
+        $missing = array_slice($images, $actual);
+        if (empty($missing)) {
+            return $images;
+        }
+
+        Log::warning('BEM direct create detected missing Shopify media; attaching missing images', [
+            'target_shop' => $target->domain,
+            'product_gid' => $productGid,
+            'expected' => $expected,
+            'actual' => $actual,
+            'missing_count' => count($missing),
+        ]);
+
+        $this->attachImagesWithProductUpdate($target, $productGid, array_map(static fn ($image) => [
+            'src' => $image['watermarked_url'] ?? null,
+            'alt' => $image['alt'] ?? null,
+            'position' => $image['position'] ?? null,
+        ], $missing));
+
+        sleep(5);
+        $finalCount = count($uploadService->fetchProductImages($target, $productGid));
+        if ($finalCount < $expected) {
+            Log::warning('BEM direct create media count still below expected after retry attach', [
+                'target_shop' => $target->domain,
+                'product_gid' => $productGid,
+                'expected' => $expected,
+                'actual' => $finalCount,
+            ]);
+        }
+
+        return $images;
+    }
+
+    private function bemMetafieldImages(array $images): array
+    {
+        return array_values(array_map(static fn ($image) => [
+            'position' => $image['position'] ?? null,
+            'source_url' => $image['source_url'] ?? null,
+            'watermarked_url' => $image['watermarked_url'] ?? null,
+            'filename' => $image['filename'] ?? null,
+            'original_extension' => $image['original_extension'] ?? null,
+            'status' => $image['status'] ?? null,
+        ], $images));
     }
 
     /**

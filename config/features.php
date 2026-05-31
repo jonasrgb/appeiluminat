@@ -11,4 +11,24 @@ return [
         // Temporary deep debug for BG stock-only sync
         'debug' => env('SHOP8_STOCK_DEBUG', false),
     ],
+    'bem_watermark_sync' => [
+        'enabled' => env('BEM_WATERMARK_SYNC_ENABLED', false),
+        'dry_run' => env('BEM_WATERMARK_SYNC_DRY_RUN', true),
+        'required_tag' => env('BEM_WATERMARK_SYNC_REQUIRED_TAG', 'wm_test'),
+        'backup_shop_domain' => env('BEM_WATERMARK_BACKUP_SHOP_DOMAIN', 'eiluminatbackup.myshopify.com'),
+        'notification_email' => env('BEM_WATERMARK_NOTIFICATION_EMAIL', 'mitnickoff121@gmail.com'),
+        'width_ratio' => env('BEM_WATERMARK_WIDTH_RATIO', 0.25),
+        'opacity' => env('BEM_WATERMARK_OPACITY', 15),
+        'target_shop_domains' => array_values(array_filter(array_map(
+            'trim',
+            explode(',', env('BEM_WATERMARK_TARGET_SHOP_DOMAINS', ''))
+        ))),
+        'domain_aliases' => [
+            'eiluminat.myshopify.com' => 'eiluminat',
+            'eiluminatbackup.myshopify.com' => 'eiluminat',
+            'powerleds-ro.myshopify.com' => 'powerleds',
+            'lustreled.myshopify.com' => 'lustreled',
+            'iluminat-industrial.myshopify.com' => 'iluminat-industrial',
+        ],
+    ],
 ];

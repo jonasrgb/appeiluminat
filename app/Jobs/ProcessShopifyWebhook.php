@@ -12,8 +12,10 @@ use Illuminate\Foundation\Bus\Dispatchable;
 use Illuminate\Queue\InteractsWithQueue;
 use Illuminate\Queue\SerializesModels;
 use App\Models\ProductMirror;
+use App\Jobs\BemApplySourceProductWatermark;
 use App\Jobs\ReplicateProductUpdateToShop;
 use App\Jobs\ReplicateStockOnlyToShop8;
+use App\Services\Shopify\BemWatermark\BemWatermarkEligibilityService;
 use Illuminate\Support\Facades\Log;
 use Illuminate\Support\Facades\Http;
 use App\Services\Shopify\ProductImagesBackupService;
@@ -107,6 +109,7 @@ class ProcessShopifyWebhook implements ShouldQueue
             )->onQueue('replication');
         }
 
+        $this->dispatchSourceWatermarkForCreate($sourceShop, $payload, $sourceImages, $sourceProductGid, $sourceProductId);
     }
 
     protected function fanOutUpdate(Shop $sourceShop, array $payload): void
@@ -271,6 +274,37 @@ class ProcessShopifyWebhook implements ShouldQueue
         }
 
         ProductImagesBackupService::syncFromImages($shop, $productGid, $images);
+    }
+
+    private function dispatchSourceWatermarkForCreate(
+        Shop $sourceShop,
+        array $payload,
+        array $sourceImages,
+        string $sourceProductGid,
+        int $sourceProductId
+    ): void {
+        if (empty($sourceImages)) {
+            return;
+        }
+
+        $eligibility = app(BemWatermarkEligibilityService::class);
+        if (!$eligibility->isEligiblePayloadForSource($payload, $sourceShop)) {
+            return;
+        }
+
+        BemApplySourceProductWatermark::dispatch(
+            sourceShopId: $sourceShop->id,
+            sourceProductId: $sourceProductId,
+            sourceProductGid: $sourceProductGid,
+            title: (string) ($payload['title'] ?? 'product'),
+            sourcePayload: $payload
+        )->onQueue('watermarks');
+
+        Log::info('BEM source watermark job queued for product create', [
+            'source_shop' => $sourceShop->domain,
+            'source_product_id' => $sourceProductId,
+            'images_count' => count($sourceImages),
+        ]);
     }
 
     /**
