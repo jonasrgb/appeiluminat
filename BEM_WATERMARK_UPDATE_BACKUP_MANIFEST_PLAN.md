@@ -403,6 +403,15 @@ Status implementare: inceput. Au fost adaugate:
 - blocheaza orice imagine watermark-uita
 - update manifest
 
+Status implementare: functional in `BemSyncBackupManifestFromSourceUpdate`.
+
+- job-ul citeste imaginile curente din source webhook
+- mapeaza imaginile watermark-uite existente prin `prod.watermarked` de pe source
+- trateaza imaginile ne-watermark-uite ca imagini noi curate
+- respinge imaginile watermark-uite necunoscute
+- rescrie produsul backup cu lista dorita de originale curate
+- scrie `prod.watermark_manifest` pe produsul backup
+
 ### Etapa 4 - Source Update Watermark
 
 - proceseaza doar imaginile noi curate
@@ -410,6 +419,13 @@ Status implementare: inceput. Au fost adaugate:
 - confirma
 - sterge doar noile originale curate de pe source
 - update manifest si `prod.watermarked`
+
+Status implementare: functional in `BemSyncBackupManifestFromSourceUpdate`.
+
+- dupa ce backup-ul este curat, source este regenerat cu watermark `eiluminat`
+- pozitiile sunt normalizate dupa ordinea curenta din source
+- `prod.watermarked` de pe source este actualizat cu lista curenta
+- webhook-ul generat de propria regenerare intra no-op daca `prod.watermarked` se potriveste cu imaginile live
 
 ### Etapa 5 - Target Update Watermark
 
@@ -419,13 +435,36 @@ Status implementare: inceput. Au fost adaugate:
 - reordoneaza
 - update `prod.watermarked`
 
+Status implementare: functional prin replace controlat in `BemSyncBackupManifestFromSourceUpdate`.
+
+- target-urile folosesc doar URL-uri curate din backup
+- fiecare target regenereaza imaginile cu watermark-ul propriu
+- `ProductMirror.last_snapshot` este actualizat cu URL-urile finale target
+- `prod.watermarked` este actualizat pe fiecare target
+
 ### Etapa 6 - Integrare In Update Job
 
 - `ReplicateProductUpdateToShop` sare peste image sync direct pentru BEM
 - update-urile non-media raman neschimbate
 - `ProcessShopifyWebhook` declanseaza manifest sync pe update
 
-Status implementare: partial. Dispatch-ul catre `BemSyncBackupManifestFromSourceUpdate` exista in spatele flag-ului `BEM_WATERMARK_UPDATE_MANIFEST_ENABLED=false`. `ReplicateProductUpdateToShop` sare acum peste image sync direct pentru BEM si nu mai rescrie snapshot-ul de imagini cu payload-ul watermark-uit din source.
+Status implementare: activabil prin flag. Dispatch-ul catre `BemSyncBackupManifestFromSourceUpdate` exista in spatele flag-ului `BEM_WATERMARK_UPDATE_MANIFEST_ENABLED=true`. `ReplicateProductUpdateToShop` sare peste image sync direct pentru BEM si nu mai rescrie snapshot-ul de imagini cu payload-ul watermark-uit din source.
+
+## Flow Implementat Pentru Product Update Media
+
+1. `products/update` intra din magazinul source.
+2. `ProcessShopifyWebhook` trimite job-ul `BemSyncBackupManifestFromSourceUpdate` daca produsul este eligibil BEM.
+3. `ReplicateProductUpdateToShop` continua update-ul non-media, dar sare peste `syncImagesReplaceAll()` pentru BEM.
+4. Job-ul BEM citeste `prod.watermarked` de pe source.
+5. Pentru fiecare imagine curenta din source:
+   - daca este watermark-uita si exista in istoric, foloseste `source_url` original
+   - daca este curata, o trateaza ca imagine noua
+   - daca este watermark-uita dar necunoscuta, opreste flow-ul si logheaza eroare
+6. Backup-ul este rescris cu originale curate, fara watermark.
+7. Source este rescris cu watermark `eiluminat` pentru lista curenta.
+8. Fiecare target este rescris din backup cu watermark-ul propriu.
+9. Se actualizeaza `prod.watermarked`, `prod.watermark_manifest` pe backup si `ProductMirror.last_snapshot`.
+10. Webhook-ul generat de propria rescriere intra no-op cand imaginile live se potrivesc cu `prod.watermarked`.
 
 ## Criterii De Acceptare
 

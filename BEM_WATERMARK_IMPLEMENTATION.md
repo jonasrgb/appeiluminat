@@ -390,6 +390,47 @@ php artisan bem-watermark:repair-from-source-history 10869099168090 --shop=power
 
 Aceasta comanda nu foloseste imaginile contaminate din target-uri. Mapping-ul se face din fisierele/URL-urile watermark-uite de pe source catre `prod.watermarked.images[*].source_url`.
 
+## Product Update Media
+
+Flow-ul automat pentru update de imagini este controlat de:
+
+```env
+BEM_WATERMARK_UPDATE_MANIFEST_ENABLED=true
+```
+
+Cand un produs BEM primeste `products/update`:
+
+- update-ul vechi continua pentru campurile non-media
+- update-ul vechi nu mai sterge si nu mai copiaza imagini din source in target
+- job-ul `BemSyncBackupManifestFromSourceUpdate` face sync-ul media separat
+
+Pasii media:
+
+- citeste imaginile curente din source
+- mapeaza imaginile watermark-uite prin `prod.watermarked` de pe source
+- detecteaza imaginile sterse prin diferenta fata de istoricul `prod.watermarked`
+- trateaza imaginile noi curate ca sursa originala pentru backup
+- rescrie backup-ul cu lista curenta de originale curate
+- regenereaza source cu watermark `eiluminat`
+- regenereaza target-urile din backup cu watermark-ul fiecarui magazin
+- actualizeaza `prod.watermarked`, `prod.watermark_manifest` pe backup si `ProductMirror.last_snapshot`
+
+Semnale in log:
+
+```text
+BEM update media sync started
+BEM update media sync completed
+BEM update media sync no-op: source images already match prod.watermarked
+BEM update image sync skipped: source payload images may be watermarked
+```
+
+Comportament asteptat:
+
+- daca nu s-au schimbat imaginile: job-ul BEM este no-op, iar non-media sync continua
+- daca s-au sters imagini: backup/source/target-uri raman cu lista redusa
+- daca s-au adaugat imagini curate: backup primeste originalele curate, target-urile primesc watermark-ul lor
+- daca apare o imagine watermark-uita necunoscuta: flow-ul se opreste si trimite eroare/log/email
+
 ## Comenzi Rulate
 
 ```bash
@@ -399,6 +440,7 @@ TELESCOPE_ENABLED=false CACHE_DRIVER=array php artisan optimize:clear
 pm2 restart laravel-queue
 php artisan test --filter=BemWatermarkFlowTest
 php artisan test --filter=BemWatermarkUpdateManifestTest
+php -l app/Jobs/BemSyncBackupManifestFromSourceUpdate.php
 ```
 
 Nota: o rulare `php artisan optimize:clear` fara `CACHE_DRIVER=array` a incercat sa foloseasca MySQL pentru cache/Telescope si a scris o eroare in `laravel.log`. Comanda a fost rerulata corect cu `TELESCOPE_ENABLED=false CACHE_DRIVER=array`.
