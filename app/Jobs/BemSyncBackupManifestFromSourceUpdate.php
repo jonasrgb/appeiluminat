@@ -97,8 +97,9 @@ class BemSyncBackupManifestFromSourceUpdate implements ShouldQueue
                 return;
             }
 
-            $sourceWatermarked = $this->fetchSourceWatermarked($graphql, $source);
-            $sourceImages = $this->sourceImages($identity);
+            $sourceState = $this->fetchSourceState($graphql, $source);
+            $sourceWatermarked = $sourceState['watermarked'];
+            $sourceImages = $this->sourceImages($sourceState['images'], $identity);
             $desiredOriginalImages = $this->desiredOriginalImages($sourceImages, $sourceWatermarked, $identity);
 
             if ($this->isNoop($desiredOriginalImages, $sourceWatermarked, $identity)) {
@@ -258,12 +259,12 @@ class BemSyncBackupManifestFromSourceUpdate implements ShouldQueue
     /**
      * @return array<int, array<string, mixed>>
      */
-    private function sourceImages(BemImageIdentityService $identity): array
+    private function sourceImages(array $sourceNodes, BemImageIdentityService $identity): array
     {
         $images = [];
 
-        foreach (($this->sourcePayload['images'] ?? []) as $index => $image) {
-            $url = $image['src'] ?? null;
+        foreach ($sourceNodes as $index => $image) {
+            $url = $image['url'] ?? ($image['src'] ?? null);
             if (!$url) {
                 continue;
             }
@@ -272,7 +273,7 @@ class BemSyncBackupManifestFromSourceUpdate implements ShouldQueue
                 'position' => $index + 1,
                 'url' => $url,
                 'media_gid' => $image['admin_graphql_api_id'] ?? ($image['id'] ?? null),
-                'alt' => $image['alt'] ?? ($this->title ?: null),
+                'alt' => $image['altText'] ?? ($image['alt'] ?? ($this->title ?: null)),
                 'filename' => $identity->filenameFromUrl($url),
                 'original_extension' => $identity->extensionFromUrl($url),
             ];
@@ -283,11 +284,21 @@ class BemSyncBackupManifestFromSourceUpdate implements ShouldQueue
         return $images;
     }
 
-    private function fetchSourceWatermarked(BemShopifyGraphqlClient $graphql, Shop $source): array
+    /**
+     * @return array{images: array<int, array<string, mixed>>, watermarked: array<string, mixed>}
+     */
+    private function fetchSourceState(BemShopifyGraphqlClient $graphql, Shop $source): array
     {
         $query = <<<'GQL'
-        query BemUpdateSourceWatermarked($id: ID!) {
+        query BemUpdateSourceState($id: ID!) {
           product(id: $id) {
+            images(first: 250) {
+              nodes {
+                id
+                url
+                altText
+              }
+            }
             metafield(namespace: "prod", key: "watermarked") {
               value
             }
@@ -296,13 +307,21 @@ class BemSyncBackupManifestFromSourceUpdate implements ShouldQueue
         GQL;
 
         $response = $graphql->request($source, $query, ['id' => $this->sourceProductGid]);
-        $value = $response['data']['product']['metafield']['value'] ?? null;
+        $product = $response['data']['product'] ?? null;
+        if (!$product) {
+            throw new \RuntimeException('BEM source product not found for update');
+        }
+
+        $value = $product['metafield']['value'] ?? null;
         $decoded = is_string($value) ? json_decode($value, true) : null;
         if (!is_array($decoded) || empty($decoded['images'])) {
             throw new \RuntimeException('BEM source prod.watermarked history missing for update');
         }
 
-        return $decoded;
+        return [
+            'images' => $product['images']['nodes'] ?? [],
+            'watermarked' => $decoded,
+        ];
     }
 
     /**

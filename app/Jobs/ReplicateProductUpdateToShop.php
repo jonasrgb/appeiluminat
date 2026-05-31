@@ -691,9 +691,16 @@ public function handle(): void
         if ($updateSucceeded) {
             $newSnap = $this->normalizeProductSnapshot($this->payload);
             if ($skipDirectImageSyncForBem) {
-                $previousImages = $mirror->last_snapshot['images'] ?? [];
+                $previousSnapshot = $mirror->last_snapshot ?? [];
+                $previousImages = $previousSnapshot['images'] ?? [];
                 $newSnap['images'] = $previousImages;
                 $newSnap['images_fingerprint'] = $this->fingerprintImages($previousImages);
+
+                foreach (['bem_update_media_synced_at', 'bem_repaired_at'] as $preservedKey) {
+                    if (array_key_exists($preservedKey, $previousSnapshot)) {
+                        $newSnap[$preservedKey] = $previousSnapshot[$preservedKey];
+                    }
+                }
             }
             $mirror->last_snapshot = $newSnap;
             $mirror->save();
