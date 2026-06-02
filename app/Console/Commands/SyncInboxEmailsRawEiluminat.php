@@ -19,7 +19,7 @@ class SyncInboxEmailsRawEiluminat extends Command
     public function handle(): int
     {
         $this->info('Pornesc sync INBOX RAW (numai emailuri noi)...');
-        Log::info('emails:sync-inbox-raw a pornit Eiluminat', ['time' => now()->toDateTimeString()]);
+        //Log::info('emails:sync-inbox-raw a pornit Eiluminat', ['time' => now()->toDateTimeString()]);
         $this->configureEmailSyncTimeouts();
         $delayMs = (int) env('MINICRM_DELAY_MS', 1000);
         $forwardTo = trim((string) env('FORWARD_TO_EMAIL_EILUMINATL', ''));

@@ -270,6 +270,17 @@ class ReplicateProductCreateToShop implements ShouldQueue
                 return;
             }
 
+            if (count($this->extractSourceImages($this->payload)) === 0) {
+                Log::info('BEM watermark dispatch skipped: source create payload has no media', [
+                    'target_shop' => $target->domain,
+                    'source_shop_id' => $this->sourceShopId,
+                    'source_product_id' => $this->sourceProductId,
+                    'target_product_gid' => $productGid,
+                ]);
+
+                return;
+            }
+
             BemApplyProductWatermark::dispatch(
                 targetShopId: $target->id,
                 sourceShopId: $this->sourceShopId,
@@ -303,6 +314,16 @@ class ReplicateProductCreateToShop implements ShouldQueue
         }
 
         if ($eligibility->isDryRun()) {
+            return null;
+        }
+
+        if (count($this->extractSourceImages($this->payload)) === 0) {
+            Log::info('BEM direct create skipped: source create payload has no media', [
+                'target_shop' => $target->domain,
+                'source_shop_id' => $this->sourceShopId,
+                'source_product_id' => $this->sourceProductId,
+            ]);
+
             return null;
         }
 
@@ -398,6 +419,8 @@ class ReplicateProductCreateToShop implements ShouldQueue
                 'images' => $this->bemMetafieldImages($images),
             ]);
 
+            $this->updateBemDirectCreateMirrorSnapshot($target, $images);
+
             Log::info('BEM direct create completed', [
                 'target_shop' => $target->domain,
                 'target_product_gid' => $productGid,
@@ -479,6 +502,41 @@ class ReplicateProductCreateToShop implements ShouldQueue
             'original_extension' => $image['original_extension'] ?? null,
             'status' => $image['status'] ?? null,
         ], $images));
+    }
+
+    private function updateBemDirectCreateMirrorSnapshot(Shop $target, array $images): void
+    {
+        $mirror = ProductMirror::where([
+            'source_shop_id' => $this->sourceShopId,
+            'source_product_id' => $this->sourceProductId,
+            'target_shop_id' => $target->id,
+        ])->first();
+
+        if (!$mirror) {
+            return;
+        }
+
+        $snapshot = is_array($mirror->last_snapshot ?? null)
+            ? $mirror->last_snapshot
+            : (is_string($mirror->last_snapshot) ? (json_decode($mirror->last_snapshot, true) ?: []) : []);
+
+        $snapshotImages = array_values(array_map(function ($image) {
+            $url = $image['watermarked_url'] ?? $image['uploaded_url'] ?? null;
+
+            return [
+                'src' => $url,
+                'src_canon' => $this->canonUrl($url),
+                'alt' => $image['alt'] ?? '',
+                'position' => (int) ($image['position'] ?? 0),
+            ];
+        }, $images));
+
+        $snapshot['images'] = $snapshotImages;
+        $snapshot['images_fingerprint'] = $this->fingerprintImages($snapshotImages);
+        $snapshot['bem_direct_create_synced_at'] = now()->toIso8601String();
+
+        $mirror->last_snapshot = $snapshot;
+        $mirror->save();
     }
 
     /**

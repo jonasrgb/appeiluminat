@@ -13,6 +13,7 @@ use App\Services\Shopify\BemWatermark\BemShopifyGraphqlClient;
 use App\Services\Shopify\BemWatermark\BemShopifyStagedUploadService;
 use App\Services\Shopify\BemWatermark\BemWatermarkEligibilityService;
 use App\Services\Shopify\BemWatermark\BemWatermarkImageProcessor;
+use App\Services\Shopify\BemWatermark\BemWatermarkUpdateBootstrapService;
 use Illuminate\Bus\Queueable;
 use Illuminate\Contracts\Queue\ShouldQueue;
 use Illuminate\Foundation\Bus\Dispatchable;
@@ -48,7 +49,8 @@ class BemSyncBackupManifestFromSourceUpdate implements ShouldQueue
         BemShopifyGraphqlClient $graphql,
         BemShopifyStagedUploadService $uploadService,
         BemWatermarkImageProcessor $imageProcessor,
-        BemProductWatermarkMetafieldService $metafieldService
+        BemProductWatermarkMetafieldService $metafieldService,
+        BemWatermarkUpdateBootstrapService $bootstrapService
     ): void {
         $source = Shop::findOrFail($this->sourceShopId);
 
@@ -81,6 +83,23 @@ class BemSyncBackupManifestFromSourceUpdate implements ShouldQueue
         $tempPaths = [];
 
         try {
+            $bootstrapResult = $bootstrapService->bootstrap(
+                source: $source,
+                sourceProductId: $this->sourceProductId,
+                sourceProductGid: $this->sourceProductGid,
+                title: $this->title,
+                sourcePayload: $this->sourcePayload
+            );
+
+            if ($bootstrapResult->didChange()) {
+                Log::info('BEM update manifest bootstrap prepared missing state', [
+                    'source_shop' => $source->domain,
+                    'source_product_id' => $this->sourceProductId,
+                    'reason' => $bootstrapResult->reason,
+                    'context' => $bootstrapResult->context,
+                ]);
+            }
+
             $backup = $backupResolver->resolve($this->sourceShopId, $this->sourceProductId);
             if (!$backup->ready || !$backup->backupShop || !$backup->sourceProductGid) {
                 if ($this->attempts() >= $this->tries) {
@@ -319,9 +338,28 @@ class BemSyncBackupManifestFromSourceUpdate implements ShouldQueue
         }
 
         return [
-            'images' => $product['images']['nodes'] ?? [],
+            'images' => $this->sourceStateImages($product['images']['nodes'] ?? []),
             'watermarked' => $decoded,
         ];
+    }
+
+    private function sourceStateImages(array $liveImages): array
+    {
+        if (!empty($liveImages)) {
+            return $liveImages;
+        }
+
+        $payloadImages = $this->sourcePayload['images'] ?? [];
+        if (!is_array($payloadImages) || empty($payloadImages)) {
+            return [];
+        }
+
+        Log::warning('BEM update source live images empty; falling back to webhook payload images', [
+            'source_product_id' => $this->sourceProductId,
+            'payload_images' => count($payloadImages),
+        ]);
+
+        return $payloadImages;
     }
 
     /**
@@ -405,6 +443,10 @@ class BemSyncBackupManifestFromSourceUpdate implements ShouldQueue
 
     private function isNoop(array $desiredOriginalImages, array $sourceWatermarked, BemImageIdentityService $identity): bool
     {
+        if (($sourceWatermarked['mode'] ?? null) === 'bootstrap_from_update') {
+            return false;
+        }
+
         $history = array_values((array) ($sourceWatermarked['images'] ?? []));
         if (count($history) !== count($desiredOriginalImages)) {
             return false;

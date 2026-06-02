@@ -11,6 +11,7 @@ use Illuminate\Queue\InteractsWithQueue;
 use Illuminate\Queue\SerializesModels;
 use Illuminate\Support\Facades\Mail;
 use App\Mail\JobFailedMail;
+use App\Models\Shop;
 
 
 class RunCustomScript implements ShouldQueue
@@ -18,6 +19,7 @@ class RunCustomScript implements ShouldQueue
     use Dispatchable, InteractsWithQueue, Queueable, SerializesModels;
 
     private $collectionId;
+    private $shopDomain;
 
     /**
      * Create a new job instance.
@@ -25,6 +27,7 @@ class RunCustomScript implements ShouldQueue
     public function __construct()
     {
         $this->collectionId = "622468399449";  // ID-ul colecției
+        $this->shopDomain = "lustreled.myshopify.com";
     }
 
     /**
@@ -35,11 +38,7 @@ class RunCustomScript implements ShouldQueue
     public function handle()
     {
         try {
-            // Creează clientul Guzzle
-            $client = new Client([
-                'base_uri' => env('RUN_lustreled_SECRET'),
-                'http_errors' => false,
-            ]);
+            $client = $this->createShopifyClient();
 
             // Fetch products from collection
             $productsData = $this->fetchProductsFromCollection($this->collectionId, $client);
@@ -95,7 +94,7 @@ class RunCustomScript implements ShouldQueue
             $body = json_decode($response->getBody(), true);
 
             if ($statusCode >= 400) {
-                throw new \Exception('Shopify API returned error: ' . $statusCode);
+                throw new \Exception('Shopify API returned error: ' . $statusCode . ' body: ' . substr(json_encode($body), 0, 500));
             }
 
             $products = array_merge($products, $body['products']);
@@ -156,7 +155,7 @@ class RunCustomScript implements ShouldQueue
         $body = json_decode($response->getBody(), true);
 
         if ($statusCode >= 400) {
-            throw new \Exception('Shopify GraphQL API returned error: ' . $statusCode);
+            throw new \Exception('Shopify GraphQL API returned error: ' . $statusCode . ' body: ' . substr(json_encode($body), 0, 500));
         }
 
         if (!empty($body['errors'])) {
@@ -187,6 +186,21 @@ class RunCustomScript implements ShouldQueue
             'status' => $product['status'],
             'older' => $isOlderThanSixtyDays,
         ];
+    }
+
+    private function createShopifyClient(): Client
+    {
+        $shop = Shop::where('domain', $this->shopDomain)->firstOrFail();
+        $apiVersion = $shop->api_version ?: '2025-01';
+
+        return new Client([
+            'base_uri' => "https://{$this->shopDomain}/admin/api/{$apiVersion}/",
+            'http_errors' => false,
+            'headers' => [
+                'X-Shopify-Access-Token' => $shop->access_token,
+                'Content-Type' => 'application/json',
+            ],
+        ]);
     }
 
     /**

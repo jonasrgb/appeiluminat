@@ -92,14 +92,23 @@ class BemWatermarkFlowTest extends TestCase
                 ]);
             }
 
-            if (str_contains($url, 'lustreled.myshopify.com') && str_contains($query, 'BemProductWatermarkedImages')) {
+            if (str_contains($url, 'lustreled.myshopify.com') && str_contains($query, 'BemProductWatermarkedMediaImages')) {
                 return Http::response([
                     'data' => [
                         'product' => [
-                            'images' => [
+                            'media' => [
                                 'nodes' => [[
-                                    'id' => 'gid://shopify/ProductImage/new',
-                                    'url' => 'https://cdn.shopify.test/final/lustreled_lustra-led-moderna_w_p_1.png',
+                                    'id' => 'gid://shopify/MediaImage/new',
+                                    'mediaContentType' => 'IMAGE',
+                                    'status' => 'READY',
+                                    'preview' => [
+                                        'image' => [
+                                            'url' => 'https://cdn.shopify.test/final/lustreled_lustra-led-moderna_w_p_1.png',
+                                        ],
+                                    ],
+                                    'image' => [
+                                        'url' => 'https://cdn.shopify.test/final/lustreled_lustra-led-moderna_w_p_1.png',
+                                    ],
                                 ]],
                             ],
                         ],
