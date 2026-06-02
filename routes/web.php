@@ -1,6 +1,7 @@
 <?php
 
 use App\Http\Controllers\ProfileController;
+use App\Http\Controllers\ProductParentBackfillController;
 use App\Http\Controllers\WebhookController;
 use Illuminate\Support\Facades\Route;
 
@@ -21,6 +22,13 @@ Route::get('/', function () {
 
 
 Route::get('/dashboard', [WebhookController::class, 'index'])->middleware(['auth', 'verified'])->name('dashboard');
+
+Route::middleware(['auth', 'verified'])->group(function () {
+    Route::get('/dashboard/product-parent-backfill', [ProductParentBackfillController::class, 'index'])
+        ->name('product-parent-backfill.index');
+    Route::get('/dashboard/product-parent-backfill/unmatched', [ProductParentBackfillController::class, 'unmatched'])
+        ->name('product-parent-backfill.unmatched');
+});
 
 Route::middleware('auth')->group(function () {
     Route::get('/profile', [ProfileController::class, 'edit'])->name('profile.edit');
