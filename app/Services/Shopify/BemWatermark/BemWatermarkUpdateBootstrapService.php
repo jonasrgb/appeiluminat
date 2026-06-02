@@ -78,6 +78,7 @@ class BemWatermarkUpdateBootstrapService
 
         $backupState = $this->fetchProductState($backup, $backupMirror->target_product_gid);
         $backupImages = $this->normalizeImages($backupState['images'] ?? []);
+        $backupProductHadNoLiveImages = empty($backupImages);
         $sourceWatermarked = $this->decodeJsonMetafield($sourceState['watermarked_value'] ?? null);
         $hasSourceHistory = is_array($sourceWatermarked)
             && !empty($sourceWatermarked['images'])
@@ -88,6 +89,16 @@ class BemWatermarkUpdateBootstrapService
             if (!empty($backupImages)) {
                 $changes[] = 'backup_images_loaded_from_source_history';
             }
+        }
+
+        if ($backupProductHadNoLiveImages && !empty($backupImages)) {
+            $backupImages = $this->seedBackupImagesFromHistory(
+                backup: $backup,
+                backupProductGid: $backupMirror->target_product_gid,
+                backupImages: $backupImages,
+                title: $title
+            );
+            $changes[] = 'backup_images_seeded_from_history';
         }
 
         if (empty($backupImages)) {
@@ -589,6 +600,59 @@ class BemWatermarkUpdateBootstrapService
         ]);
 
         return $backupImages;
+    }
+
+    /**
+     * @param array<int, array<string, mixed>> $backupImages
+     * @return array<int, array<string, mixed>>
+     */
+    private function seedBackupImagesFromHistory(
+        Shop $backup,
+        string $backupProductGid,
+        array $backupImages,
+        string $title
+    ): array {
+        $cleanImages = [];
+
+        foreach ($backupImages as $index => $image) {
+            $url = $image['url'] ?? null;
+            if (!$url || $this->identity->isWatermarkedUrl($url)) {
+                throw new \RuntimeException('BEM update bootstrap cannot seed backup from invalid history image at position '.($index + 1));
+            }
+
+            $cleanImages[] = [
+                'position' => (int) ($image['position'] ?? ($index + 1)),
+                'source_url' => $url,
+                'original_extension' => $this->identity->extensionFromUrl($url),
+                'alt' => $image['alt'] ?? $title,
+                'status' => 'completed',
+            ];
+        }
+
+        $uploaded = $this->uploadService->replaceProductImagesFromUrls($backup, $backupProductGid, $cleanImages);
+        $seededImages = [];
+
+        foreach ($uploaded as $index => $image) {
+            $url = $image['uploaded_url'] ?? ($image['source_url'] ?? null);
+            if (!$url) {
+                throw new \RuntimeException('BEM update bootstrap backup history seed did not return URL at position '.($index + 1));
+            }
+
+            $seededImages[] = [
+                'position' => (int) ($image['position'] ?? ($index + 1)),
+                'id' => null,
+                'url' => $url,
+                'alt' => $image['alt'] ?? $title,
+            ];
+        }
+
+        Log::notice('BEM update bootstrap seeded backup images from source history', [
+            'backup_shop' => $backup->domain,
+            'backup_product_gid' => $backupProductGid,
+            'images_count' => count($seededImages),
+        ]);
+
+        return $seededImages;
     }
 
     private function normalizeImages(array $nodes): array

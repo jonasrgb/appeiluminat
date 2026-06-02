@@ -410,6 +410,7 @@ Pasii media:
 - mapeaza imaginile watermark-uite prin `prod.watermarked` de pe source
 - detecteaza imaginile sterse prin diferenta fata de istoricul `prod.watermarked`
 - trateaza imaginile noi curate ca sursa originala pentru backup
+- daca produsul backup exista dar are 0 imagini, iar `prod.watermarked` de pe source are istoric curat, seed-uieste backup-ul din acel istoric inainte de sync
 - rescrie backup-ul cu lista curenta de originale curate
 - regenereaza source cu watermark `eiluminat`
 - regenereaza target-urile din backup cu watermark-ul fiecarui magazin
