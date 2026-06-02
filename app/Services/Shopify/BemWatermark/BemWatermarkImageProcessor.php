@@ -26,10 +26,7 @@ class BemWatermarkImageProcessor
             throw new \RuntimeException('BEM watermark asset missing for '.$target->domain);
         }
 
-        $tmpDir = storage_path('app/watermark/bem_tmp');
-        if (!is_dir($tmpDir)) {
-            mkdir($tmpDir, 0755, true);
-        }
+        $tmpDir = $this->createTempDirectory();
 
         $processed = [];
         $tempPaths = [];
@@ -91,8 +88,34 @@ class BemWatermarkImageProcessor
         foreach ($paths as $path) {
             if (is_string($path) && $path !== '' && is_file($path)) {
                 @unlink($path);
+                $this->removeEmptyTempDirectoryForPath($path);
             }
         }
+    }
+
+    private function createTempDirectory(): string
+    {
+        $baseDir = storage_path('app/watermark/bem_tmp/'.(app()->runningUnitTests() ? 'tests' : 'jobs'));
+        $tmpDir = $baseDir.'/'.Str::uuid();
+
+        if (!is_dir($tmpDir)) {
+            mkdir($tmpDir, 0755, true);
+        }
+
+        return $tmpDir;
+    }
+
+    private function removeEmptyTempDirectoryForPath(string $path): void
+    {
+        $baseDir = realpath(storage_path('app/watermark/bem_tmp/'.(app()->runningUnitTests() ? 'tests' : 'jobs')));
+        $dir = dirname($path);
+        $realDir = is_dir($dir) ? realpath($dir) : false;
+
+        if (!$baseDir || !$realDir || !str_starts_with($realDir, $baseDir.DIRECTORY_SEPARATOR)) {
+            return;
+        }
+
+        @rmdir($realDir);
     }
 
     private function downloadImage(string $url, string $tmpDir, string $extension): string

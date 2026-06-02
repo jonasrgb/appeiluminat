@@ -181,6 +181,7 @@ class BemShopifyStagedUploadService
             foreach ($tempPaths as $path) {
                 if (is_string($path) && $path !== '' && is_file($path)) {
                     @unlink($path);
+                    $this->removeEmptyTempDirectoryForPath($path);
                 }
             }
         }
@@ -294,7 +295,11 @@ class BemShopifyStagedUploadService
             ];
         }
 
-        $stream = fopen($image['path'], 'r');
+            if (empty($image['path']) || !is_file($image['path'])) {
+                throw new \RuntimeException('BEM staged upload temp file missing for '.($image['filename'] ?? 'unknown'));
+            }
+
+            $stream = fopen($image['path'], 'r');
         try {
             $multipart[] = [
                 'name' => 'file',
@@ -325,10 +330,7 @@ class BemShopifyStagedUploadService
      */
     private function downloadUrlImagesForStagedUpload(array $images): array
     {
-        $tmpDir = storage_path('app/watermark/bem_tmp');
-        if (!is_dir($tmpDir)) {
-            mkdir($tmpDir, 0755, true);
-        }
+        $tmpDir = $this->createTempDirectory();
 
         $uploadable = [];
         foreach ($images as $index => $image) {
@@ -369,6 +371,31 @@ class BemShopifyStagedUploadService
         }
 
         return $uploadable;
+    }
+
+    private function createTempDirectory(): string
+    {
+        $baseDir = storage_path('app/watermark/bem_tmp/'.(app()->runningUnitTests() ? 'tests' : 'jobs'));
+        $tmpDir = $baseDir.'/'.Str::uuid();
+
+        if (!is_dir($tmpDir)) {
+            mkdir($tmpDir, 0755, true);
+        }
+
+        return $tmpDir;
+    }
+
+    private function removeEmptyTempDirectoryForPath(string $path): void
+    {
+        $baseDir = realpath(storage_path('app/watermark/bem_tmp/'.(app()->runningUnitTests() ? 'tests' : 'jobs')));
+        $dir = dirname($path);
+        $realDir = is_dir($dir) ? realpath($dir) : false;
+
+        if (!$baseDir || !$realDir || !str_starts_with($realDir, $baseDir.DIRECTORY_SEPARATOR)) {
+            return;
+        }
+
+        @rmdir($realDir);
     }
 
     /**

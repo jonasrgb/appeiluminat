@@ -84,31 +84,7 @@ class BemWatermarkUpdateBootstrapService
             && !empty($sourceWatermarked['images'])
             && is_array($sourceWatermarked['images']);
 
-        if (empty($backupImages) && $hasSourceHistory) {
-            $backupImages = $this->backupImagesFromSourceHistory($sourceWatermarked);
-            if (!empty($backupImages)) {
-                $changes[] = 'backup_images_loaded_from_source_history';
-            }
-        }
-
-        if ($backupProductHadNoLiveImages && !empty($backupImages)) {
-            $backupImages = $this->seedBackupImagesFromHistory(
-                backup: $backup,
-                backupProductGid: $backupMirror->target_product_gid,
-                backupImages: $backupImages,
-                title: $title
-            );
-            $changes[] = 'backup_images_seeded_from_history';
-        }
-
-        if (empty($backupImages)) {
-            $backupImages = $this->backupImagesFromMirrorSnapshot($backupMirror);
-            if (!empty($backupImages)) {
-                $changes[] = 'backup_images_loaded_from_mirror_snapshot';
-            }
-        }
-
-        if (empty($backupImages)) {
+        if (!$hasSourceHistory) {
             if ($this->containsWatermarkedOrMissingImage($sourceImages)) {
                 Log::warning('BEM update bootstrap skipped backup seed: source images are not clean', [
                     'source_shop' => $source->domain,
@@ -116,7 +92,7 @@ class BemWatermarkUpdateBootstrapService
                     'backup_product_gid' => $backupMirror->target_product_gid,
                 ]);
 
-                return BemWatermarkUpdateBootstrapResult::skipped('source_images_not_clean_for_backup_seed', [
+                return BemWatermarkUpdateBootstrapResult::skipped('source_images_not_clean_for_legacy_bootstrap', [
                     'source_product_id' => $sourceProductId,
                     'backup_product_gid' => $backupMirror->target_product_gid,
                 ]);
@@ -128,7 +104,56 @@ class BemWatermarkUpdateBootstrapService
                 sourceImages: $sourceImages,
                 title: $title
             );
-            $changes[] = 'backup_images_seeded_from_source_payload';
+            $changes[] = $backupProductHadNoLiveImages
+                ? 'backup_images_seeded_from_source_payload'
+                : 'backup_images_reconciled_from_current_source_payload';
+        } else {
+            if (empty($backupImages)) {
+                $backupImages = $this->backupImagesFromSourceHistory($sourceWatermarked);
+                if (!empty($backupImages)) {
+                    $changes[] = 'backup_images_loaded_from_source_history';
+                }
+            }
+
+            if ($backupProductHadNoLiveImages && !empty($backupImages)) {
+                $backupImages = $this->seedBackupImagesFromHistory(
+                    backup: $backup,
+                    backupProductGid: $backupMirror->target_product_gid,
+                    backupImages: $backupImages,
+                    title: $title
+                );
+                $changes[] = 'backup_images_seeded_from_history';
+            }
+
+            if (empty($backupImages)) {
+                $backupImages = $this->backupImagesFromMirrorSnapshot($backupMirror);
+                if (!empty($backupImages)) {
+                    $changes[] = 'backup_images_loaded_from_mirror_snapshot';
+                }
+            }
+
+            if (empty($backupImages)) {
+                if ($this->containsWatermarkedOrMissingImage($sourceImages)) {
+                    Log::warning('BEM update bootstrap skipped backup seed: source images are not clean', [
+                        'source_shop' => $source->domain,
+                        'source_product_id' => $sourceProductId,
+                        'backup_product_gid' => $backupMirror->target_product_gid,
+                    ]);
+
+                    return BemWatermarkUpdateBootstrapResult::skipped('source_images_not_clean_for_backup_seed', [
+                        'source_product_id' => $sourceProductId,
+                        'backup_product_gid' => $backupMirror->target_product_gid,
+                    ]);
+                }
+
+                $backupImages = $this->seedBackupImagesFromCleanSourcePayload(
+                    backup: $backup,
+                    backupProductGid: $backupMirror->target_product_gid,
+                    sourceImages: $sourceImages,
+                    title: $title
+                );
+                $changes[] = 'backup_images_seeded_from_source_payload';
+            }
         }
 
         $this->assertImagesAreClean($backupImages, 'backup');

@@ -89,6 +89,8 @@ Test:
 12. Se scrie metafield-ul `prod.watermarked`.
 13. Fisierele temporare sunt sterse in `finally`.
 
+Nota: fisierele temporare live sunt izolate in subdirectoare per rulare sub `storage/app/watermark/bem_tmp/jobs/...`. Testele folosesc doar `storage/app/watermark/bem_tmp/tests/...`, ca sa nu poata sterge fisiere temporare ale joburilor live.
+
 Pentru produse fara tag-ul `wm_test`, flow-ul ramane cel existent.
 
 Pentru `BEM_WATERMARK_SYNC_DRY_RUN=true`, produsul target se creeaza prin flow-ul vechi si job-ul BEM doar logheaza ce ar face, fara upload/metafield.
@@ -253,6 +255,14 @@ php artisan queue:work database --queue=watermarks --sleep=3 --tries=2 --timeout
 
 La momentul implementarii, `laravel-queue` din PM2 a fost restartat.
 
+Pentru productie cu multe update-uri simultane, joburile BEM care asteapta produsul de backup au fereastra lunga de retry:
+
+- `BemSyncBackupManifestFromSourceUpdate`
+- `BemApplyProductWatermark`
+- `BemApplySourceProductWatermark`
+
+Aceste joburi pot reincerca pana la 120 de ori, cu `retryUntil` de 6 ore. Asta evita erorile false de tip `attempted too many times` cand webhook-ul de update ajunge inainte ca produsul de backup si `ProductMirror` sa fie create.
+
 ## Testare
 
 Test e2e local:
@@ -410,11 +420,19 @@ Pasii media:
 - mapeaza imaginile watermark-uite prin `prod.watermarked` de pe source
 - detecteaza imaginile sterse prin diferenta fata de istoricul `prod.watermarked`
 - trateaza imaginile noi curate ca sursa originala pentru backup
+- pentru produse vechi fara istoric BEM valid, daca imaginile curente din source sunt curate, backup-ul este reconciliat din source in ordinea curenta, chiar daca backup-ul avea deja imagini vechi
 - daca produsul backup exista dar are 0 imagini, iar `prod.watermarked` de pe source are istoric curat, seed-uieste backup-ul din acel istoric inainte de sync
 - rescrie backup-ul cu lista curenta de originale curate
 - regenereaza source cu watermark `eiluminat`
 - regenereaza target-urile din backup cu watermark-ul fiecarui magazin
 - actualizeaza `prod.watermarked`, `prod.watermark_manifest` pe backup si `ProductMirror.last_snapshot`
+
+Regula pentru produse vechi:
+
+- daca `prod.watermarked` lipseste sau nu are imagini, flow-ul nu mai mapeaza source-ul cu backup-ul doar dupa pozitie
+- daca source-ul are imagini curate, source-ul devine sursa de adevar si backup-ul este rescris cu acele originale
+- daca source-ul are imagini watermark-uite si nu exista istoric BEM sigur, bootstrap-ul se opreste si logheaza motivul; nu se ghiceste dupa pozitie
+- dupa reconcilierea backup-ului, job-ul continua normal si regenereaza watermark-ul pe source si target-uri
 
 Semnale in log:
 
@@ -441,7 +459,9 @@ TELESCOPE_ENABLED=false CACHE_DRIVER=array php artisan optimize:clear
 pm2 restart laravel-queue
 php artisan test --filter=BemWatermarkFlowTest
 php artisan test --filter=BemWatermarkUpdateManifestTest
+php artisan test --filter=BemWatermark
 php -l app/Jobs/BemSyncBackupManifestFromSourceUpdate.php
+php -l app/Services/Shopify/BemWatermark/BemWatermarkUpdateBootstrapService.php
 ```
 
 Nota: o rulare `php artisan optimize:clear` fara `CACHE_DRIVER=array` a incercat sa foloseasca MySQL pentru cache/Telescope si a scris o eroare in `laravel.log`. Comanda a fost rerulata corect cu `TELESCOPE_ENABLED=false CACHE_DRIVER=array`.

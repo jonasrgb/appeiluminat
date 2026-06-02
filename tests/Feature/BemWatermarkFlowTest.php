@@ -13,13 +13,47 @@ use Tests\TestCase;
 
 class BemWatermarkFlowTest extends TestCase
 {
+    protected function setUp(): void
+    {
+        parent::setUp();
+
+        $this->cleanupBemTempFiles();
+    }
+
     protected function tearDown(): void
     {
-        foreach (glob(storage_path('app/watermark/bem_tmp/*')) ?: [] as $path) {
-            @unlink($path);
-        }
+        $this->cleanupBemTempFiles();
 
         parent::tearDown();
+    }
+
+    private function cleanupBemTempFiles(): void
+    {
+        $dir = storage_path('app/watermark/bem_tmp/tests');
+        if (!is_dir($dir)) {
+            return;
+        }
+
+        $iterator = new \RecursiveIteratorIterator(
+            new \RecursiveDirectoryIterator($dir, \FilesystemIterator::SKIP_DOTS),
+            \RecursiveIteratorIterator::CHILD_FIRST
+        );
+
+        foreach ($iterator as $item) {
+            $item->isDir() ? @rmdir($item->getPathname()) : @unlink($item->getPathname());
+        }
+
+        @rmdir($dir);
+    }
+
+    private function bemTestTempFiles(): array
+    {
+        $dir = storage_path('app/watermark/bem_tmp/tests');
+        if (!is_dir($dir)) {
+            return [];
+        }
+
+        return glob($dir.'/*') ?: [];
     }
 
     public function test_bem_watermark_components_process_backup_image_replace_target_images_and_set_metafield(): void
@@ -202,7 +236,7 @@ class BemWatermarkFlowTest extends TestCase
         $this->assertSame('png', $metafieldPayload['images'][0]['original_extension']);
         $this->assertSame('completed', $metafieldPayload['images'][0]['status']);
         $this->assertSame('https://cdn.shopify.test/final/lustreled_lustra-led-moderna_w_p_1.png', $metafieldPayload['images'][0]['watermarked_url']);
-        $this->assertSame([], glob(storage_path('app/watermark/bem_tmp/*')) ?: []);
+        $this->assertSame([], $this->bemTestTempFiles());
     }
 
     public function test_bem_watermark_processor_preserves_webp_extension(): void
@@ -241,7 +275,7 @@ class BemWatermarkFlowTest extends TestCase
 
         app(BemWatermarkImageProcessor::class)->cleanup($processedResult['temp_paths']);
 
-        $this->assertSame([], glob(storage_path('app/watermark/bem_tmp/*')) ?: []);
+        $this->assertSame([], $this->bemTestTempFiles());
     }
 
     public function test_bem_watermark_processor_preserves_png_transparency(): void
@@ -278,13 +312,13 @@ class BemWatermarkFlowTest extends TestCase
         imagedestroy($processedImage);
         app(BemWatermarkImageProcessor::class)->cleanup($processedResult['temp_paths']);
 
-        $this->assertSame([], glob(storage_path('app/watermark/bem_tmp/*')) ?: []);
+        $this->assertSame([], $this->bemTestTempFiles());
     }
 
     public function test_bem_staged_upload_can_append_then_delete_original_media(): void
     {
         $target = $this->shop(3, 'eiluminat.myshopify.com');
-        $processedPath = storage_path('app/watermark/bem_tmp/test-append.png');
+        $processedPath = storage_path('app/watermark/bem_tmp/tests/manual/test-append.png');
 
         if (!is_dir(dirname($processedPath))) {
             mkdir(dirname($processedPath), 0755, true);

@@ -23,9 +23,9 @@ class BemApplyProductWatermark implements ShouldQueue
 {
     use Dispatchable, InteractsWithQueue, Queueable, SerializesModels;
 
-    public int $tries = 6;
+    public int $tries = 120;
     public int $timeout = 900;
-    public array $backoff = [60, 120, 180, 300, 300];
+    public array $backoff = [60, 120, 300, 600];
 
     public function __construct(
         public int $targetShopId,
@@ -36,6 +36,11 @@ class BemApplyProductWatermark implements ShouldQueue
         public string $title,
         public array $sourcePayload
     ) {
+    }
+
+    public function retryUntil(): \DateTimeInterface
+    {
+        return now()->addHours(6);
     }
 
     public function handle(
