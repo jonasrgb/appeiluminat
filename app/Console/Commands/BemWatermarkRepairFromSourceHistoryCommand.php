@@ -18,9 +18,10 @@ class BemWatermarkRepairFromSourceHistoryCommand extends Command
     protected $signature = 'bem-watermark:repair-from-source-history
         {source_product_id : Source Shopify product legacy id}
         {--shop= : Optional target shop domain or id. If omitted, repairs backup and all BEM target mirrors}
+        {--from-live-source : Use current source product images as clean originals instead of prod.watermarked history}
         {--dry-run : Show what would be repaired without replacing media}';
 
-    protected $description = 'Repair BEM images from source prod.watermarked history after a source-watermark update contamination.';
+    protected $description = 'Repair BEM images from source prod.watermarked history or current live source images.';
 
     public function handle(
         BemShopifyGraphqlClient $graphql,
@@ -47,7 +48,9 @@ class BemWatermarkRepairFromSourceHistoryCommand extends Command
         $sourceProductGid = 'gid://shopify/Product/'.$sourceProductId;
         $sourceProduct = $this->fetchProductWithWatermarked($graphql, $sourceShop, $sourceProductGid);
         $sourceTitle = (string) ($sourceProduct['title'] ?? $sourceProductId);
-        $currentImages = $this->currentImagesFromSourceHistory($sourceProduct, $identity);
+        $currentImages = $this->option('from-live-source')
+            ? $this->currentImagesFromLiveSource($sourceProduct, $identity)
+            : $this->currentImagesFromSourceHistory($sourceProduct, $identity);
 
         $backupDomain = strtolower((string) config('features.bem_watermark_sync.backup_shop_domain'));
         $backupMirror = $mirrors->first(function (ProductMirror $mirror) use ($backupDomain) {
@@ -79,6 +82,7 @@ class BemWatermarkRepairFromSourceHistoryCommand extends Command
             count($currentImages),
             $dryRun ? 'true' : 'false'
         ));
+        $this->line('source_images_mode='.($this->option('from-live-source') ? 'live_source' : 'prod_watermarked_history'));
 
         if ($dryRun) {
             $this->line(sprintf('backup=%s images=%d', $backupShop->domain, count($currentImages)));
@@ -245,8 +249,78 @@ class BemWatermarkRepairFromSourceHistoryCommand extends Command
         }
 
         if (empty($current)) {
-            throw new \RuntimeException('Source product has no current images');
+            foreach ($history as $index => $historyImage) {
+                $sourceUrl = $historyImage['source_url'] ?? null;
+                if (!$sourceUrl) {
+                    continue;
+                }
+
+                if ($identity->isWatermarkedUrl($sourceUrl)) {
+                    throw new \RuntimeException('Source history contains watermarked source_url at position '.($index + 1));
+                }
+
+                $current[] = [
+                    'position' => (int) ($historyImage['position'] ?? ($index + 1)),
+                    'source_url' => $sourceUrl,
+                    'source_watermarked_url' => $historyImage['watermarked_url'] ?? null,
+                    'watermarked_url' => $historyImage['watermarked_url'] ?? null,
+                    'filename' => $historyImage['filename'] ?? $identity->filenameFromUrl($historyImage['watermarked_url'] ?? null),
+                    'original_extension' => $historyImage['original_extension']
+                        ?? $identity->extensionFromUrl($sourceUrl),
+                    'alt' => $historyImage['alt'] ?? $sourceProduct['title'] ?? null,
+                    'status' => 'completed',
+                ];
+            }
+
+            if (!empty($current)) {
+                Log::warning('BEM repair using full source history because source product has no current images', [
+                    'source_product_id' => $sourceProduct['legacyResourceId'] ?? null,
+                    'images_count' => count($current),
+                ]);
+            }
         }
+
+        if (empty($current)) {
+            throw new \RuntimeException('Source product has no current images and no clean source history');
+        }
+
+        return $current;
+    }
+
+    private function currentImagesFromLiveSource(array $sourceProduct, BemImageIdentityService $identity): array
+    {
+        $current = [];
+
+        foreach (($sourceProduct['images']['nodes'] ?? []) as $index => $node) {
+            $url = (string) ($node['url'] ?? '');
+            if (!$url) {
+                continue;
+            }
+
+            if ($identity->isWatermarkedUrl($url)) {
+                throw new \RuntimeException('Live source image is already watermarked at position '.($index + 1).': '.$url);
+            }
+
+            $current[] = [
+                'position' => $index + 1,
+                'source_url' => $url,
+                'source_watermarked_url' => null,
+                'watermarked_url' => null,
+                'filename' => $identity->filenameFromUrl($url),
+                'original_extension' => $identity->extensionFromUrl($url),
+                'alt' => $node['altText'] ?? $sourceProduct['title'] ?? null,
+                'status' => 'completed',
+            ];
+        }
+
+        if (empty($current)) {
+            throw new \RuntimeException('Source product has no current live images');
+        }
+
+        Log::warning('BEM repair using current live source images as clean originals', [
+            'source_product_id' => $sourceProduct['legacyResourceId'] ?? null,
+            'images_count' => count($current),
+        ]);
 
         return $current;
     }

@@ -7,6 +7,12 @@ return [
         // Dry-run: when true, only log intended actions; no DB writes or Shopify mutations
         'dry_run' => env('MIRROR_BOOTSTRAP_DRY_RUN', true),
     ],
+    'parentproduct_bootstrap' => [
+        'notification_email' => env(
+            'PARENTPRODUCT_NOTIFICATION_EMAIL',
+            env('BEM_WATERMARK_NOTIFICATION_EMAIL', 'mitnickoff121@gmail.com')
+        ),
+    ],
     'stock_only_bg' => [
         // Temporary deep debug for BG stock-only sync
         'debug' => env('SHOP8_STOCK_DEBUG', false),

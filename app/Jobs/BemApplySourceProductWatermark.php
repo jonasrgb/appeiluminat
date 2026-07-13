@@ -2,12 +2,12 @@
 
 namespace App\Jobs;
 
-use App\Mail\BemWatermarkFailedMail;
 use App\Models\Shop;
 use App\Services\Shopify\BemWatermark\BemBackupProductImageResolver;
 use App\Services\Shopify\BemWatermark\BemProductWatermarkMetafieldService;
 use App\Services\Shopify\BemWatermark\BemShopifyGraphqlClient;
 use App\Services\Shopify\BemWatermark\BemShopifyStagedUploadService;
+use App\Services\Shopify\BemWatermark\BemImageIdentityService;
 use App\Services\Shopify\BemWatermark\BemWatermarkEligibilityService;
 use App\Services\Shopify\BemWatermark\BemWatermarkImageProcessor;
 use Illuminate\Bus\Queueable;
@@ -17,7 +17,6 @@ use Illuminate\Queue\InteractsWithQueue;
 use Illuminate\Queue\SerializesModels;
 use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\Log;
-use Illuminate\Support\Facades\Mail;
 use Illuminate\Support\Str;
 
 class BemApplySourceProductWatermark implements ShouldQueue
@@ -48,7 +47,8 @@ class BemApplySourceProductWatermark implements ShouldQueue
         BemWatermarkImageProcessor $imageProcessor,
         BemShopifyStagedUploadService $uploadService,
         BemProductWatermarkMetafieldService $metafieldService,
-        BemShopifyGraphqlClient $graphql
+        BemShopifyGraphqlClient $graphql,
+        BemImageIdentityService $identity
     ): void {
         $source = Shop::findOrFail($this->sourceShopId);
 
@@ -60,7 +60,8 @@ class BemApplySourceProductWatermark implements ShouldQueue
             return;
         }
 
-        $images = $this->sourceImages();
+        $watermarkedPayload = $this->fetchWatermarkedPayload($source, $graphql);
+        $images = $this->sourceImages($watermarkedPayload, $identity);
         if (empty($images)) {
             Log::info('BEM source watermark skipped: product create payload has no images', [
                 'source_shop' => $source->domain,
@@ -69,7 +70,7 @@ class BemApplySourceProductWatermark implements ShouldQueue
             return;
         }
 
-        if ($this->alreadyCompleted($source, $graphql)) {
+        if ($this->alreadyCompleted($watermarkedPayload)) {
             Log::info('BEM source watermark skipped: prod.watermarked already completed', [
                 'source_shop' => $source->domain,
                 'source_product_id' => $this->sourceProductId,
@@ -98,7 +99,15 @@ class BemApplySourceProductWatermark implements ShouldQueue
 
             $originalMediaIds = $uploadService->fetchProductImageMediaIds($source, $this->sourceProductGid);
             if (count($originalMediaIds) < count($images)) {
-                throw new \RuntimeException('BEM source watermark original media ids not ready');
+                if (count($originalMediaIds) > 0) {
+                    throw new \RuntimeException('BEM source watermark original media ids not ready');
+                }
+
+                Log::warning('BEM source watermark restoring product with no current media from clean history', [
+                    'source_shop' => $source->domain,
+                    'source_product_id' => $this->sourceProductId,
+                    'images_count' => count($images),
+                ]);
             }
 
             $processedResult = $imageProcessor->process($source, $this->title, $images);
@@ -121,7 +130,9 @@ class BemApplySourceProductWatermark implements ShouldQueue
 
             $this->waitForAppendedImages($source, $uploadService, count($originalMediaIds) + count($uploadedImages));
 
-            $uploadService->deleteProductMedia($source, $this->sourceProductGid, $originalMediaIds);
+            if (!empty($originalMediaIds)) {
+                $uploadService->deleteProductMedia($source, $this->sourceProductGid, $originalMediaIds);
+            }
             $finalImages = $uploadService->applyFinalProductImageUrls(
                 $source,
                 $this->sourceProductGid,
@@ -181,20 +192,7 @@ class BemApplySourceProductWatermark implements ShouldQueue
         ];
 
         Log::error('BEM source watermark job failed', $context);
-
-        $email = (string) config('features.bem_watermark_sync.notification_email');
-        if ($email === '') {
-            return;
-        }
-
-        try {
-            Mail::to($email)->send(new BemWatermarkFailedMail($context));
-        } catch (\Throwable $mailException) {
-            Log::error('BEM source watermark failure email failed', [
-                'error' => $mailException->getMessage(),
-                'context' => $context,
-            ]);
-        }
+        Log::warning('BEM source watermark failure email suppressed', $context);
     }
 
     private function handleBackupNotReady(Shop $source, ?string $reason, int $expectedImages, int $backupImages): void
@@ -215,7 +213,7 @@ class BemApplySourceProductWatermark implements ShouldQueue
         $this->release(60);
     }
 
-    private function alreadyCompleted(Shop $source, BemShopifyGraphqlClient $graphql): bool
+    private function fetchWatermarkedPayload(Shop $source, BemShopifyGraphqlClient $graphql): ?array
     {
         $query = <<<'GQL'
         query BemSourceWatermarkedMetafield($id: ID!) {
@@ -230,16 +228,51 @@ class BemApplySourceProductWatermark implements ShouldQueue
         $response = $graphql->request($source, $query, ['id' => $this->sourceProductGid]);
         $value = $response['data']['product']['metafield']['value'] ?? null;
         if (!$value) {
-            return false;
+            return null;
         }
 
         $payload = json_decode((string) $value, true);
+        return is_array($payload) ? $payload : null;
+    }
+
+    private function alreadyCompleted(?array $payload): bool
+    {
         if (!is_array($payload)) {
             return false;
         }
 
-        return ($payload['status'] ?? null) === 'completed'
+        $isCompleted = ($payload['status'] ?? null) === 'completed'
             || ($payload['mode'] ?? null) === 'source_product_create';
+
+        if (!$isCompleted) {
+            return false;
+        }
+
+        $productIds = array_filter([
+            $payload['source_product_id'] ?? null,
+            $payload['target_product_id'] ?? null,
+        ], static fn ($value) => $value !== null && $value !== '');
+
+        $productGids = array_filter([
+            $payload['source_product_gid'] ?? null,
+            $payload['target_product_gid'] ?? null,
+        ], static fn ($value) => $value !== null && $value !== '');
+
+        $belongsToCurrentProduct = in_array((string) $this->sourceProductId, array_map('strval', $productIds), true)
+            || in_array($this->sourceProductGid, array_map('strval', $productGids), true);
+
+        if (!$belongsToCurrentProduct) {
+            Log::warning('BEM source watermark ignoring inherited prod.watermarked metafield', [
+                'source_shop_id' => $this->sourceShopId,
+                'source_product_id' => $this->sourceProductId,
+                'source_product_gid' => $this->sourceProductGid,
+                'metafield_source_product_id' => $payload['source_product_id'] ?? null,
+                'metafield_target_product_id' => $payload['target_product_id'] ?? null,
+                'metafield_mode' => $payload['mode'] ?? null,
+            ]);
+        }
+
+        return $belongsToCurrentProduct;
     }
 
     private function waitForAppendedImages(Shop $source, BemShopifyStagedUploadService $uploadService, int $expectedCount): void
@@ -259,7 +292,7 @@ class BemApplySourceProductWatermark implements ShouldQueue
     /**
      * @return array<int, array<string, mixed>>
      */
-    private function sourceImages(): array
+    private function sourceImages(?array $watermarkedPayload, BemImageIdentityService $identity): array
     {
         $images = [];
 
@@ -275,6 +308,57 @@ class BemApplySourceProductWatermark implements ShouldQueue
                 'image_id' => $image['admin_graphql_api_id'] ?? ($image['id'] ?? null),
                 'alt' => $image['alt'] ?? ($this->title ?: null),
                 'original_extension' => $this->extensionFromUrl($sourceUrl),
+            ];
+        }
+
+        usort($images, static fn ($a, $b) => ((int) $a['position']) <=> ((int) $b['position']));
+
+        $hasWatermarkedImages = false;
+        foreach ($images as $image) {
+            if ($identity->isWatermarkedUrl($image['source_url'] ?? null)) {
+                $hasWatermarkedImages = true;
+                break;
+            }
+        }
+
+        if (!$hasWatermarkedImages) {
+            return $images;
+        }
+
+        $historyImages = $this->cleanOriginalImagesFromWatermarkedPayload($watermarkedPayload, $identity);
+        if (count($historyImages) >= count($images)) {
+            Log::warning('BEM source watermark using inherited clean original URLs for duplicated product', [
+                'source_shop_id' => $this->sourceShopId,
+                'source_product_id' => $this->sourceProductId,
+                'payload_images_count' => count($images),
+                'history_images_count' => count($historyImages),
+            ]);
+
+            return array_slice($historyImages, 0, count($images));
+        }
+
+        throw new \RuntimeException('BEM source watermark refused watermarked source images without clean history');
+    }
+
+    private function cleanOriginalImagesFromWatermarkedPayload(?array $payload, BemImageIdentityService $identity): array
+    {
+        if (!is_array($payload) || empty($payload['images']) || !is_array($payload['images'])) {
+            return [];
+        }
+
+        $images = [];
+        foreach ($payload['images'] as $index => $image) {
+            $sourceUrl = $image['source_url'] ?? null;
+            if (!$sourceUrl || $identity->isWatermarkedUrl($sourceUrl)) {
+                continue;
+            }
+
+            $images[] = [
+                'position' => (int) ($image['position'] ?? ($index + 1)),
+                'source_url' => $sourceUrl,
+                'image_id' => null,
+                'alt' => $image['alt'] ?? ($this->title ?: null),
+                'original_extension' => $image['original_extension'] ?? $this->extensionFromUrl($sourceUrl),
             ];
         }
 

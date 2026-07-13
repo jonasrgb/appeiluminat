@@ -3,6 +3,7 @@
 namespace App\Jobs;
 
 use App\Models\ProductMirror;
+use App\Models\ProductParentBackfillCandidate;
 use App\Models\VariantMirror;
 use App\Models\Shop;
 use Illuminate\Bus\Queueable;
@@ -93,7 +94,35 @@ public function handle(): void
                 $candidate = null;
                 $strategy  = null;
 
-                if ($handle) {
+                $found = $this->searchTargetProductByParentProduct($target, $this->sourceProductId);
+                if (!empty($found['gid'])) {
+                    $candidate = $found;
+                    $strategy = 'parentproduct';
+                } elseif (!empty($found['ambiguous'])) {
+                    Log::warning('Auto-bootstrap: parentproduct search ambiguous or multiple matches', [
+                        'target_shop' => $target->domain,
+                        'source_pid' => $this->sourceProductId,
+                    ]);
+                    $this->sendParentProductBootstrapIssueEmail([
+                        'mode' => 'replicate_product_update',
+                        'issue' => 'ambiguous_parentproduct',
+                        'target_shop_id' => $target->id,
+                        'target_shop' => $target->domain,
+                        'source_shop_id' => $this->sourceShopId,
+                        'source_product_id' => $this->sourceProductId,
+                        'source_title' => $this->payload['title'] ?? null,
+                        'source_handle' => $handle,
+                        'source_skus' => $skus,
+                        'searched' => [
+                            'type' => 'custom.parentproduct',
+                            'value' => $this->sourceProductId,
+                        ],
+                        'candidates' => $found['candidates'] ?? [],
+                    ]);
+                    return;
+                }
+
+                if (!$candidate && $handle) {
                     $found = $this->searchTargetProductByHandle($target, $handle);
                     if (!empty($found['gid'])) {
                         $candidate = $found;
@@ -102,6 +131,22 @@ public function handle(): void
                         Log::warning('Auto-bootstrap: handle search ambiguous or multiple matches', [
                             'target_shop' => $target->domain,
                             'handle'      => $handle,
+                        ]);
+                        $this->sendParentProductBootstrapIssueEmail([
+                            'mode' => 'replicate_product_update',
+                            'issue' => 'ambiguous_handle',
+                            'target_shop_id' => $target->id,
+                            'target_shop' => $target->domain,
+                            'source_shop_id' => $this->sourceShopId,
+                            'source_product_id' => $this->sourceProductId,
+                            'source_title' => $this->payload['title'] ?? null,
+                            'source_handle' => $handle,
+                            'source_skus' => $skus,
+                            'searched' => [
+                                'type' => 'handle',
+                                'value' => $handle,
+                            ],
+                            'candidates' => $found['candidates'] ?? [],
                         ]);
                     } else {
                     Log::info('Auto-bootstrap: no product found by handle', [
@@ -121,6 +166,22 @@ public function handle(): void
                         Log::warning('Auto-bootstrap: SKU search ambiguous or multiple products matched', [
                             'target_shop' => $target->domain,
                             'skus'        => $skus,
+                        ]);
+                        $this->sendParentProductBootstrapIssueEmail([
+                            'mode' => 'replicate_product_update',
+                            'issue' => 'ambiguous_sku',
+                            'target_shop_id' => $target->id,
+                            'target_shop' => $target->domain,
+                            'source_shop_id' => $this->sourceShopId,
+                            'source_product_id' => $this->sourceProductId,
+                            'source_title' => $this->payload['title'] ?? null,
+                            'source_handle' => $handle,
+                            'source_skus' => $skus,
+                            'searched' => [
+                                'type' => 'sku',
+                                'value' => $skus,
+                            ],
+                            'candidates' => $found['candidates'] ?? [],
                         ]);
                     } else {
                     Log::info('Auto-bootstrap: no product found by SKUs', [
@@ -1210,6 +1271,12 @@ public function handle(): void
         $title = $payload['title'] ?? null;
         if ($title !== null) {
             $diff['title'] = $title;
+        }
+
+        // handle / URL slug
+        $handle = $payload['handle'] ?? null;
+        if ($handle !== null && trim((string) $handle) !== '') {
+            $diff['handle'] = (string) $handle;
         }
 
         // body_html -> descriptionHtml
@@ -2951,6 +3018,89 @@ private function productSet(Shop $shop, array $input): void
 
 
     // --- Discovery helpers (read-only) ---
+    private function searchTargetProductByParentProduct(Shop $shop, int $sourceProductId): array
+    {
+        $snapshotMatches = ProductParentBackfillCandidate::query()
+            ->where('target_shop_id', $shop->id)
+            ->where('source_product_id', $sourceProductId)
+            ->where('parentproduct_value', $sourceProductId)
+            ->get();
+
+        if ($snapshotMatches->count() === 1) {
+            $match = $snapshotMatches->first();
+
+            return [
+                'gid' => $match->target_product_gid,
+                'handle' => $match->target_handle,
+                'title' => $match->target_title,
+            ];
+        }
+
+        if ($snapshotMatches->count() > 1) {
+            return [
+                'ambiguous' => true,
+                'candidates' => $snapshotMatches
+                    ->map(fn (ProductParentBackfillCandidate $match) => [
+                        'source_product_id' => $match->source_product_id,
+                        'target_product_id' => $match->target_product_id,
+                        'target_product_gid' => $match->target_product_gid,
+                        'target_title' => $match->target_title,
+                        'target_handle' => $match->target_handle,
+                        'match_status' => $match->match_status,
+                    ])
+                    ->values()
+                    ->all(),
+            ];
+        }
+
+        $q = <<<'GQL'
+        query($query: String!) {
+          products(first: 10, query: $query) {
+            nodes {
+              id
+              handle
+              title
+              metafield(namespace: "custom", key: "parentproduct") {
+                value
+              }
+            }
+          }
+        }
+        GQL;
+
+        $queryStr = 'metafields.custom.parentproduct:' . $sourceProductId;
+        $res = $this->gql($shop, $q, ['query' => $queryStr]);
+        $nodes = $res['data']['products']['nodes'] ?? [];
+        $matches = [];
+
+        foreach ($nodes as $node) {
+            if ((string)($node['metafield']['value'] ?? '') !== (string)$sourceProductId) {
+                continue;
+            }
+
+            $matches[] = $node;
+        }
+
+        if (count($matches) === 1) {
+            return [
+                'gid' => $matches[0]['id'] ?? null,
+                'handle' => $matches[0]['handle'] ?? null,
+                'title' => $matches[0]['title'] ?? null,
+            ];
+        }
+
+        return [
+            'ambiguous' => count($matches) > 1,
+            'candidates' => array_values(array_map(fn (array $node) => [
+                'target_product_gid' => $node['id'] ?? null,
+                'target_product_id' => isset($node['id']) ? $this->numericIdFromGid($node['id']) : null,
+                'target_title' => $node['title'] ?? null,
+                'target_handle' => $node['handle'] ?? null,
+                'parentproduct' => $node['metafield']['value'] ?? null,
+            ], $matches)),
+        ];
+    }
+
     private function searchTargetProductByHandle(Shop $shop, string $handle): array
     {
         $q = <<<'GQL'
@@ -2971,7 +3121,15 @@ private function productSet(Shop $shop, array $input): void
                 'title'  => $nodes[0]['title'] ?? null,
             ];
         }
-        return ['ambiguous' => count($nodes) > 1];
+        return [
+            'ambiguous' => count($nodes) > 1,
+            'candidates' => array_values(array_map(fn (array $node) => [
+                'target_product_gid' => $node['id'] ?? null,
+                'target_product_id' => isset($node['id']) ? $this->numericIdFromGid($node['id']) : null,
+                'target_title' => $node['title'] ?? null,
+                'target_handle' => $node['handle'] ?? null,
+            ], $nodes)),
+        ];
     }
 
     private function searchTargetProductBySkus(Shop $shop, array $skus): array
@@ -3002,7 +3160,22 @@ private function productSet(Shop $shop, array $input): void
                 'title'  => $nodes[0]['title'] ?? null,
             ];
         }
-        return ['ambiguous' => count($nodes) > 1];
+        return [
+            'ambiguous' => count($nodes) > 1,
+            'candidates' => array_values(array_map(fn (array $node) => [
+                'target_product_gid' => $node['id'] ?? null,
+                'target_product_id' => isset($node['id']) ? $this->numericIdFromGid($node['id']) : null,
+                'target_title' => $node['title'] ?? null,
+                'target_handle' => $node['handle'] ?? null,
+            ], $nodes)),
+        ];
+    }
+
+    private function sendParentProductBootstrapIssueEmail(array $context): void
+    {
+        $context['created_at'] = now()->toIso8601String();
+
+        Log::warning('Parentproduct bootstrap issue email suppressed', $context);
     }
 
     // Normalizează nume/opțiuni ca să construim chei stabile

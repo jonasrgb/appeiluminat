@@ -2,7 +2,6 @@
 
 namespace App\Jobs;
 
-use App\Mail\BemWatermarkFailedMail;
 use App\Models\ProductMirror;
 use App\Models\Shop;
 use App\Services\Shopify\BemWatermark\BemBackupManifestService;
@@ -21,7 +20,6 @@ use Illuminate\Queue\InteractsWithQueue;
 use Illuminate\Queue\SerializesModels;
 use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\Log;
-use Illuminate\Support\Facades\Mail;
 use Illuminate\Support\Str;
 
 class BemSyncBackupManifestFromSourceUpdate implements ShouldQueue
@@ -264,20 +262,7 @@ class BemSyncBackupManifestFromSourceUpdate implements ShouldQueue
         ];
 
         Log::error('BEM update manifest sync failed', $context);
-
-        $email = (string) config('features.bem_watermark_sync.notification_email');
-        if ($email === '') {
-            return;
-        }
-
-        try {
-            Mail::to($email)->send(new BemWatermarkFailedMail($context));
-        } catch (\Throwable $mailException) {
-            Log::error('BEM update manifest failure email failed', [
-                'error' => $mailException->getMessage(),
-                'context' => $context,
-            ]);
-        }
+        Log::warning('BEM update manifest failure email suppressed', $context);
     }
 
     /**

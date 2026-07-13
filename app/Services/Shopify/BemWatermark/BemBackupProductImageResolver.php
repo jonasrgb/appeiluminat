@@ -8,8 +8,10 @@ use Illuminate\Support\Facades\Log;
 
 class BemBackupProductImageResolver
 {
-    public function __construct(private readonly BemShopifyGraphqlClient $graphql)
-    {
+    public function __construct(
+        private readonly BemShopifyGraphqlClient $graphql,
+        private readonly BemImageIdentityService $identity
+    ) {
     }
 
     public function resolve(int $sourceShopId, int $sourceProductId): BemBackupProductImageResult
@@ -62,6 +64,18 @@ class BemBackupProductImageResolver
             $url = $node['url'] ?? null;
             if (!$url) {
                 continue;
+            }
+
+            if ($this->identity->isWatermarkedUrl($url)) {
+                Log::warning('BEM watermark backup product has watermarked image', [
+                    'backup_shop' => $backupShop->domain,
+                    'backup_product_gid' => $mirror->target_product_gid,
+                    'source_product_id' => $sourceProductId,
+                    'position' => $index + 1,
+                    'url' => $url,
+                ]);
+
+                return BemBackupProductImageResult::notReady('Backup product has watermarked image at position '.($index + 1));
             }
 
             $images[] = [

@@ -2,7 +2,6 @@
 
 namespace App\Jobs;
 
-use App\Mail\BemWatermarkFailedMail;
 use App\Models\Shop;
 use App\Services\Shopify\BemWatermark\BemBackupProductImageResolver;
 use App\Services\Shopify\BemWatermark\BemProductWatermarkMetafieldService;
@@ -16,7 +15,6 @@ use Illuminate\Queue\InteractsWithQueue;
 use Illuminate\Queue\SerializesModels;
 use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\Log;
-use Illuminate\Support\Facades\Mail;
 use Illuminate\Support\Str;
 
 class BemApplyProductWatermark implements ShouldQueue
@@ -232,20 +230,7 @@ class BemApplyProductWatermark implements ShouldQueue
         ];
 
         Log::error('BEM watermark job failed', $context);
-
-        $email = (string) config('features.bem_watermark_sync.notification_email');
-        if ($email === '') {
-            return;
-        }
-
-        try {
-            Mail::to($email)->send(new BemWatermarkFailedMail($context));
-        } catch (\Throwable $mailException) {
-            Log::error('BEM watermark failure email failed', [
-                'error' => $mailException->getMessage(),
-                'context' => $context,
-            ]);
-        }
+        Log::warning('BEM watermark failure email suppressed', $context);
     }
 
     private function lockKey(Shop $target): string

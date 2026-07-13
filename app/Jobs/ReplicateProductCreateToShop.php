@@ -16,6 +16,7 @@ use Illuminate\Support\Facades\Mail;
 use App\Services\Shopify\ProductImagesBackupService;
 use App\Jobs\BemApplyProductWatermark;
 use App\Services\Shopify\BemWatermark\BemBackupProductImageResolver;
+use App\Services\Shopify\BemWatermark\BemImageIdentityService;
 use App\Services\Shopify\BemWatermark\BemProductWatermarkMetafieldService;
 use App\Services\Shopify\BemWatermark\BemShopifyStagedUploadService;
 use App\Services\Shopify\BemWatermark\BemWatermarkEligibilityService;
@@ -77,6 +78,7 @@ class ReplicateProductCreateToShop implements ShouldQueue
                 ]);
 
                 if ($existingMirror->target_product_gid) {
+                    $this->setParentProductMetafield($target, $existingMirror->target_product_gid);
                     $this->dispatchBemWatermarkIfEligible(
                         $target,
                         $existingMirror->target_product_gid,
@@ -94,11 +96,13 @@ class ReplicateProductCreateToShop implements ShouldQueue
             }
 
             $bemTempPaths = $bemCreate['temp_paths'] ?? [];
+            $basePayloadForCreate = $this->payloadWithCleanImagesForBackupCreate($target, $this->payload);
             $payloadForCreate = $bemCreate
                 ? $this->payloadWithBemWatermarkedImages($this->payload, $bemCreate['images'])
-                : $this->payload;
+                : $basePayloadForCreate;
 
             [$productGid, $productLegacyId, $variantMap] = $this->productCreate($target, $payloadForCreate, $metaDescription);
+            $this->setParentProductMetafield($target, $productGid);
 
             $this->attachProductToManualCollection($target, $productGid);
 
@@ -122,7 +126,7 @@ class ReplicateProductCreateToShop implements ShouldQueue
                 'target_shop_id'    => $target->id,
             ])->first();
 
-            $imgs = $this->extractSourceImages($this->payload);
+            $imgs = $this->extractSourceImages($payloadForCreate);
 
             if ($mirror) {
                 $snap = is_array($mirror->last_snapshot ?? null)
@@ -374,6 +378,140 @@ class ReplicateProductCreateToShop implements ShouldQueue
             'images' => $uploadedImages,
             'temp_paths' => $processedResult['temp_paths'],
         ];
+    }
+
+    private function setParentProductMetafield(Shop $target, string $productGid): void
+    {
+        $mutation = <<<'GQL'
+        mutation SetParentProduct($metafields: [MetafieldsSetInput!]!) {
+          metafieldsSet(metafields: $metafields) {
+            userErrors { field message code }
+          }
+        }
+        GQL;
+
+        try {
+            $response = $this->gql($target, $mutation, [
+                'metafields' => [[
+                    'ownerId' => $productGid,
+                    'namespace' => 'custom',
+                    'key' => 'parentproduct',
+                    'type' => 'number_integer',
+                    'value' => (string) $this->sourceProductId,
+                ]],
+            ]);
+
+            $errors = $response['data']['metafieldsSet']['userErrors'] ?? [];
+            if (!empty($errors)) {
+                Log::warning('Parentproduct metafield set returned user errors', [
+                    'target_shop' => $target->domain,
+                    'target_product_gid' => $productGid,
+                    'source_product_id' => $this->sourceProductId,
+                    'errors' => $errors,
+                ]);
+                return;
+            }
+
+            Log::info('Parentproduct metafield set on created product', [
+                'target_shop' => $target->domain,
+                'target_product_gid' => $productGid,
+                'source_product_id' => $this->sourceProductId,
+            ]);
+        } catch (\Throwable $e) {
+            Log::error('Parentproduct metafield set failed on created product', [
+                'target_shop' => $target->domain,
+                'target_product_gid' => $productGid,
+                'source_product_id' => $this->sourceProductId,
+                'error' => $e->getMessage(),
+            ]);
+        }
+    }
+
+    private function payloadWithCleanImagesForBackupCreate(Shop $target, array $payload): array
+    {
+        $backupDomain = strtolower((string) config('features.bem_watermark_sync.backup_shop_domain'));
+        if ($backupDomain === '' || strtolower((string) $target->domain) !== $backupDomain) {
+            return $payload;
+        }
+
+        $identity = app(BemImageIdentityService::class);
+        $images = $this->extractSourceImages($payload);
+        $hasWatermarkedImages = false;
+        foreach ($images as $image) {
+            if ($identity->isWatermarkedUrl($image['src'] ?? null)) {
+                $hasWatermarkedImages = true;
+                break;
+            }
+        }
+
+        if (!$hasWatermarkedImages) {
+            return $payload;
+        }
+
+        $historyImages = $this->cleanOriginalImagesFromSourceWatermarkedMetafield($identity);
+        if (count($historyImages) < count($images)) {
+            throw new \RuntimeException('BEM backup create refused watermarked source images without clean history');
+        }
+
+        $title = $payload['title'] ?? null;
+        $payload['images'] = array_map(static fn (array $image) => array_filter([
+            'src' => $image['source_url'] ?? null,
+            'alt' => $image['alt'] ?? $title,
+            'position' => $image['position'] ?? null,
+        ], static fn ($value) => $value !== null), array_slice($historyImages, 0, count($images)));
+
+        Log::warning('BEM backup create replaced inherited watermarked payload images with clean originals', [
+            'target_shop' => $target->domain,
+            'source_product_id' => $this->sourceProductId,
+            'images_count' => count($payload['images']),
+        ]);
+
+        return $payload;
+    }
+
+    private function cleanOriginalImagesFromSourceWatermarkedMetafield(BemImageIdentityService $identity): array
+    {
+        $source = Shop::find($this->sourceShopId);
+        if (!$source) {
+            return [];
+        }
+
+        $query = <<<'GQL'
+        query SourceWatermarkedForBackupCreate($id: ID!) {
+          product(id: $id) {
+            metafield(namespace: "prod", key: "watermarked") {
+              value
+            }
+          }
+        }
+        GQL;
+
+        $response = $this->gql($source, $query, [
+            'id' => "gid://shopify/Product/{$this->sourceProductId}",
+        ]);
+        $value = $response['data']['product']['metafield']['value'] ?? null;
+        $payload = $value ? json_decode((string) $value, true) : null;
+        if (!is_array($payload) || empty($payload['images']) || !is_array($payload['images'])) {
+            return [];
+        }
+
+        $images = [];
+        foreach ($payload['images'] as $index => $image) {
+            $sourceUrl = $image['source_url'] ?? null;
+            if (!$sourceUrl || $identity->isWatermarkedUrl($sourceUrl)) {
+                continue;
+            }
+
+            $images[] = [
+                'position' => (int) ($image['position'] ?? ($index + 1)),
+                'source_url' => $sourceUrl,
+                'alt' => $image['alt'] ?? ($this->payload['title'] ?? null),
+            ];
+        }
+
+        usort($images, static fn ($a, $b) => ((int) $a['position']) <=> ((int) $b['position']));
+
+        return $images;
     }
 
     private function payloadWithBemWatermarkedImages(array $payload, array $images): array
@@ -1156,6 +1294,7 @@ class ReplicateProductCreateToShop implements ShouldQueue
 
         $input = array_filter([
             'id'          => $productGid,
+            'handle'      => isset($src['handle']) && trim((string) $src['handle']) !== '' ? (string) $src['handle'] : null,
             'tags'        => $tags ?: null,
             'productType' => $src['product_type'] ?? null,
             'vendor'      => $src['vendor'] ?? null,

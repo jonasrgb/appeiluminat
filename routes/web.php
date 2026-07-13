@@ -28,6 +28,10 @@ Route::middleware(['auth', 'verified'])->group(function () {
         ->name('product-parent-backfill.index');
     Route::get('/dashboard/product-parent-backfill/unmatched', [ProductParentBackfillController::class, 'unmatched'])
         ->name('product-parent-backfill.unmatched');
+    Route::get('/dashboard/product-parent-backfill/duplicates', [ProductParentBackfillController::class, 'duplicates'])
+        ->name('product-parent-backfill.duplicates');
+    Route::get('/dashboard/duplicates/{shop}', [ProductParentBackfillController::class, 'duplicatesByShop'])
+        ->name('product-parent-duplicates.shop');
 });
 
 Route::middleware('auth')->group(function () {

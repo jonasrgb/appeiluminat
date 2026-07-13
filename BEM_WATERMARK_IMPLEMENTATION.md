@@ -450,6 +450,19 @@ Comportament asteptat:
 - daca s-au adaugat imagini curate: backup primeste originalele curate, target-urile primesc watermark-ul lor
 - daca apare o imagine watermark-uita necunoscuta: flow-ul se opreste si trimite eroare/log/email
 
+## Duplicate Cu Media Watermark-uita
+
+La duplicarea unui produs cu media bifata, Shopify poate copia imaginile deja watermark-uite si metafield-ul `prod.watermarked` de pe produsul original.
+
+Protectii implementate:
+
+- `BemApplySourceProductWatermark` nu mai considera `prod.watermarked` valid daca ID-ul/GID-ul din metafield nu apartine produsului nou.
+- Daca imaginile din payload sunt deja watermark-uite, jobul sursa foloseste URL-urile originale curate din istoricul `prod.watermarked` mostenit, cand acestea exista.
+- Daca nu exista istoric curat, jobul refuza sa aplice watermark peste watermark si trimite eroare controlata.
+- `BemBackupProductImageResolver` refuza backup-uri care contin imagini watermark-uite, ca sa nu fie folosite drept originale.
+- `ReplicateProductCreateToShop` inlocuieste imaginile watermark-uite cu originale curate cand creeaza produsul in magazinul de backup.
+- `ReplicateProductCreateToShop` seteaza `custom.parentproduct` pe produsele create in target/backup.
+
 ## Comenzi Rulate
 
 ```bash

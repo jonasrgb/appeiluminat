@@ -208,3 +208,14 @@ php artisan test --filter=BemWatermark
 - [ ] Testeaza SKU ambiguu cu `parentproduct` unic.
 - [ ] Scrie comanda de backfill pentru produse vechi.
 - [ ] Ruleaza backfill dry-run si analizeaza ambiguitatile.
+
+## Implementat Pe 2026-06-02
+
+- Backfill/dashboard separat pentru `custom.parentproduct`.
+- `ReplicateProductUpdateToShop` cauta acum produsul target dupa snapshot-ul local de backfill `custom.parentproduct` inainte de handle/SKU cand lipseste `ProductMirror` si `MIRROR_BOOTSTRAP_ENABLED=true`.
+- `BemWatermarkUpdateBootstrapService` foloseste aceeasi ordine: `ProductMirror`, snapshot/backfill `custom.parentproduct`, Shopify `custom.parentproduct`, handle, SKU.
+- Snapshot-ul local este folosit primul deoarece Shopify product search poate intoarce produse care au metafield-ul, fara sa garanteze ca primele rezultate includ valoarea exacta cautata.
+- Cazurile de ambiguitate trimit email `Parentproduct bootstrap issue` catre `PARENTPRODUCT_NOTIFICATION_EMAIL` sau, daca nu este setat, catre `BEM_WATERMARK_NOTIFICATION_EMAIL`.
+- Emailul include magazinul target, produsul sursa, criteriul cautat si lista de candidati gasiti.
+- `ReplicateProductCreateToShop` si `ReplicateProductUpdateToShop` sincronizeaza acum si `handle` din magazinul sursa, nu doar titlul.
+- Daca sunt mai multe produse target cu acelasi `custom.parentproduct`, flow-ul se opreste si logheaza ambiguitatea.
