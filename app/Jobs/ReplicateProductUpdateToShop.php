@@ -2349,8 +2349,7 @@ public function handle(): void
         return true;
     }
 
-    // --- Target variants: citire și mapare pe cheie canonică ---
-    private function fetchTargetVariantsMap(Shop $shop, string $productGid, array $optionNames): array
+    private function fetchTargetVariantsForMapping(Shop $shop, string $productGid, array $optionNames): array
     {
         $q = <<<'GQL'
         query($id: ID!) {
@@ -2359,6 +2358,7 @@ public function handle(): void
             nodes {
                 id
                 selectedOptions { name value }
+                metafield(namespace: "custom", key: "parentvariant") { value }
             }
             }
         }
@@ -2368,7 +2368,9 @@ public function handle(): void
         $r = $this->gql($shop, $q, ['id' => $productGid]);
         $nodes = $r['data']['product']['variants']['nodes'] ?? [];
 
-        $map = [];
+        $byKey = [];
+        $byParentVariantId = [];
+        $nodesByGid = [];
         foreach ($nodes as $v) {
             // construim cheia canonică din selectedOptions în ORDINEA din $optionNames
             $sel = $v['selectedOptions'] ?? [];
@@ -2381,9 +2383,34 @@ public function handle(): void
                 $parts[] = $this->canonOptName($name).'='.($byName[$this->canonOptName($name)] ?? '');
             }
             $key = implode('|', $parts);
-            $map[$key] = $v['id'] ?? null; // target variant GID
+            $gid = $v['id'] ?? null;
+            if (!$gid) {
+                continue;
+            }
+
+            $parentVariantValue = trim((string)($v['metafield']['value'] ?? ''));
+            $v['parentvariant_value'] = $parentVariantValue;
+
+            $byKey[$key] = $gid; // target variant GID
+            $nodesByGid[$gid] = $v;
+
+            if ($parentVariantValue !== '') {
+                $byParentVariantId[$parentVariantValue] = $gid;
+            }
         }
-        return $map;
+
+        return [
+            'by_key' => $byKey,
+            'by_parent_variant_id' => $byParentVariantId,
+            'nodes_by_gid' => $nodesByGid,
+            'nodes' => array_values($nodesByGid),
+        ];
+    }
+
+    // --- Target variants: citire și mapare pe cheie canonică ---
+    private function fetchTargetVariantsMap(Shop $shop, string $productGid, array $optionNames): array
+    {
+        return $this->fetchTargetVariantsForMapping($shop, $productGid, $optionNames)['by_key'] ?? [];
     }
 
     // Citește de pe produsul sursă starea tracked pentru fiecare variantă și mapează pe cheia canonică
@@ -2432,8 +2459,13 @@ private function ensureVariantMirrors(
 ): void {
     $optionNames = array_map(fn($o) => $o['name'], $srcOptions);
 
+    $targetVariantState = $this->fetchTargetVariantsForMapping($target, $pm->target_product_gid, $optionNames);
+
     // key => targetVariantGid (din Shopify target)
-    $targetMap = $this->fetchTargetVariantsMap($target, $pm->target_product_gid, $optionNames);
+    $targetMap = $targetVariantState['by_key'] ?? [];
+    $targetByParentVariant = $targetVariantState['by_parent_variant_id'] ?? [];
+    $targetNodesByGid = $targetVariantState['nodes_by_gid'] ?? [];
+    $targetNodes = $targetVariantState['nodes'] ?? [];
 
     foreach ($srcVariantsByKey as $rawKey => $sv) {
         $ckey = $this->canonKey($rawKey);
@@ -2455,6 +2487,18 @@ private function ensureVariantMirrors(
         }
 
         $targetGid = $targetMap[$ckey] ?? null;
+        $matchedBy = $targetGid ? 'options_key' : null;
+
+        if (!$targetGid && $srcVarId) {
+            $targetGid = $targetByParentVariant[(string)$srcVarId] ?? null;
+            $matchedBy = $targetGid ? 'parentvariant' : null;
+        }
+
+        if (!$targetGid && count($srcVariantsByKey) === 1 && count($targetNodes) === 1) {
+            $targetGid = $targetNodes[0]['id'] ?? null;
+            $matchedBy = $targetGid ? 'single_variant' : null;
+        }
+
         if (!$vm) {
             // nu avem rând – creăm doar dacă putem mappa la o variantă din target
             if (!$targetGid) {
@@ -2479,6 +2523,7 @@ private function ensureVariantMirrors(
                 'product_mirror_id' => $pm->id,
                 'key'               => $ckey,
                 'target_gid'        => $targetGid,
+                'matched_by'        => $matchedBy,
             ]);
         } else {
             // există – facem backfill/normalizare fără să stricăm fingerprint-urile existente
@@ -2492,6 +2537,11 @@ private function ensureVariantMirrors(
             if ($targetGid && $vm->target_variant_gid !== $targetGid) {
                 $vm->target_variant_gid = $targetGid;
                 $dirty = true;
+            } elseif (!$targetGid && !empty($vm->target_variant_gid) && isset($targetNodesByGid[$vm->target_variant_gid])) {
+                // Varianta există încă în Shopify, dar opțiunile ei nu mai coincid cu cheia sursă.
+                // Păstrăm legătura și o lăsăm să fie normalizată de update-ul curent.
+                $targetGid = $vm->target_variant_gid;
+                $matchedBy = 'existing_mirror_gid';
             } elseif (!$targetGid && !empty($vm->target_variant_gid)) {
                 // Varianta nu mai există pe target (a fost ștearsă sau nu a fost creată niciodată).
                 // Ștergem intrarea din mirror ca să fie tratată ca toCreate la pasul următor.
@@ -2524,8 +2574,68 @@ private function ensureVariantMirrors(
                 // ]);
             }
         }
+
+        if ($targetGid && $srcVarId) {
+            $currentParentVariant = (string)($targetNodesByGid[$targetGid]['parentvariant_value'] ?? '');
+            if ($currentParentVariant !== (string)$srcVarId) {
+                $this->setParentVariantMetafield($target, $targetGid, (int)$srcVarId, $matchedBy);
+                if (isset($targetNodesByGid[$targetGid])) {
+                    $targetNodesByGid[$targetGid]['parentvariant_value'] = (string)$srcVarId;
+                }
+            }
+        }
     }
 }
+
+    private function setParentVariantMetafield(Shop $target, string $targetVariantGid, int $sourceVariantId, ?string $matchedBy = null): void
+    {
+        $mutation = <<<'GQL'
+        mutation SetParentVariant($metafields: [MetafieldsSetInput!]!) {
+          metafieldsSet(metafields: $metafields) {
+            userErrors { field message code }
+          }
+        }
+        GQL;
+
+        try {
+            $response = $this->gql($target, $mutation, [
+                'metafields' => [[
+                    'ownerId' => $targetVariantGid,
+                    'namespace' => 'custom',
+                    'key' => 'parentvariant',
+                    'type' => 'number_integer',
+                    'value' => (string)$sourceVariantId,
+                ]],
+            ]);
+
+            $errors = $response['data']['metafieldsSet']['userErrors'] ?? [];
+            if (!empty($errors)) {
+                Log::warning('Parentvariant metafield set returned user errors', [
+                    'target_shop' => $target->domain,
+                    'target_variant_gid' => $targetVariantGid,
+                    'source_variant_id' => $sourceVariantId,
+                    'matched_by' => $matchedBy,
+                    'errors' => $errors,
+                ]);
+                return;
+            }
+
+            Log::info('Parentvariant metafield set on target variant', [
+                'target_shop' => $target->domain,
+                'target_variant_gid' => $targetVariantGid,
+                'source_variant_id' => $sourceVariantId,
+                'matched_by' => $matchedBy,
+            ]);
+        } catch (\Throwable $e) {
+            Log::warning('Parentvariant metafield set failed on target variant', [
+                'target_shop' => $target->domain,
+                'target_variant_gid' => $targetVariantGid,
+                'source_variant_id' => $sourceVariantId,
+                'matched_by' => $matchedBy,
+                'error' => $e->getMessage(),
+            ]);
+        }
+    }
 
 
 

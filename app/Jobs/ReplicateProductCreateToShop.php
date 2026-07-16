@@ -173,6 +173,14 @@ class ReplicateProductCreateToShop implements ShouldQueue
                             ])),
                         ]
                     );
+
+                    if (!empty($vm['source_variant_id']) && !empty($vm['target_variant_gid'])) {
+                        $this->setParentVariantMetafield(
+                            $target,
+                            $vm['target_variant_gid'],
+                            (int)$vm['source_variant_id']
+                        );
+                    }
                 }
             }
 
@@ -422,6 +430,53 @@ class ReplicateProductCreateToShop implements ShouldQueue
                 'target_shop' => $target->domain,
                 'target_product_gid' => $productGid,
                 'source_product_id' => $this->sourceProductId,
+                'error' => $e->getMessage(),
+            ]);
+        }
+    }
+
+    private function setParentVariantMetafield(Shop $target, string $targetVariantGid, int $sourceVariantId): void
+    {
+        $mutation = <<<'GQL'
+        mutation SetParentVariant($metafields: [MetafieldsSetInput!]!) {
+          metafieldsSet(metafields: $metafields) {
+            userErrors { field message code }
+          }
+        }
+        GQL;
+
+        try {
+            $response = $this->gql($target, $mutation, [
+                'metafields' => [[
+                    'ownerId' => $targetVariantGid,
+                    'namespace' => 'custom',
+                    'key' => 'parentvariant',
+                    'type' => 'number_integer',
+                    'value' => (string)$sourceVariantId,
+                ]],
+            ]);
+
+            $errors = $response['data']['metafieldsSet']['userErrors'] ?? [];
+            if (!empty($errors)) {
+                Log::warning('Parentvariant metafield set returned user errors on created variant', [
+                    'target_shop' => $target->domain,
+                    'target_variant_gid' => $targetVariantGid,
+                    'source_variant_id' => $sourceVariantId,
+                    'errors' => $errors,
+                ]);
+                return;
+            }
+
+            Log::info('Parentvariant metafield set on created variant', [
+                'target_shop' => $target->domain,
+                'target_variant_gid' => $targetVariantGid,
+                'source_variant_id' => $sourceVariantId,
+            ]);
+        } catch (\Throwable $e) {
+            Log::warning('Parentvariant metafield set failed on created variant', [
+                'target_shop' => $target->domain,
+                'target_variant_gid' => $targetVariantGid,
+                'source_variant_id' => $sourceVariantId,
                 'error' => $e->getMessage(),
             ]);
         }
