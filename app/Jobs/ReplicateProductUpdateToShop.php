@@ -6,6 +6,7 @@ use App\Models\ProductMirror;
 use App\Models\ProductParentBackfillCandidate;
 use App\Models\VariantMirror;
 use App\Models\Shop;
+use App\Models\SourceProductDeletion;
 use Illuminate\Bus\Queueable;
 use Illuminate\Contracts\Queue\ShouldQueue;
 use Illuminate\Foundation\Bus\Dispatchable;
@@ -51,6 +52,15 @@ class ReplicateProductUpdateToShop implements ShouldQueue
 
 public function handle(): void
 {
+    if (SourceProductDeletion::existsFor($this->sourceShopId, $this->sourceProductId)) {
+        Log::warning('ReplicateProductUpdate skipped: source product was deleted', [
+            'source_shop_id' => $this->sourceShopId,
+            'source_product_id' => $this->sourceProductId,
+            'target_shop_id' => $this->targetShopId,
+        ]);
+        return;
+    }
+
     $target = Shop::findOrFail($this->targetShopId);
     if ((int)$target->id === 8 || $target->domain === 'eiluminat-bg.myshopify.com') {
         Log::info('ReplicateProductUpdateToShop skipped for BG store', [

@@ -5,11 +5,13 @@ namespace App\Jobs;
 use App\Models\ProductMirror;
 use App\Models\VariantMirror;
 use App\Models\Shop;
+use App\Models\SourceProductDeletion;
 use Illuminate\Bus\Queueable;
 use Illuminate\Contracts\Queue\ShouldQueue;
 use Illuminate\Foundation\Bus\Dispatchable;
 use Illuminate\Queue\InteractsWithQueue;
 use Illuminate\Queue\SerializesModels;
+use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\Http;
 use Illuminate\Support\Facades\Log;
 use Illuminate\Support\Facades\Mail;
@@ -49,8 +51,18 @@ class ReplicateProductCreateToShop implements ShouldQueue
     public function handle(): void
     {
         $bemTempPaths = [];
+        $creationLock = null;
 
         try {
+            if (SourceProductDeletion::existsFor($this->sourceShopId, $this->sourceProductId)) {
+                Log::warning('ReplicateProductCreate skipped: source product was deleted', [
+                    'source_shop_id' => $this->sourceShopId,
+                    'source_product_id' => $this->sourceProductId,
+                    'target_shop_id' => $this->targetShopId,
+                ]);
+                return;
+            }
+
             $target = Shop::findOrFail($this->targetShopId);
 
             if ((int)$target->id === 8 || $target->domain === 'eiluminat-bg.myshopify.com') {
@@ -59,6 +71,25 @@ class ReplicateProductCreateToShop implements ShouldQueue
                     'target_shop_domain' => $target->domain,
                     'source_product_id' => $this->sourceProductId,
                 ]);
+                return;
+            }
+
+            // A create webhook can be delivered more than once. Serialize each
+            // source-to-target creation so a retry cannot create a second copy.
+            $creationLock = Cache::store('file')->lock(
+                "product-replication-create:{$this->sourceShopId}:{$this->sourceProductId}:{$target->id}",
+                900
+            );
+
+            if (!$creationLock->get()) {
+                Log::info('ReplicateProductCreate delayed: creation already in progress', [
+                    'source_shop_id' => $this->sourceShopId,
+                    'source_product_id' => $this->sourceProductId,
+                    'target_shop_id' => $target->id,
+                    'target_shop' => $target->domain,
+                ]);
+
+                $this->release(15);
                 return;
             }
 
@@ -89,6 +120,35 @@ class ReplicateProductCreateToShop implements ShouldQueue
                 return;
             }
 
+            $existingParentProduct = $this->existingShopifyProductByParentProduct($target);
+            if ($existingParentProduct['status'] === 'ambiguous') {
+                Log::error('ReplicateProductCreate stopped: multiple products share parentproduct', [
+                    'source_shop_id' => $this->sourceShopId,
+                    'source_product_id' => $this->sourceProductId,
+                    'target_shop_id' => $target->id,
+                    'target_shop' => $target->domain,
+                    'candidates' => $existingParentProduct['products'],
+                ]);
+
+                return;
+            }
+
+            if ($existingParentProduct['status'] === 'found') {
+                $product = $existingParentProduct['products'][0];
+                $this->storeExistingProductMirror($target, $product);
+
+                Log::warning('ReplicateProductCreate skipped: existing Shopify parentproduct found, preventing duplicate create', [
+                    'source_shop_id' => $this->sourceShopId,
+                    'source_product_id' => $this->sourceProductId,
+                    'target_shop_id' => $target->id,
+                    'target_shop' => $target->domain,
+                    'target_product_id' => $product['id'],
+                    'target_product_gid' => $product['gid'],
+                ]);
+
+                return;
+            }
+
             $metaDescription = $this->fetchSourceMetaDescription();
             $bemCreate = $this->prepareBemWatermarkedCreate($target);
             if (($bemCreate['released'] ?? false) === true) {
@@ -100,6 +160,37 @@ class ReplicateProductCreateToShop implements ShouldQueue
             $payloadForCreate = $bemCreate
                 ? $this->payloadWithBemWatermarkedImages($this->payload, $bemCreate['images'])
                 : $basePayloadForCreate;
+
+            // The delete webhook may have arrived while BEM media was being prepared.
+            if (SourceProductDeletion::existsFor($this->sourceShopId, $this->sourceProductId)) {
+                Log::warning('ReplicateProductCreate skipped before Shopify create: source product was deleted', [
+                    'source_shop_id' => $this->sourceShopId,
+                    'source_product_id' => $this->sourceProductId,
+                    'target_shop_id' => $this->targetShopId,
+                ]);
+                return;
+            }
+
+            // BEM processing can take time. Check again immediately before the
+            // write in case another execution created the target meanwhile.
+            $existingParentProduct = $this->existingShopifyProductByParentProduct($target);
+            if ($existingParentProduct['status'] !== 'none') {
+                if ($existingParentProduct['status'] === 'found') {
+                    $product = $existingParentProduct['products'][0];
+                    $this->storeExistingProductMirror($target, $product);
+                }
+
+                Log::warning('ReplicateProductCreate skipped before Shopify create: parentproduct already exists', [
+                    'source_shop_id' => $this->sourceShopId,
+                    'source_product_id' => $this->sourceProductId,
+                    'target_shop_id' => $target->id,
+                    'target_shop' => $target->domain,
+                    'status' => $existingParentProduct['status'],
+                    'candidates' => $existingParentProduct['products'],
+                ]);
+
+                return;
+            }
 
             [$productGid, $productLegacyId, $variantMap] = $this->productCreate($target, $payloadForCreate, $metaDescription);
             $this->setParentProductMetafield($target, $productGid);
@@ -226,6 +317,8 @@ class ReplicateProductCreateToShop implements ShouldQueue
 
             throw $e;
         } finally {
+            optional($creationLock)->release();
+
             if (!empty($bemTempPaths)) {
                 try {
                     app(BemWatermarkImageProcessor::class)->cleanup($bemTempPaths);
@@ -272,6 +365,62 @@ class ReplicateProductCreateToShop implements ShouldQueue
         ])
             ->whereNotNull('target_product_gid')
             ->first();
+    }
+
+    /**
+     * @return array{status: 'none'|'found'|'ambiguous', products: array<int, array{id: int|null, gid: string}>}
+     */
+    private function existingShopifyProductByParentProduct(Shop $target): array
+    {
+        $query = <<<'GQL'
+        query ExistingProductParent($query: String!) {
+          products(first: 10, query: $query) {
+            nodes {
+              id
+              legacyResourceId
+              metafield(namespace: "custom", key: "parentproduct") {
+                value
+              }
+            }
+          }
+        }
+        GQL;
+
+        $response = $this->gql($target, $query, [
+            'query' => 'metafields.custom.parentproduct:'.$this->sourceProductId,
+        ]);
+
+        $products = collect($response['data']['products']['nodes'] ?? [])
+            ->filter(fn (array $product) => (string) data_get($product, 'metafield.value') === (string) $this->sourceProductId)
+            ->filter(fn (array $product) => !empty($product['id']))
+            ->map(fn (array $product) => [
+                'id' => isset($product['legacyResourceId']) ? (int) $product['legacyResourceId'] : null,
+                'gid' => (string) $product['id'],
+            ])
+            ->values()
+            ->all();
+
+        return [
+            'status' => count($products) === 0 ? 'none' : (count($products) === 1 ? 'found' : 'ambiguous'),
+            'products' => $products,
+        ];
+    }
+
+    /** @param array{id: int|null, gid: string} $product */
+    private function storeExistingProductMirror(Shop $target, array $product): void
+    {
+        ProductMirror::updateOrCreate(
+            [
+                'source_shop_id' => $this->sourceShopId,
+                'source_product_id' => $this->sourceProductId,
+                'target_shop_id' => $target->id,
+            ],
+            [
+                'source_product_gid' => "gid://shopify/Product/{$this->sourceProductId}",
+                'target_product_gid' => $product['gid'],
+                'target_product_id' => $product['id'],
+            ]
+        );
     }
 
     private function dispatchBemWatermarkIfEligible(Shop $target, string $productGid, ?int $productLegacyId): void

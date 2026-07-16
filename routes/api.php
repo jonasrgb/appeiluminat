@@ -32,6 +32,9 @@ Route::post('/webhooks/shopify', [ShopifyWebhookController::class, 'handle'])
 Route::post('/webhooks/shopify/update', [ShopifyWebhookController::class, 'handle'])
     ->middleware('shopify.webhook:products/update');
 
+Route::post('/webhooks/shopify/delete', [ShopifyWebhookController::class, 'handle'])
+    ->middleware('shopify.webhook:products/delete');
+
 Route::post('/webhooks/shopify/products', MultiShopProductWebhookController::class)
     ->middleware('shopify.webhook');
 

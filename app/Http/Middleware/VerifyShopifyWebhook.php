@@ -24,9 +24,9 @@ class VerifyShopifyWebhook
         }
 
         // 1) Alege secretul în funcție de topic (sau parametrul primit)
-        $isUpdate = $expectedTopic === 'products/update' || $topic === 'products/update';
+        $isAppWebhook = in_array($expectedTopic ?: $topic, ['products/update', 'products/delete'], true);
 
-        $secret = $isUpdate
+        $secret = $isAppWebhook
             ? config('services.shopify.app_webhook_secret')            // bottom secret (Custom App)
             : config('services.shopify.notifications_webhook_secret'); // Notifications secret
 

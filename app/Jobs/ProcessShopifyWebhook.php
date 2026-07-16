@@ -6,6 +6,8 @@ use App\Models\Shop;
 use App\Models\ShopConnection;
 use App\Models\ShopifyWebhookEvent;
 use App\Models\ProductMediaProcess;
+use App\Models\ProductParentBackfillCandidate;
+use App\Models\SourceProductDeletion;
 use Illuminate\Bus\Queueable;
 use Illuminate\Contracts\Queue\ShouldQueue;
 use Illuminate\Foundation\Bus\Dispatchable;
@@ -50,6 +52,16 @@ class ProcessShopifyWebhook implements ShouldQueue
         $sourceShop = Shop::where('domain', $this->shopDomain)->where('is_source', true)->first();
         if (!$sourceShop) return;
 
+        $sourceProductId = (int) ($this->payload['id'] ?? 0);
+        if ($this->topic !== 'products/delete' && $sourceProductId && SourceProductDeletion::existsFor($sourceShop->id, $sourceProductId)) {
+            Log::warning('Shopify webhook skipped for deleted source product', [
+                'topic' => $this->topic,
+                'source_shop' => $sourceShop->domain,
+                'source_product_id' => $sourceProductId,
+            ]);
+            return;
+        }
+
         // Log::info('ProcessShopifyWebhook payload', [
         //     'topic' => $this->topic,
         //     'shop'  => $this->shopDomain,
@@ -59,6 +71,7 @@ class ProcessShopifyWebhook implements ShouldQueue
         match ($this->topic) {
             'products/create' => $this->fanOutCreate($sourceShop, $this->payload),
             'products/update' => $this->fanOutUpdate($sourceShop, $this->payload),
+            'products/delete' => $this->fanOutDelete($sourceShop, $this->payload),
             default => null,
         };
     }
@@ -182,6 +195,65 @@ class ProcessShopifyWebhook implements ShouldQueue
             'source_shop' => $sourceShop->domain,
             'targets'     => $targets->pluck('domain')->values(),
             'product_id'  => $sourceProductId,
+        ]);
+    }
+
+    protected function fanOutDelete(Shop $sourceShop, array $payload): void
+    {
+        $sourceProductId = (int) ($payload['id'] ?? 0);
+        if (!$sourceProductId) {
+            Log::warning('fanOutDelete: missing source product id', ['shop' => $sourceShop->domain]);
+            return;
+        }
+
+        SourceProductDeletion::updateOrCreate(
+            [
+                'source_shop_id' => $sourceShop->id,
+                'source_product_id' => $sourceProductId,
+            ],
+            [
+                'webhook_event_id' => $this->eventId,
+                'deleted_at' => now(),
+            ]
+        );
+
+        $targetShopIds = ShopConnection::query()
+            ->where('source_shop_id', $sourceShop->id)
+            ->pluck('target_shop_id');
+
+        $targetShopIds = $targetShopIds
+            ->merge(ProductMirror::query()
+                ->where('source_shop_id', $sourceShop->id)
+                ->where('source_product_id', $sourceProductId)
+                ->pluck('target_shop_id'))
+            ->merge(ProductParentBackfillCandidate::query()
+                ->where(function ($query) use ($sourceShop, $sourceProductId) {
+                    $query->where(function ($query) use ($sourceShop, $sourceProductId) {
+                        $query->where('source_shop_id', $sourceShop->id)
+                            ->where('source_product_id', $sourceProductId);
+                    })->orWhere('parentproduct_value', $sourceProductId);
+                })
+                ->pluck('target_shop_id'))
+            ->unique()
+            ->values();
+
+        ProductMediaProcess::query()
+            ->where('shop_id', $sourceShop->id)
+            ->where('product_id', $sourceProductId)
+            ->delete();
+
+        foreach ($targetShopIds as $targetShopId) {
+            ReplicateProductDeleteToShop::dispatch(
+                targetShopId: (int) $targetShopId,
+                sourceShopId: $sourceShop->id,
+                sourceProductId: $sourceProductId,
+            )->onQueue('replication');
+        }
+
+        Log::info('fanOutDelete queued', [
+            'source_shop' => $sourceShop->domain,
+            'source_product_id' => $sourceProductId,
+            'target_shop_ids' => $targetShopIds->all(),
         ]);
     }
 

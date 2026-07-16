@@ -16,6 +16,7 @@ class ShopifyWebhookController extends Controller
     private array $allowedTopics = [
         'products/create',
         'products/update',
+        'products/delete',
     ];
 
     public function handle(Request $request)
