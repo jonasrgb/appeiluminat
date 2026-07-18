@@ -2,8 +2,10 @@
 
 namespace Tests\Feature;
 
+use App\Jobs\BemSyncBackupManifestFromSourceUpdate;
 use App\Models\Shop;
 use App\Services\Shopify\BemWatermark\BemBackupManifestService;
+use App\Services\Shopify\BemWatermark\BemImageIdentityService;
 use App\Services\Shopify\BemWatermark\BemSourceUpdateImageClassifier;
 use Illuminate\Support\Facades\Http;
 use Tests\TestCase;
@@ -132,6 +134,59 @@ class BemWatermarkUpdateManifestTest extends TestCase
         $this->assertSame([], $result['new_clean']);
         $this->assertCount(1, $result['unknown_watermarked']);
         $this->assertSame('watermarked_image_not_found_in_manifest', $result['unknown_watermarked'][0]['reason']);
+    }
+
+    public function test_source_update_reconciles_stale_history_url_with_current_clean_backup_url(): void
+    {
+        $job = new BemSyncBackupManifestFromSourceUpdate(
+            sourceShopId: 3,
+            sourceProductId: 123,
+            sourceProductGid: 'gid://shopify/Product/123',
+            title: 'Test product',
+            sourcePayload: []
+        );
+
+        $method = new \ReflectionMethod($job, 'reconcileOriginalUrlsFromBackup');
+        $method->setAccessible(true);
+
+        $result = $method->invoke($job, [[
+            'position' => 1,
+            'source_url' => 'https://cdn.example.test/old-original.png?v=1',
+            'previous_position' => 7,
+            'matched_existing' => true,
+            'original_extension' => 'png',
+        ]], [[
+            'position' => 7,
+            'source_url' => 'https://cdn.example.test/current-original.png?v=2',
+            'original_extension' => 'png',
+        ]], app(BemImageIdentityService::class));
+
+        $this->assertSame('https://cdn.example.test/current-original.png?v=2', $result[0]['source_url']);
+        $this->assertTrue($result[0]['reconciled_from_backup']);
+    }
+
+    public function test_source_update_refuses_reconciliation_when_backup_position_is_missing(): void
+    {
+        $job = new BemSyncBackupManifestFromSourceUpdate(
+            sourceShopId: 3,
+            sourceProductId: 123,
+            sourceProductGid: 'gid://shopify/Product/123',
+            title: 'Test product',
+            sourcePayload: []
+        );
+
+        $method = new \ReflectionMethod($job, 'reconcileOriginalUrlsFromBackup');
+        $method->setAccessible(true);
+
+        $this->expectException(\RuntimeException::class);
+        $this->expectExceptionMessage('missing clean backup image at recorded position 7');
+
+        $method->invoke($job, [[
+            'position' => 1,
+            'source_url' => 'https://cdn.example.test/old-original.png',
+            'previous_position' => 7,
+            'matched_existing' => true,
+        ]], [], app(BemImageIdentityService::class));
     }
 
     private function shop(int $id, string $domain): Shop

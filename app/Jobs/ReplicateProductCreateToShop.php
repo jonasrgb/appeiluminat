@@ -76,7 +76,7 @@ class ReplicateProductCreateToShop implements ShouldQueue
 
             // A create webhook can be delivered more than once. Serialize each
             // source-to-target creation so a retry cannot create a second copy.
-            $creationLock = Cache::store('file')->lock(
+            $creationLock = Cache::store('database')->lock(
                 "product-replication-create:{$this->sourceShopId}:{$this->sourceProductId}:{$target->id}",
                 900
             );

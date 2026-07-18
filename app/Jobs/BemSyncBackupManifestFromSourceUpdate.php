@@ -133,6 +133,15 @@ class BemSyncBackupManifestFromSourceUpdate implements ShouldQueue
                 return;
             }
 
+            // CDN URLs of clean backup media can change after Shopify replaces a
+            // file. For images already known to BEM, the current clean backup
+            // image at its recorded position is the canonical source URL.
+            $desiredOriginalImages = $this->reconcileOriginalUrlsFromBackup(
+                $desiredOriginalImages,
+                $backup->images,
+                $identity
+            );
+
             Log::info('BEM update media sync started', [
                 'source_shop' => $source->domain,
                 'source_product_id' => $this->sourceProductId,
@@ -459,6 +468,74 @@ class BemSyncBackupManifestFromSourceUpdate implements ShouldQueue
         }
 
         return true;
+    }
+
+    /**
+     * Replaces only historic clean URLs with the current clean media URL from
+     * the backup product. The backup resolver has already rejected watermarked
+     * backup media. A missing recorded position is unsafe, so the sync stops
+     * before any product media can be replaced.
+     *
+     * @param array<int, array<string, mixed>> $desiredOriginalImages
+     * @param array<int, array<string, mixed>> $backupImages
+     * @return array<int, array<string, mixed>>
+     */
+    private function reconcileOriginalUrlsFromBackup(
+        array $desiredOriginalImages,
+        array $backupImages,
+        BemImageIdentityService $identity
+    ): array {
+        $backupByPosition = [];
+        foreach ($backupImages as $backupImage) {
+            $position = (int) ($backupImage['position'] ?? 0);
+            $url = (string) ($backupImage['source_url'] ?? '');
+
+            if ($position > 0 && $url !== '') {
+                $backupByPosition[$position] = $backupImage;
+            }
+        }
+
+        $reconciled = 0;
+        foreach ($desiredOriginalImages as $index => $desiredImage) {
+            if (($desiredImage['matched_existing'] ?? false) !== true) {
+                continue;
+            }
+
+            $recordedPosition = (int) ($desiredImage['previous_position'] ?? 0);
+            $backupImage = $backupByPosition[$recordedPosition] ?? null;
+            if (!$backupImage) {
+                throw new \RuntimeException(
+                    'BEM backup reconciliation refused: missing clean backup image at recorded position '
+                    .$recordedPosition.' for source image '.($index + 1)
+                );
+            }
+
+            $backupUrl = (string) ($backupImage['source_url'] ?? '');
+            if ($backupUrl === '' || $identity->isWatermarkedUrl($backupUrl)) {
+                throw new \RuntimeException(
+                    'BEM backup reconciliation refused: invalid clean backup image at recorded position '
+                    .$recordedPosition
+                );
+            }
+
+            if ($identity->canonicalUrl($desiredImage['source_url'] ?? null) !== $identity->canonicalUrl($backupUrl)) {
+                $reconciled++;
+            }
+
+            $desiredOriginalImages[$index]['source_url'] = $backupUrl;
+            $desiredOriginalImages[$index]['original_extension'] = $backupImage['original_extension']
+                ?? $identity->extensionFromUrl($backupUrl);
+            $desiredOriginalImages[$index]['reconciled_from_backup'] = true;
+        }
+
+        if ($reconciled > 0) {
+            Log::notice('BEM update reconciled stale original URLs from clean backup media', [
+                'source_product_id' => $this->sourceProductId,
+                'reconciled_images' => $reconciled,
+            ]);
+        }
+
+        return $desiredOriginalImages;
     }
 
     private function imagesFromBackupUpload(array $desiredOriginalImages, array $backupUploaded): array
