@@ -10,6 +10,7 @@ use App\Services\Shopify\BemWatermark\BemImageIdentityService;
 use App\Services\Shopify\BemWatermark\BemProductWatermarkMetafieldService;
 use App\Services\Shopify\BemWatermark\BemShopifyGraphqlClient;
 use App\Services\Shopify\BemWatermark\BemShopifyStagedUploadService;
+use App\Services\Shopify\BemWatermark\BemTargetMediaReconciler;
 use App\Services\Shopify\BemWatermark\BemWatermarkEligibilityService;
 use App\Services\Shopify\BemWatermark\BemWatermarkImageProcessor;
 use App\Services\Shopify\BemWatermark\BemWatermarkUpdateBootstrapService;
@@ -53,7 +54,8 @@ class BemSyncBackupManifestFromSourceUpdate implements ShouldQueue
         BemShopifyStagedUploadService $uploadService,
         BemWatermarkImageProcessor $imageProcessor,
         BemProductWatermarkMetafieldService $metafieldService,
-        BemWatermarkUpdateBootstrapService $bootstrapService
+        BemWatermarkUpdateBootstrapService $bootstrapService,
+        BemTargetMediaReconciler $targetMediaReconciler
     ): void {
         $source = Shop::findOrFail($this->sourceShopId);
 
@@ -123,13 +125,54 @@ class BemSyncBackupManifestFromSourceUpdate implements ShouldQueue
             $sourceWatermarked = $sourceState['watermarked'];
             $sourceImages = $this->sourceImages($sourceState['images'], $identity);
             $desiredOriginalImages = $this->desiredOriginalImages($sourceImages, $sourceWatermarked, $identity);
+            $mirrors = ProductMirror::where([
+                'source_shop_id' => $this->sourceShopId,
+                'source_product_id' => $this->sourceProductId,
+            ])->get();
+            $backupMirror = $mirrors->first(fn (ProductMirror $mirror) => (int) $mirror->target_shop_id === (int) $backup->backupShop->id);
+            $targetMirrors = $this->targetMirrors($mirrors, $backup->backupShop);
+            $targetContexts = $this->targetContexts($targetMirrors);
 
             if ($this->isNoop($desiredOriginalImages, $sourceWatermarked, $identity)) {
+                if ($eligibility->isDryRun()) {
+                    Log::info('BEM update media sync dry-run no-op completed without Shopify writes', [
+                        'source_shop' => $source->domain,
+                        'source_product_id' => $this->sourceProductId,
+                        'images_count' => count($desiredOriginalImages),
+                        'targets' => count($targetContexts),
+                    ]);
+                    return;
+                }
+
+                $targetResult = $this->reconcileTargetContexts(
+                    $targetContexts,
+                    $targetMediaReconciler,
+                    $backup->backupShop,
+                    (int) $backup->sourceProductId,
+                    $backup->sourceProductGid,
+                    $backup->images
+                );
+                $manifestUpdated = $this->persistNoopManifestIfNeeded(
+                    $manifestService,
+                    $backup->backupShop,
+                    $backup->sourceProductGid,
+                    $desiredOriginalImages,
+                    $backup->images,
+                    $sourceWatermarked,
+                    $identity
+                );
+
                 Log::info('BEM update media sync no-op: source images already match prod.watermarked', [
                     'source_shop' => $source->domain,
                     'source_product_id' => $this->sourceProductId,
                     'images_count' => count($desiredOriginalImages),
+                    'targets_attempted' => $targetResult['attempted'],
+                    'targets_healthy' => $targetResult['healthy'],
+                    'targets_repaired' => $targetResult['repaired'],
+                    'backup_manifest_updated' => $manifestUpdated,
                 ]);
+
+                $this->throwIfTargetReconciliationFailed($targetResult);
                 return;
             }
 
@@ -188,41 +231,18 @@ class BemSyncBackupManifestFromSourceUpdate implements ShouldQueue
             );
             $metafieldService->update($source, $this->sourceProductGid, $sourcePayload);
 
-            $mirrors = ProductMirror::where('source_product_id', $this->sourceProductId)->get();
-            $backupMirror = $mirrors->first(fn (ProductMirror $mirror) => (int) $mirror->target_shop_id === (int) $backup->backupShop->id);
             if ($backupMirror) {
                 $this->updateMirrorSnapshot($backupMirror, $backupImages, $identity);
             }
 
-            $targetMirrors = $this->targetMirrors($mirrors, $backup->backupShop);
-            foreach ($targetMirrors as $mirror) {
-                $target = Shop::find($mirror->target_shop_id);
-                if (!$target || !$mirror->target_product_gid) {
-                    continue;
-                }
-
-                $processed = $imageProcessor->process($target, $this->title, $backupImages);
-                $tempPaths = array_merge($tempPaths, $processed['temp_paths']);
-                $uploaded = $uploadService->replaceProductImages(
-                    $target,
-                    $mirror->target_product_gid,
-                    $processed['processed']
-                );
-                $finalImages = $this->mergeUploadedImages($processed['processed'], $uploaded);
-
-                $metafieldService->update($target, $mirror->target_product_gid, $this->productWatermarkedPayload(
-                    sourceShop: $backup->backupShop,
-                    sourceProductGid: $backup->sourceProductGid,
-                    sourceProductId: (int) $backup->sourceProductId,
-                    target: $target,
-                    targetProductGid: $mirror->target_product_gid,
-                    targetProductId: $mirror->target_product_id,
-                    images: $finalImages,
-                    mode: 'target_product_update'
-                ));
-
-                $this->updateMirrorSnapshot($mirror, $finalImages, $identity);
-            }
+            $targetResult = $this->reconcileTargetContexts(
+                $targetContexts,
+                $targetMediaReconciler,
+                $backup->backupShop,
+                (int) $backup->sourceProductId,
+                $backup->sourceProductGid,
+                $backupImages
+            );
 
             $manifest = $manifestService->fetch($backup->backupShop, $backup->sourceProductGid);
             $manifest['images'] = $this->manifestImages($desiredOriginalImages, $backupImages, $sourceFinalImages, $identity);
@@ -230,16 +250,22 @@ class BemSyncBackupManifestFromSourceUpdate implements ShouldQueue
                 'source_shop' => $source->domain,
                 'source_product_id' => $this->sourceProductId,
                 'images_count' => count($manifest['images']),
-                'target_count' => $targetMirrors->count(),
+                'target_count' => count($targetContexts),
+                'targets_repaired' => $targetResult['repaired'],
+                'target_errors' => count($targetResult['errors']),
             ]);
             $manifestService->update($backup->backupShop, $backup->sourceProductGid, $manifest);
+
+            $this->throwIfTargetReconciliationFailed($targetResult);
 
             Log::info('BEM update media sync completed', [
                 'source_shop' => $source->domain,
                 'source_product_id' => $this->sourceProductId,
                 'backup_shop' => $backup->backupShop->domain,
                 'images_count' => count($backupImages),
-                'targets' => $targetMirrors->count(),
+                'targets' => count($targetContexts),
+                'targets_healthy' => $targetResult['healthy'],
+                'targets_repaired' => $targetResult['repaired'],
             ]);
         } catch (\Throwable $e) {
             Log::error('BEM update manifest sync attempt failed', [
@@ -615,6 +641,102 @@ class BemSyncBackupManifestFromSourceUpdate implements ShouldQueue
         ], $images));
     }
 
+    /**
+     * @param iterable<int, array{mirror: ProductMirror, target: Shop}> $contexts
+     * @param array<int, array<string, mixed>> $backupImages
+     * @return array{attempted: int, healthy: int, repaired: int, errors: array<string, string>}
+     */
+    private function reconcileTargetContexts(
+        iterable $contexts,
+        BemTargetMediaReconciler $reconciler,
+        Shop $backupShop,
+        int $backupProductId,
+        string $backupProductGid,
+        array $backupImages
+    ): array {
+        $result = [
+            'attempted' => 0,
+            'healthy' => 0,
+            'repaired' => 0,
+            'errors' => [],
+        ];
+
+        foreach ($contexts as $context) {
+            $mirror = $context['mirror'];
+            $target = $context['target'];
+            $result['attempted']++;
+
+            try {
+                $targetResult = $reconciler->reconcile(
+                    $mirror,
+                    $target,
+                    $backupShop,
+                    $backupProductId,
+                    $backupProductGid,
+                    $this->title,
+                    $backupImages
+                );
+
+                if (($targetResult['repaired'] ?? false) === true) {
+                    $result['repaired']++;
+                } else {
+                    $result['healthy']++;
+                }
+            } catch (\Throwable $e) {
+                $result['errors'][(string) $target->domain] = $e->getMessage();
+
+                Log::error('BEM target media reconciliation attempt failed', [
+                    'source_product_id' => $this->sourceProductId,
+                    'target_shop' => $target->domain,
+                    'target_product_gid' => $mirror->target_product_gid,
+                    'error' => $e->getMessage(),
+                ]);
+            }
+        }
+
+        return $result;
+    }
+
+    /**
+     * @param array{errors?: array<string, string>} $result
+     */
+    private function throwIfTargetReconciliationFailed(array $result): void
+    {
+        $errors = $result['errors'] ?? [];
+        if (empty($errors)) {
+            return;
+        }
+
+        $messages = [];
+        foreach ($errors as $domain => $message) {
+            $messages[] = $domain.': '.$message;
+        }
+
+        throw new \RuntimeException('BEM target media reconciliation failed for '.implode('; ', $messages));
+    }
+
+    /**
+     * @return array<int, array{mirror: ProductMirror, target: Shop}>
+     */
+    private function targetContexts(iterable $targetMirrors): array
+    {
+        $contexts = [];
+
+        foreach ($targetMirrors as $mirror) {
+            $target = Shop::find($mirror->target_shop_id);
+            if (!$target || !$mirror->target_product_gid) {
+                continue;
+            }
+
+            $contexts[] = [
+                'mirror' => $mirror,
+                'target' => $target,
+            ];
+        }
+
+        return $contexts;
+    }
+
     private function targetMirrors($mirrors, Shop $backupShop)
     {
         $allowedDomains = array_values(array_filter(array_map(
@@ -703,6 +825,77 @@ class BemSyncBackupManifestFromSourceUpdate implements ShouldQueue
         }
 
         return $manifestImages;
+    }
+
+    private function persistNoopManifestIfNeeded(
+        BemBackupManifestService $manifestService,
+        Shop $backupShop,
+        string $backupProductGid,
+        array $desiredOriginalImages,
+        array $backupImages,
+        array $sourceWatermarked,
+        BemImageIdentityService $identity
+    ): bool {
+        $desiredManifestImages = $this->manifestImages(
+            $desiredOriginalImages,
+            $backupImages,
+            array_values((array) ($sourceWatermarked['images'] ?? [])),
+            $identity
+        );
+        $manifest = $manifestService->fetch($backupShop, $backupProductGid);
+
+        if ($this->manifestImagesMatch((array) ($manifest['images'] ?? []), $desiredManifestImages, $identity)) {
+            return false;
+        }
+
+        $manifest['images'] = $desiredManifestImages;
+        $manifest = $manifestService->appendHistory($manifest, 'source_update_media_sync_noop_reconcile', [
+            'source_product_id' => $this->sourceProductId,
+            'images_count' => count($desiredManifestImages),
+        ]);
+        $manifestService->update($backupShop, $backupProductGid, $manifest);
+
+        Log::notice('BEM update no-op repaired stale backup manifest', [
+            'source_product_id' => $this->sourceProductId,
+            'backup_shop' => $backupShop->domain,
+            'backup_product_gid' => $backupProductGid,
+            'images_count' => count($desiredManifestImages),
+        ]);
+
+        return true;
+    }
+
+    private function manifestImagesMatch(
+        array $currentImages,
+        array $desiredImages,
+        BemImageIdentityService $identity
+    ): bool {
+        $currentImages = array_values($currentImages);
+        $desiredImages = array_values($desiredImages);
+
+        if (count($currentImages) !== count($desiredImages)) {
+            return false;
+        }
+
+        foreach ($desiredImages as $index => $desired) {
+            $current = $currentImages[$index] ?? [];
+
+            if ((int) ($current['position'] ?? 0) !== (int) ($desired['position'] ?? 0)
+                || ($current['status'] ?? null) !== ($desired['status'] ?? null)
+                || ($current['source_watermarked_filename'] ?? null) !== ($desired['source_watermarked_filename'] ?? null)
+                || ($current['original_extension'] ?? null) !== ($desired['original_extension'] ?? null)) {
+                return false;
+            }
+
+            foreach (['source_original_url', 'backup_url', 'source_watermarked_url'] as $urlKey) {
+                if ($identity->canonicalUrl($current[$urlKey] ?? null)
+                    !== $identity->canonicalUrl($desired[$urlKey] ?? null)) {
+                    return false;
+                }
+            }
+        }
+
+        return true;
     }
 
     private function lockKey(Shop $source): string

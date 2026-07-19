@@ -1,0 +1,107 @@
+# Review package: a833a1e..b6a7cbb
+
+## Commits
+b6a7cbb test: guard legacy parentvariant bootstrap scope
+
+## Files changed
+ .../ReplicateProductUpdateIdentityContractTest.php | 35 ++++++++++++++++++++--
+ 1 file changed, 33 insertions(+), 2 deletions(-)
+
+## Diff
+diff --git a/tests/Unit/ReplicateProductUpdateIdentityContractTest.php b/tests/Unit/ReplicateProductUpdateIdentityContractTest.php
+index 7257ea7..0ec4292 100644
+--- a/tests/Unit/ReplicateProductUpdateIdentityContractTest.php
++++ b/tests/Unit/ReplicateProductUpdateIdentityContractTest.php
+@@ -1,16 +1,16 @@
+ <?php
+ 
+ namespace Tests\Unit;
+ 
+-use App\Jobs\ReplicateProductUpdateToShop;
+ use App\Jobs\ReplicateProductCreateToShop;
++use App\Jobs\ReplicateProductUpdateToShop;
+ use App\Services\Shopify\LegacyParentVariantBootstrapPolicy;
+ use App\Services\Shopify\ShopifyParentIdentityResolver;
+ use Illuminate\Queue\Middleware\WithoutOverlapping;
+ use Illuminate\Support\Facades\Http;
+ use ReflectionMethod;
+ use Tests\TestCase;
+ 
+ class ReplicateProductUpdateIdentityContractTest extends TestCase
+ {
+     public function test_update_job_requires_identity_resolver_and_legacy_bootstrap_policy(): void
+@@ -69,20 +69,51 @@ public function test_product_set_can_be_explicitly_enabled_for_legacy_default_va
+     }
+ 
+     public function test_bootstrap_policy_is_checked_only_when_unmanaged_variants_exist(): void
+     {
+         $source = $this->methodSource('bootstrapLegacyVariantIdentity');
+ 
+         $this->assertStringContainsString('$decision[\'status\'] === \'not_needed\'', $source);
+         $this->assertStringContainsString("'status' => 'not_needed'", $source);
+     }
+ 
++    public function test_legacy_bootstrap_has_no_mutable_identity_fallback_and_bg_exits_first(): void
++    {
++        $bootstrap = $this->methodSource('bootstrapLegacyVariantIdentity');
++        $handle = $this->methodSource('handle');
++
++        foreach (['sku', 'title', 'handle', 'options_key', 'position', 'price'] as $forbidden) {
++            $this->assertStringNotContainsString($forbidden, strtolower($bootstrap));
++        }
++
++        $bgExit = strpos($handle, 'eiluminat-bg.myshopify.com');
++        $strictSync = strpos($handle, '$this->syncVariantsStrict(');
++
++        $this->assertNotFalse($bgExit);
++        $this->assertNotFalse($strictSync);
++        $this->assertLessThan($strictSync, $bgExit);
++    }
++
++    public function test_unsafe_bootstrap_returns_before_shopify_mutations(): void
++    {
++        $source = $this->methodSource('bootstrapLegacyVariantIdentity');
++        $unsafe = strpos($source, '$decision[\'status\'] === \'unsafe\'');
++        $setMetafield = strpos($source, '$this->setParentVariantMetafield(');
++        $productSet = strpos($source, '$this->productSetVariantStructure(');
++
++        $this->assertNotFalse($unsafe);
++        $this->assertNotFalse($setMetafield);
++        $this->assertNotFalse($productSet);
++        $this->assertLessThan($setMetafield, $unsafe);
++        $this->assertLessThan($productSet, $unsafe);
++    }
++
+     public function test_update_job_contains_no_product_handle_or_sku_fallback_methods(): void
+     {
+         $source = file_get_contents(app_path('Jobs/ReplicateProductUpdateToShop.php'));
+ 
+         $this->assertStringNotContainsString('searchTargetProductByHandle', $source);
+         $this->assertStringNotContainsString('searchTargetProductBySkus', $source);
+         $this->assertStringNotContainsString('ProductParentBackfillCandidate', $source);
+     }
+ 
+     public function test_update_job_contains_no_variant_identity_fallbacks(): void
+@@ -123,21 +154,21 @@ public function test_new_variants_receive_parentvariant_atomically(): void
+         $lines = file(app_path('Jobs/ReplicateProductUpdateToShop.php'));
+         $source = implode('', array_slice(
+             $lines,
+             $reflection->getStartLine() - 1,
+             $reflection->getEndLine() - $reflection->getStartLine() + 1
+         ));
+ 
+         $this->assertStringContainsString("'metafields'", $source);
+         $this->assertStringContainsString("'key' => 'parentvariant'", $source);
+         $this->assertStringContainsString("'value' => (string) \$sourceId", $source);
+-        $this->assertStringContainsString("metafield(namespace: \"custom\", key: \"parentvariant\")", $source);
++        $this->assertStringContainsString('metafield(namespace: "custom", key: "parentvariant")', $source);
+         $this->assertStringContainsString("\$node['metafield']['value']", $source);
+     }
+ 
+     public function test_updates_are_serialized_per_source_and_target_product(): void
+     {
+         $job = new ReplicateProductUpdateToShop(4, 3, 700, []);
+         $middleware = $job->middleware();
+ 
+         $this->assertCount(1, $middleware);
+         $this->assertInstanceOf(WithoutOverlapping::class, $middleware[0]);

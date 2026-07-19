@@ -1,0 +1,112 @@
+diff --git a/app/Console/Kernel.php b/app/Console/Kernel.php
+new file mode 100755
+index 0000000..e19dbbd
+--- /dev/null
++++ b/app/Console/Kernel.php
+@@ -0,0 +1,63 @@
++<?php
++
++namespace App\Console;
++
++use Illuminate\Console\Scheduling\Schedule;
++use Illuminate\Foundation\Console\Kernel as ConsoleKernel;
++use App\Jobs\RunCustomScript;
++use App\Jobs\RunCustomScript2;
++use App\Jobs\RunCustomScript3;
++use App\Jobs\RunCustomScript4;
++
++class Kernel extends ConsoleKernel
++{
++    /**
++     * Define the application's command schedule.
++     */
++    protected function schedule(Schedule $schedule): void
++    {
++        // $schedule->command('inspire')->hourly();
++        $schedule->job(new RunCustomScript)->dailyAt('00:00');
++        $schedule->job(new RunCustomScript2)->dailyAt('00:00');
++        $schedule->job(new RunCustomScript3)->dailyAt('00:00');
++        $schedule->job(new RunCustomScript4)->dailyAt('00:00');
++        $schedule->command('shopify:bulk-missing-images --send-minicrm')
++            ->dailyAt('00:00')
++            ->timezone('Europe/Bucharest')
++            ->withoutOverlapping()
++            ->runInBackground();
++        $schedule->command('catalog-audit:scan')
++            ->dailyAt('01:00')
++            ->timezone('Europe/Bucharest')
++            ->withoutOverlapping()
++            ->runInBackground();
++        //$schedule->command('app:check-products-count')->sundays()->at('00:00');
++        $schedule->command('emails:sync-inbox-raw')
++        ->everyFiveMinutes()
++        ->withoutOverlapping()
++        ->runInBackground();
++        $schedule->command('emails:sync-inbox-raw-powerleds')
++        ->everyFiveMinutes()
++        ->withoutOverlapping()
++        ->runInBackground();
++        $schedule->command('emails:sync-inbox-raw-industrial')
++        ->everyFiveMinutes()
++        ->withoutOverlapping()
++        ->runInBackground();
++        $schedule->command('emails:sync-inbox-raw-eiluminat')
++        ->everyFiveMinutes()
++        ->withoutOverlapping()
++        ->runInBackground();
++    }
++
++    /**
++     * Register the commands for the application.
++     */
++    protected function commands(): void
++    {
++        $this->load(__DIR__.'/Commands');
++        \App\Console\Commands\ShopsAdd::class;
++        \App\Console\Commands\ShopsConnect::class;
++        require base_path('routes/console.php');
++    }
++}
+diff --git a/tests/Unit/CatalogAuditScheduleContractTest.php b/tests/Unit/CatalogAuditScheduleContractTest.php
+new file mode 100644
+index 0000000..37a1eb1
+--- /dev/null
++++ b/tests/Unit/CatalogAuditScheduleContractTest.php
+@@ -0,0 +1,37 @@
++<?php
++
++namespace Tests\Unit;
++
++use Tests\TestCase;
++
++class CatalogAuditScheduleContractTest extends TestCase
++{
++    public function test_catalog_audit_scan_has_the_required_nightly_schedule_contract(): void
++    {
++        $path = app_path('Console/Kernel.php');
++        $source = file_get_contents($path);
++
++        $this->assertNotFalse($source);
++        $this->assertStringContainsString(<<<'PHP'
++        $schedule->command('catalog-audit:scan')
++            ->dailyAt('01:00')
++            ->timezone('Europe/Bucharest')
++            ->withoutOverlapping()
++            ->runInBackground();
++PHP, $source);
++    }
++
++    public function test_existing_midnight_missing_images_schedule_remains_unchanged(): void
++    {
++        $source = file_get_contents(app_path('Console/Kernel.php'));
++
++        $this->assertNotFalse($source);
++        $this->assertStringContainsString(<<<'PHP'
++        $schedule->command('shopify:bulk-missing-images --send-minicrm')
++            ->dailyAt('00:00')
++            ->timezone('Europe/Bucharest')
++            ->withoutOverlapping()
++            ->runInBackground();
++PHP, $source);
++    }
++}

@@ -1,0 +1,160 @@
+# Review package: dff84d0..a833a1e
+
+## Commits
+a833a1e feat: rebuild legacy target variant identity once
+
+## Files changed
+ app/Jobs/ReplicateProductUpdateToShop.php          | 46 ++++++++++++++++++++--
+ .../ReplicateProductUpdateIdentityContractTest.php | 27 +++++++++++++
+ 2 files changed, 70 insertions(+), 3 deletions(-)
+
+## Diff
+diff --git a/app/Jobs/ReplicateProductUpdateToShop.php b/app/Jobs/ReplicateProductUpdateToShop.php
+index 236d344..e9cd1f6 100644
+--- a/app/Jobs/ReplicateProductUpdateToShop.php
++++ b/app/Jobs/ReplicateProductUpdateToShop.php
+@@ -329,21 +329,58 @@ private function bootstrapLegacyVariantIdentity(
+                 'target_variant_gid' => $targetVariantGid,
+             ]);
+ 
+             return [
+                 'status' => 'bootstrapped',
+                 'target_state' => $verifiedState,
+                 'reset_mirrors' => true,
+             ];
+         }
+ 
+-        // The replace_structure branch is added in Task 3.
++        if ($decision['action'] === 'replace_structure') {
++            $targetOptions = $this->fetchTargetOptions($target, $mirror->target_product_gid);
++
++            $this->productSetVariantStructure(
++                $target,
++                $mirror->target_product_gid,
++                $sourceById,
++                $sourceOptions,
++                $targetOptions,
++                [],
++                allowCompatibleOptionStructure: true
++            );
++
++            $verifiedState = $identityResolver->targetVariantState(
++                $target,
++                $mirror->target_product_gid
++            );
++            $this->assertBootstrapIdentityState($verifiedState, array_keys($sourceById));
++            $this->replaceVariantMirrorsFromVerifiedState(
++                $mirror,
++                $sourceById,
++                $verifiedState
++            );
++
++            Log::notice('Variant identity structure bootstrapped declaratively', [
++                'source_product_id' => $this->sourceProductId,
++                'target_shop' => $target->domain,
++                'target_product_gid' => $mirror->target_product_gid,
++                'source_variant_ids' => array_map('intval', array_keys($sourceById)),
++            ]);
++
++            return [
++                'status' => 'bootstrapped',
++                'target_state' => $verifiedState,
++                'reset_mirrors' => true,
++            ];
++        }
++
+         throw new \RuntimeException('Unsupported legacy parentvariant bootstrap action');
+     }
+ 
+     private function assertBootstrapIdentityState(array $targetState, array $sourceIds): void
+     {
+         $expected = array_map('strval', $sourceIds);
+         $actual = array_map('strval', array_keys($targetState['by_parent_id'] ?? []));
+         sort($expected, SORT_STRING);
+         sort($actual, SORT_STRING);
+ 
+@@ -776,27 +813,30 @@ private function mixedReplacementHasCompatibleOptions(
+      * Existing variants are addressed only by GIDs verified through parentvariant.
+      *
+      * @return array<string, array{source_variant_id:int, variant_id:int|string|null, variant_gid:string}>
+      */
+     private function productSetVariantStructure(
+         Shop $shop,
+         string $productGid,
+         array $sourceById,
+         array $sourceOptions,
+         array $targetOptions,
+-        array $verifiedMirrors
++        array $verifiedMirrors,
++        bool $allowCompatibleOptionStructure = false
+     ): array {
+         if (!$sourceById || !$sourceOptions) {
+             throw new \RuntimeException('productSet structural replacement requires variants and options');
+         }
+ 
+-        if ($this->mixedReplacementHasCompatibleOptions($sourceOptions, $targetOptions)) {
++        if (!$allowCompatibleOptionStructure
++            && $this->mixedReplacementHasCompatibleOptions($sourceOptions, $targetOptions)
++        ) {
+             throw new \RuntimeException('productSet structural replacement was called for compatible options');
+         }
+ 
+         $productOptions = [];
+         foreach (array_values($sourceOptions) as $position => $option) {
+             $name = trim((string) ($option['name'] ?? ''));
+             $values = array_values(array_unique(array_filter(array_map(
+                 static fn ($value): string => trim((string) $value),
+                 $option['values'] ?? []
+             ), static fn (string $value): bool => $value !== '')));
+diff --git a/tests/Unit/ReplicateProductUpdateIdentityContractTest.php b/tests/Unit/ReplicateProductUpdateIdentityContractTest.php
+index b2b6248..7257ea7 100644
+--- a/tests/Unit/ReplicateProductUpdateIdentityContractTest.php
++++ b/tests/Unit/ReplicateProductUpdateIdentityContractTest.php
+@@ -42,20 +42,47 @@ public function test_legacy_bootstrap_runs_before_the_unmanaged_variant_guard():
+     public function test_single_legacy_variant_is_reused_without_product_set(): void
+     {
+         $source = $this->methodSource('bootstrapLegacyVariantIdentity');
+ 
+         $this->assertStringContainsString("'attach_single'", $source);
+         $this->assertStringContainsString('$this->setParentVariantMetafield(', $source);
+         $this->assertStringContainsString("'legacy_bootstrap_single'", $source);
+         $this->assertStringNotContainsString('productVariantsBulkDelete', $source);
+     }
+ 
++    public function test_legacy_structure_bootstrap_uses_product_set_without_retained_variant_gid(): void
++    {
++        $source = $this->methodSource('bootstrapLegacyVariantIdentity');
++
++        $this->assertStringContainsString("'replace_structure'", $source);
++        $this->assertStringContainsString('$this->productSetVariantStructure(', $source);
++        $this->assertStringContainsString('allowCompatibleOptionStructure: true', $source);
++        $this->assertStringContainsString('$this->assertBootstrapIdentityState(', $source);
++        $this->assertStringContainsString('$this->replaceVariantMirrorsFromVerifiedState(', $source);
++    }
++
++    public function test_product_set_can_be_explicitly_enabled_for_legacy_default_variant_bootstrap(): void
++    {
++        $source = $this->methodSource('productSetVariantStructure');
++
++        $this->assertStringContainsString('bool $allowCompatibleOptionStructure = false', $source);
++        $this->assertStringContainsString('!$allowCompatibleOptionStructure', $source);
++    }
++
++    public function test_bootstrap_policy_is_checked_only_when_unmanaged_variants_exist(): void
++    {
++        $source = $this->methodSource('bootstrapLegacyVariantIdentity');
++
++        $this->assertStringContainsString('$decision[\'status\'] === \'not_needed\'', $source);
++        $this->assertStringContainsString("'status' => 'not_needed'", $source);
++    }
++
+     public function test_update_job_contains_no_product_handle_or_sku_fallback_methods(): void
+     {
+         $source = file_get_contents(app_path('Jobs/ReplicateProductUpdateToShop.php'));
+ 
+         $this->assertStringNotContainsString('searchTargetProductByHandle', $source);
+         $this->assertStringNotContainsString('searchTargetProductBySkus', $source);
+         $this->assertStringNotContainsString('ProductParentBackfillCandidate', $source);
+     }
+ 
+     public function test_update_job_contains_no_variant_identity_fallbacks(): void

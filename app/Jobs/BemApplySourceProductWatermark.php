@@ -7,6 +7,7 @@ use App\Services\Shopify\BemWatermark\BemBackupProductImageResolver;
 use App\Services\Shopify\BemWatermark\BemProductWatermarkMetafieldService;
 use App\Services\Shopify\BemWatermark\BemShopifyGraphqlClient;
 use App\Services\Shopify\BemWatermark\BemShopifyStagedUploadService;
+use App\Services\Shopify\BemWatermark\BemSourceCreateMediaResolver;
 use App\Services\Shopify\BemWatermark\BemImageIdentityService;
 use App\Services\Shopify\BemWatermark\BemWatermarkEligibilityService;
 use App\Services\Shopify\BemWatermark\BemWatermarkImageProcessor;
@@ -48,7 +49,8 @@ class BemApplySourceProductWatermark implements ShouldQueue
         BemShopifyStagedUploadService $uploadService,
         BemProductWatermarkMetafieldService $metafieldService,
         BemShopifyGraphqlClient $graphql,
-        BemImageIdentityService $identity
+        BemImageIdentityService $identity,
+        BemSourceCreateMediaResolver $sourceMediaResolver
     ): void {
         $source = Shop::findOrFail($this->sourceShopId);
 
@@ -57,6 +59,10 @@ class BemApplySourceProductWatermark implements ShouldQueue
                 'source_shop' => $source->domain,
                 'source_product_id' => $this->sourceProductId,
             ]);
+            return;
+        }
+
+        if (!$this->hydrateDelayedSourceMedia($source, $sourceMediaResolver)) {
             return;
         }
 
@@ -128,7 +134,11 @@ class BemApplySourceProductWatermark implements ShouldQueue
                 throw new \RuntimeException('BEM source watermark uploaded image count mismatch');
             }
 
-            $this->waitForAppendedImages($source, $uploadService, count($originalMediaIds) + count($uploadedImages));
+            $uploadService->waitForReadyProductMedia(
+                $source,
+                $this->sourceProductGid,
+                array_values(array_filter(array_column($uploadedImages, 'media_id')))
+            );
 
             if (!empty($originalMediaIds)) {
                 $uploadService->deleteProductMedia($source, $this->sourceProductGid, $originalMediaIds);
@@ -193,6 +203,48 @@ class BemApplySourceProductWatermark implements ShouldQueue
 
         Log::error('BEM source watermark job failed', $context);
         Log::warning('BEM source watermark failure email suppressed', $context);
+    }
+
+    private function hydrateDelayedSourceMedia(
+        Shop $source,
+        BemSourceCreateMediaResolver $sourceMediaResolver
+    ): bool {
+        if (!empty($this->sourcePayload['images']) && is_array($this->sourcePayload['images'])) {
+            return true;
+        }
+
+        $resolved = $sourceMediaResolver->resolve($source, $this->sourceProductGid);
+        if (($resolved['status'] ?? null) === 'ready' && !empty($resolved['images'])) {
+            $this->sourcePayload['images'] = $resolved['images'];
+
+            Log::notice('BEM source watermark hydrated delayed source media from Shopify', [
+                'source_shop' => $source->domain,
+                'source_product_id' => $this->sourceProductId,
+                'images_count' => count($resolved['images']),
+            ]);
+
+            return true;
+        }
+
+        if (($resolved['status'] ?? null) === 'processing' || $this->attempts() < 3) {
+            Log::warning('BEM source watermark waiting for delayed source media', [
+                'source_shop' => $source->domain,
+                'source_product_id' => $this->sourceProductId,
+                'media_status' => $resolved['status'] ?? 'unknown',
+                'attempt' => $this->attempts(),
+            ]);
+            $this->release(15);
+
+            return false;
+        }
+
+        Log::info('BEM source watermark skipped: source product has no media after create grace period', [
+            'source_shop' => $source->domain,
+            'source_product_id' => $this->sourceProductId,
+            'attempt' => $this->attempts(),
+        ]);
+
+        return false;
     }
 
     private function handleBackupNotReady(Shop $source, ?string $reason, int $expectedImages, int $backupImages): void
@@ -273,20 +325,6 @@ class BemApplySourceProductWatermark implements ShouldQueue
         }
 
         return $belongsToCurrentProduct;
-    }
-
-    private function waitForAppendedImages(Shop $source, BemShopifyStagedUploadService $uploadService, int $expectedCount): void
-    {
-        for ($attempt = 1; $attempt <= 5; $attempt++) {
-            $images = $uploadService->fetchProductImages($source, $this->sourceProductGid);
-            if (count($images) >= $expectedCount) {
-                return;
-            }
-
-            sleep(2);
-        }
-
-        throw new \RuntimeException('BEM source watermark appended media not ready');
     }
 
     /**

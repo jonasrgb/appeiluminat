@@ -1,7 +1,8 @@
 <?php
 
-use App\Http\Controllers\ProfileController;
+use App\Http\Controllers\CatalogAuditController;
 use App\Http\Controllers\ProductParentBackfillController;
+use App\Http\Controllers\ProfileController;
 use App\Http\Controllers\WebhookController;
 use Illuminate\Support\Facades\Route;
 
@@ -20,8 +21,14 @@ Route::get('/', function () {
     return view('welcome');
 });
 
-
 Route::get('/dashboard', [WebhookController::class, 'index'])->middleware(['auth', 'verified'])->name('dashboard');
+
+Route::middleware('auth')->group(function () {
+    Route::get('/dashboard/catalog-audit/{shop}/missing-images', [CatalogAuditController::class, 'missingImages'])
+        ->name('catalog-audit.missing-images');
+    Route::get('/dashboard/catalog-audit/{shop}/duplicate-skus', [CatalogAuditController::class, 'duplicateSkus'])
+        ->name('catalog-audit.duplicate-skus');
+});
 
 Route::middleware(['auth', 'verified'])->group(function () {
     Route::get('/dashboard/product-parent-backfill', [ProductParentBackfillController::class, 'index'])
@@ -39,6 +46,5 @@ Route::middleware('auth')->group(function () {
     Route::patch('/profile', [ProfileController::class, 'update'])->name('profile.update');
     Route::delete('/profile', [ProfileController::class, 'destroy'])->name('profile.destroy');
 });
-
 
 require __DIR__.'/auth.php';

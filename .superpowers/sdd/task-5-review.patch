@@ -1,0 +1,812 @@
+diff --git a/app/Jobs/Shopify/RunCatalogAuditForShop.php b/app/Jobs/Shopify/RunCatalogAuditForShop.php
+new file mode 100644
+index 0000000..e5982c1
+--- /dev/null
++++ b/app/Jobs/Shopify/RunCatalogAuditForShop.php
+@@ -0,0 +1,158 @@
++<?php
++
++namespace App\Jobs\Shopify;
++
++use App\Models\CatalogAuditRun;
++use App\Models\Shop;
++use App\Services\Shopify\CatalogAuditBulkService;
++use App\Services\Shopify\CatalogAuditJsonlParser;
++use App\Services\Shopify\CatalogAuditReconciler;
++use Illuminate\Bus\Queueable;
++use Illuminate\Contracts\Queue\ShouldQueue;
++use Illuminate\Foundation\Bus\Dispatchable;
++use Illuminate\Queue\InteractsWithQueue;
++use Illuminate\Queue\Middleware\WithoutOverlapping;
++use Illuminate\Queue\SerializesModels;
++use Illuminate\Support\Facades\Log;
++use Throwable;
++
++class RunCatalogAuditForShop implements ShouldQueue
++{
++    use Dispatchable, InteractsWithQueue, Queueable, SerializesModels;
++
++    public int $tries = 2;
++
++    public array $backoff = [60];
++
++    public int $timeout = 1800;
++
++    public bool $failOnTimeout = true;
++
++    public function __construct(public int $runId, public int $shopId)
++    {
++        $this->onQueue((string) config('catalog_audit.queue', 'bulk_ops'));
++    }
++
++    public function middleware(): array
++    {
++        return [
++            (new WithoutOverlapping('catalog-audit-shop-'.$this->shopId))
++                ->releaseAfter(60)
++                ->expireAfter(2400),
++        ];
++    }
++
++    public function handle(
++        CatalogAuditBulkService $bulkService,
++        CatalogAuditJsonlParser $parser,
++        CatalogAuditReconciler $reconciler,
++    ): void {
++        try {
++            [$run, $shop] = $this->validatedRunAndShop();
++
++            $run->forceFill([
++                'status' => CatalogAuditRun::STATUS_RUNNING,
++                'started_at' => $run->started_at ?? now(),
++                'error_message' => null,
++            ])->save();
++
++            $snapshot = $bulkService->downloadSnapshot(
++                $shop,
++                (int) config('catalog_audit.timeout_seconds', 1200),
++                (int) config('catalog_audit.poll_seconds', 5),
++            );
++
++            $reconciler->reconcile($run, $parser->parse($snapshot, $shop));
++        } catch (Throwable $exception) {
++            $attempt = $this->attempts();
++
++            if ($attempt < $this->tries) {
++                Log::warning('Catalog audit job will retry.', $this->logContext($exception, $attempt));
++                $this->release(60);
++
++                return;
++            }
++
++            $this->markRunFailed($exception, $attempt);
++        }
++    }
++
++    public function failed(Throwable $exception): void
++    {
++        try {
++            $this->markRunFailed($exception, $this->attempts());
++        } catch (Throwable $markFailure) {
++            Log::error('Catalog audit job could not persist its failed callback state.', [
++                ...$this->logContext($exception, $this->attempts()),
++                'mark_failure' => $markFailure,
++            ]);
++
++            return;
++        }
++
++        $this->dispatchNextJobInChain();
++    }
++
++    /** @return array{CatalogAuditRun, Shop} */
++    private function validatedRunAndShop(): array
++    {
++        $run = CatalogAuditRun::query()
++            ->whereKey($this->runId)
++            ->where('shop_id', $this->shopId)
++            ->first();
++        $shop = Shop::query()
++            ->whereKey($this->shopId)
++            ->where('is_active', true)
++            ->first();
++
++        if ($run === null || $shop === null) {
++            throw new \RuntimeException('Catalog audit run or active shop was not found.');
++        }
++
++        if (! in_array($run->status, [CatalogAuditRun::STATUS_QUEUED, CatalogAuditRun::STATUS_RUNNING], true)) {
++            throw new \RuntimeException('Catalog audit run is not available to execute.');
++        }
++
++        $configuredDomains = array_filter(
++            config('catalog_audit.shops', []),
++            static fn (mixed $domain): bool => is_string($domain)
++        );
++        if (! in_array($shop->domain, $configuredDomains, true)) {
++            throw new \RuntimeException('Catalog audit shop is not configured.');
++        }
++
++        return [$run, $shop];
++    }
++
++    private function markRunFailed(Throwable $exception, int $attempt): void
++    {
++        $message = mb_substr($exception->getMessage() ?: $exception::class, 0, 1000);
++
++        $updated = CatalogAuditRun::query()
++            ->whereKey($this->runId)
++            ->where('shop_id', $this->shopId)
++            ->whereIn('status', [CatalogAuditRun::STATUS_QUEUED, CatalogAuditRun::STATUS_RUNNING])
++            ->update([
++                'status' => CatalogAuditRun::STATUS_FAILED,
++                'finished_at' => now(),
++                'error_message' => $message,
++            ]);
++
++        if ($updated !== 1) {
++            throw new \RuntimeException('Catalog audit run could not be marked failed.');
++        }
++
++        Log::error('Catalog audit job failed permanently.', $this->logContext($exception, $attempt));
++    }
++
++    /** @return array<string, mixed> */
++    private function logContext(Throwable $exception, int $attempt): array
++    {
++        return [
++            'run_id' => $this->runId,
++            'shop_id' => $this->shopId,
++            'attempt' => $attempt,
++            'exception' => $exception,
++        ];
++    }
++}
+diff --git a/app/Console/Commands/RunCatalogAuditCommand.php b/app/Console/Commands/RunCatalogAuditCommand.php
+new file mode 100644
+index 0000000..5ed5fbd
+--- /dev/null
++++ b/app/Console/Commands/RunCatalogAuditCommand.php
+@@ -0,0 +1,137 @@
++<?php
++
++namespace App\Console\Commands;
++
++use App\Jobs\Shopify\RunCatalogAuditForShop;
++use App\Models\CatalogAuditRun;
++use App\Models\Shop;
++use Illuminate\Console\Command;
++use Illuminate\Support\Collection;
++use Illuminate\Support\Facades\Bus;
++use Illuminate\Support\Facades\DB;
++use Throwable;
++
++class RunCatalogAuditCommand extends Command
++{
++    protected $signature = 'catalog-audit:scan {--shop= : Shop slug, domain, or numeric ID}';
++
++    protected $description = 'Queue catalog audits for active configured Shopify shops.';
++
++    public function handle(): int
++    {
++        $configuredShops = config('catalog_audit.shops', []);
++        if (! is_array($configuredShops)) {
++            $this->error('Catalog audit shop configuration is invalid.');
++
++            return self::FAILURE;
++        }
++
++        $configuredShops = array_filter(
++            $configuredShops,
++            static fn (mixed $domain): bool => is_string($domain) && $domain !== ''
++        );
++        $activeShops = Shop::query()
++            ->where('is_active', true)
++            ->whereIn('domain', array_values($configuredShops))
++            ->get();
++
++        $shops = $this->resolveShops($configuredShops, $activeShops);
++        if ($shops === null) {
++            return self::FAILURE;
++        }
++
++        if ($shops->isEmpty()) {
++            $this->info('No active configured catalog-audit shops found.');
++
++            return self::SUCCESS;
++        }
++
++        if (! $this->usesDatabaseQueueOnDefaultConnection()) {
++            return self::FAILURE;
++        }
++
++        $queue = (string) config('catalog_audit.queue', 'bulk_ops');
++        try {
++            $jobCount = DB::transaction(function () use ($shops, $queue): int {
++                $jobs = [];
++                foreach ($shops as $shop) {
++                    $run = CatalogAuditRun::create([
++                        'shop_id' => $shop->id,
++                        'status' => CatalogAuditRun::STATUS_QUEUED,
++                    ]);
++
++                    $jobs[] = (new RunCatalogAuditForShop($run->id, $shop->id))->onQueue($queue);
++                }
++
++                Bus::chain($jobs)->dispatch();
++
++                return count($jobs);
++            });
++        } catch (Throwable $exception) {
++            report($exception);
++            $this->error('Catalog audit runs could not be queued.');
++
++            return self::FAILURE;
++        }
++
++        $this->info('Queued '.$jobCount.' catalog audit run(s).');
++
++        return self::SUCCESS;
++    }
++
++    private function usesDatabaseQueueOnDefaultConnection(): bool
++    {
++        $queueConnection = (string) config('queue.default');
++        $queueConfiguration = config("queue.connections.{$queueConnection}", []);
++        $queueDriver = is_array($queueConfiguration) ? ($queueConfiguration['driver'] ?? null) : null;
++        $queueDatabaseConnection = is_array($queueConfiguration)
++            ? ($queueConfiguration['connection'] ?? config('database.default'))
++            : null;
++
++        if ($queueDriver !== 'database' || $queueDatabaseConnection !== config('database.default')) {
++            $this->error('Catalog audits require the default database queue on the application database connection.');
++
++            return false;
++        }
++
++        return true;
++    }
++
++    /**
++     * @param  array<string, string>  $configuredShops
++     * @param  Collection<int, Shop>  $activeShops
++     * @return Collection<int, Shop>|null
++     */
++    private function resolveShops(array $configuredShops, Collection $activeShops): ?Collection
++    {
++        $byDomain = $activeShops->keyBy(
++            static fn (Shop $shop): string => strtolower((string) $shop->domain)
++        );
++        $byId = $activeShops->keyBy('id');
++        $selector = trim((string) $this->option('shop'));
++
++        if ($selector !== '') {
++            $shop = null;
++            if (array_key_exists($selector, $configuredShops)) {
++                $shop = $byDomain->get(strtolower($configuredShops[$selector]));
++            } elseif (ctype_digit($selector)) {
++                $shop = $byId->get((int) $selector);
++            } else {
++                $shop = $byDomain->get(strtolower($selector));
++            }
++
++            if (! $shop instanceof Shop) {
++                $this->error("Shop [{$selector}] is unknown, inactive, or not configured for catalog audits.");
++
++                return null;
++            }
++
++            return collect([$shop]);
++        }
++
++        return collect($configuredShops)
++            ->map(fn (string $domain): ?Shop => $byDomain->get(strtolower($domain)))
++            ->filter()
++            ->values();
++    }
++}
+diff --git a/config/queue.php b/config/queue.php
+new file mode 100755
+index 0000000..8a00f48
+--- /dev/null
++++ b/config/queue.php
+@@ -0,0 +1,93 @@
++<?php
++
++return [
++
++    /*
++    |--------------------------------------------------------------------------
++    | Default Queue Connection Name
++    |--------------------------------------------------------------------------
++    |
++    | Laravel's queue API supports an assortment of back-ends via a single
++    | API, giving you convenient access to each back-end using the same
++    | syntax for every one. Here you may define a default connection.
++    |
++    */
++
++    'default' => env('QUEUE_CONNECTION', 'sync'),
++
++    /*
++    |--------------------------------------------------------------------------
++    | Queue Connections
++    |--------------------------------------------------------------------------
++    |
++    | Here you may configure the connection information for each server that
++    | is used by your application. A default configuration has been added
++    | for each back-end shipped with Laravel. You are free to add more.
++    |
++    | Drivers: "sync", "database", "beanstalkd", "sqs", "redis", "null"
++    |
++    */
++
++    'connections' => [
++
++        'sync' => [
++            'driver' => 'sync',
++        ],
++
++        'database' => [
++            'driver' => 'database',
++            'table' => 'jobs',
++            'queue' => 'default',
++            'retry_after' => (int) env('DB_QUEUE_RETRY_AFTER', 2700),
++            'after_commit' => false,
++        ],
++
++        'beanstalkd' => [
++            'driver' => 'beanstalkd',
++            'host' => 'localhost',
++            'queue' => 'default',
++            'retry_after' => 90,
++            'block_for' => 0,
++            'after_commit' => false,
++        ],
++
++        'sqs' => [
++            'driver' => 'sqs',
++            'key' => env('AWS_ACCESS_KEY_ID'),
++            'secret' => env('AWS_SECRET_ACCESS_KEY'),
++            'prefix' => env('SQS_PREFIX', 'https://sqs.us-east-1.amazonaws.com/your-account-id'),
++            'queue' => env('SQS_QUEUE', 'default'),
++            'suffix' => env('SQS_SUFFIX'),
++            'region' => env('AWS_DEFAULT_REGION', 'us-east-1'),
++            'after_commit' => false,
++        ],
++
++        'redis' => [
++            'driver' => 'redis',
++            'connection' => 'default',
++            'queue' => env('REDIS_QUEUE', 'default'),
++            'retry_after' => 90,
++            'block_for' => null,
++            'after_commit' => false,
++        ],
++
++    ],
++
++    /*
++    |--------------------------------------------------------------------------
++    | Failed Queue Jobs
++    |--------------------------------------------------------------------------
++    |
++    | These options configure the behavior of failed queue job logging so you
++    | can control which database and table are used to store the jobs that
++    | have failed. You may change them to any database / table you wish.
++    |
++    */
++
++    'failed' => [
++        'driver' => env('QUEUE_FAILED_DRIVER', 'database-uuids'),
++        'database' => env('DB_CONNECTION', 'mysql'),
++        'table' => 'failed_jobs',
++    ],
++
++];
+diff --git a/tests/Unit/CatalogAuditCommandContractTest.php b/tests/Unit/CatalogAuditCommandContractTest.php
+new file mode 100644
+index 0000000..f388235
+--- /dev/null
++++ b/tests/Unit/CatalogAuditCommandContractTest.php
+@@ -0,0 +1,79 @@
++<?php
++
++namespace Tests\Unit;
++
++use App\Console\Commands\RunCatalogAuditCommand;
++use App\Jobs\Shopify\RunCatalogAuditForShop;
++use Illuminate\Queue\Middleware\WithoutOverlapping;
++use ReflectionMethod;
++use Tests\TestCase;
++
++class CatalogAuditCommandContractTest extends TestCase
++{
++    public function test_command_exposes_the_catalog_audit_scan_contract_without_accessing_a_database(): void
++    {
++        $path = app_path('Console/Commands/RunCatalogAuditCommand.php');
++
++        $this->assertFileExists($path);
++
++        $command = new RunCatalogAuditCommand;
++
++        $this->assertSame('catalog-audit:scan', $command->getName());
++        $this->assertTrue($command->getDefinition()->hasOption('shop'));
++
++        $source = (string) file_get_contents($path);
++        $this->assertStringContainsString('CatalogAuditRun::create', $source);
++        $this->assertStringContainsString('CatalogAuditRun::STATUS_QUEUED', $source);
++        $this->assertStringContainsString('Bus::chain($jobs)->dispatch()', $source);
++        $this->assertStringContainsString("config('catalog_audit.queue'", $source);
++        $this->assertStringContainsString('$queueDriver !== \'database\'', $source);
++        $this->assertStringContainsString('DB::transaction', $source);
++    }
++
++    public function test_job_has_the_required_queue_and_overlap_contract_without_accessing_a_database(): void
++    {
++        $path = app_path('Jobs/Shopify/RunCatalogAuditForShop.php');
++
++        $this->assertFileExists($path);
++
++        $job = new RunCatalogAuditForShop(41, 7);
++        $constructor = new ReflectionMethod($job, '__construct');
++        $parameters = $constructor->getParameters();
++
++        $this->assertCount(2, $parameters);
++        $this->assertSame('runId', $parameters[0]->getName());
++        $this->assertTrue($parameters[0]->isPromoted());
++        $this->assertSame('int', (string) $parameters[0]->getType());
++        $this->assertSame('shopId', $parameters[1]->getName());
++        $this->assertTrue($parameters[1]->isPromoted());
++        $this->assertSame('int', (string) $parameters[1]->getType());
++        $this->assertSame(2, $job->tries);
++        $this->assertSame([60], $job->backoff);
++        $this->assertSame(1800, $job->timeout);
++        $this->assertTrue($job->failOnTimeout);
++        $this->assertSame('bulk_ops', $job->queue);
++
++        $middleware = $job->middleware();
++
++        $this->assertCount(1, $middleware);
++        $this->assertInstanceOf(WithoutOverlapping::class, $middleware[0]);
++        $this->assertSame('catalog-audit-shop-7', $middleware[0]->key);
++        $this->assertSame(60, $middleware[0]->releaseAfter);
++        $this->assertSame(2400, $middleware[0]->expiresAfter);
++
++        $retryAfter = (int) config('queue.connections.database.retry_after');
++
++        $this->assertGreaterThan($job->timeout, $retryAfter);
++        $this->assertGreaterThan($middleware[0]->expiresAfter, $retryAfter);
++    }
++
++    public function test_job_has_a_failed_callback_that_only_advances_after_persisting_the_terminal_failure(): void
++    {
++        $source = (string) file_get_contents(app_path('Jobs/Shopify/RunCatalogAuditForShop.php'));
++
++        $this->assertStringContainsString('public function failed(Throwable $exception): void', $source);
++        $this->assertStringContainsString('$this->markRunFailed($exception, $this->attempts());', $source);
++        $this->assertStringContainsString('$this->dispatchNextJobInChain();', $source);
++        $this->assertStringContainsString("throw new \\RuntimeException('Catalog audit run could not be marked failed.');", $source);
++    }
++}
+diff --git a/tests/Feature/RunCatalogAuditForShopTest.php b/tests/Feature/RunCatalogAuditForShopTest.php
+new file mode 100644
+index 0000000..81b2835
+--- /dev/null
++++ b/tests/Feature/RunCatalogAuditForShopTest.php
+@@ -0,0 +1,315 @@
++<?php
++
++namespace Tests\Feature;
++
++use App\Console\Commands\RunCatalogAuditCommand;
++use App\Jobs\Shopify\RunCatalogAuditForShop;
++use App\Models\CatalogAuditFinding;
++use App\Models\CatalogAuditRun;
++use App\Models\Shop;
++use Illuminate\Contracts\Queue\Job as QueueJob;
++use Illuminate\Database\Schema\Blueprint;
++use Illuminate\Support\Facades\Bus;
++use Illuminate\Support\Facades\Config;
++use Illuminate\Support\Facades\DB;
++use Illuminate\Support\Facades\Http;
++use Illuminate\Support\Facades\Schema;
++use Mockery;
++use RuntimeException;
++use Tests\TestCase;
++
++class RunCatalogAuditForShopTest extends TestCase
++{
++    protected function setUp(): void
++    {
++        if (! extension_loaded('pdo_sqlite')) {
++            $this->markTestSkipped('PDO SQLite is required for isolated catalog audit orchestration tests.');
++        }
++
++        parent::setUp();
++
++        $this->configureInMemoryDatabase();
++        Config::set('catalog_audit.shops', [
++            'first' => 'first.myshopify.com',
++            'second' => 'second.myshopify.com',
++        ]);
++        Config::set('catalog_audit.queue', 'bulk_ops');
++        Config::set('catalog_audit.timeout_seconds', 1);
++        Config::set('catalog_audit.poll_seconds', 0);
++        Config::set('queue.default', 'database');
++    }
++
++    public function test_command_creates_queued_runs_in_config_order_and_dispatches_one_chain(): void
++    {
++        $first = $this->shop('first.myshopify.com');
++        $second = $this->shop('second.myshopify.com');
++        Bus::fake();
++
++        $this->artisan(RunCatalogAuditCommand::class)
++            ->assertExitCode(0);
++
++        $runs = CatalogAuditRun::query()->with('shop')->orderBy('id')->get();
++
++        $this->assertSame(['first.myshopify.com', 'second.myshopify.com'], $runs->pluck('shop.domain')->all());
++        $this->assertSame([CatalogAuditRun::STATUS_QUEUED, CatalogAuditRun::STATUS_QUEUED], $runs->pluck('status')->all());
++        Bus::assertDispatched(RunCatalogAuditForShop::class, function (RunCatalogAuditForShop $job) use ($first, $second, $runs): bool {
++            $this->assertSame($runs[0]->id, $job->runId);
++            $this->assertSame($first->id, $job->shopId);
++            $this->assertSame('bulk_ops', $job->queue);
++            $this->assertCount(1, $job->chained);
++
++            $next = unserialize($job->chained[0]);
++            $this->assertInstanceOf(RunCatalogAuditForShop::class, $next);
++            $this->assertSame($runs[1]->id, $next->runId);
++            $this->assertSame($second->id, $next->shopId);
++            $this->assertSame('bulk_ops', $next->queue);
++
++            return true;
++        });
++    }
++
++    public function test_command_resolves_one_active_configured_shop_by_slug_domain_or_id(): void
++    {
++        $first = $this->shop('first.myshopify.com');
++        $second = $this->shop('second.myshopify.com');
++
++        foreach (['first', 'second.myshopify.com', (string) $first->id] as $selector) {
++            CatalogAuditRun::query()->delete();
++            Bus::fake();
++
++            $this->artisan(RunCatalogAuditCommand::class, ['--shop' => $selector])
++                ->assertExitCode(0);
++
++            $run = CatalogAuditRun::sole();
++            $expected = $selector === 'second.myshopify.com' ? $second : $first;
++            $this->assertSame($expected->id, $run->shop_id);
++            Bus::assertDispatched(RunCatalogAuditForShop::class, function (RunCatalogAuditForShop $job) use ($run, $expected): bool {
++                return $job->runId === $run->id && $job->shopId === $expected->id;
++            });
++        }
++    }
++
++    public function test_command_rejects_unknown_or_excluded_shops_before_creating_runs_or_dispatching(): void
++    {
++        $this->shop('first.myshopify.com', false);
++        $this->shop('excluded.myshopify.com');
++
++        foreach (['unknown', 'excluded.myshopify.com'] as $selector) {
++            Bus::fake();
++
++            $this->artisan(RunCatalogAuditCommand::class, ['--shop' => $selector])
++                ->assertExitCode(1);
++
++            $this->assertSame(0, CatalogAuditRun::query()->count());
++            Bus::assertNothingDispatched();
++        }
++    }
++
++    public function test_command_returns_success_without_dispatching_when_no_configured_shop_is_active(): void
++    {
++        $this->shop('first.myshopify.com', false);
++        Bus::fake();
++
++        $this->artisan(RunCatalogAuditCommand::class)
++            ->assertExitCode(0);
++
++        $this->assertSame(0, CatalogAuditRun::query()->count());
++        Bus::assertNothingDispatched();
++    }
++
++    public function test_command_rejects_a_non_database_queue_before_creating_runs(): void
++    {
++        $this->shop('first.myshopify.com');
++        Config::set('queue.default', 'sync');
++
++        $this->artisan(RunCatalogAuditCommand::class)
++            ->assertExitCode(1);
++
++        $this->assertSame(0, CatalogAuditRun::query()->count());
++    }
++
++    public function test_command_rolls_back_queued_runs_when_database_chain_dispatch_fails(): void
++    {
++        $this->shop('first.myshopify.com');
++        Bus::shouldReceive('chain')
++            ->once()
++            ->andThrow(new RuntimeException('Queue dispatch failed.'));
++
++        $this->artisan(RunCatalogAuditCommand::class)
++            ->assertExitCode(1);
++
++        $this->assertSame(0, CatalogAuditRun::query()->count());
++    }
++
++    public function test_job_reconciles_a_snapshot_after_marking_its_queued_run_running(): void
++    {
++        $shop = $this->shop('first.myshopify.com');
++        $run = $this->queuedRun($shop);
++        Http::fakeSequence()
++            ->push(['data' => ['bulkOperationRunQuery' => [
++                'bulkOperation' => ['id' => 'gid://shopify/BulkOperation/1', 'status' => 'CREATED'],
++                'userErrors' => [],
++            ]]], 200)
++            ->push(['data' => ['currentBulkOperation' => [
++                'id' => 'gid://shopify/BulkOperation/1',
++                'status' => 'COMPLETED',
++                'url' => 'https://snapshot.test/catalog.jsonl',
++            ]]], 200)
++            ->push("{\"id\":\"gid://shopify/Product/1\",\"legacyResourceId\":\"1\",\"title\":\"Lamp\",\"handle\":\"lamp\",\"status\":\"ACTIVE\"}\n", 200);
++
++        (new RunCatalogAuditForShop($run->id, $shop->id))->handle(
++            app(\App\Services\Shopify\CatalogAuditBulkService::class),
++            app(\App\Services\Shopify\CatalogAuditJsonlParser::class),
++            app(\App\Services\Shopify\CatalogAuditReconciler::class),
++        );
++
++        $run->refresh();
++        $this->assertSame(CatalogAuditRun::STATUS_COMPLETED, $run->status);
++        $this->assertNotNull($run->started_at);
++        $this->assertSame(1, CatalogAuditFinding::where('shop_id', $shop->id)->count());
++    }
++
++    public function test_job_releases_the_first_failed_attempt_without_touching_stale_findings_or_the_chain(): void
++    {
++        $shop = $this->shop('first.myshopify.com');
++        $run = $this->queuedRun($shop);
++        $this->finding($shop, $this->completedRun($shop));
++        Http::fake(['*' => Http::response([], 500)]);
++        Bus::fake();
++        $queueJob = Mockery::mock(QueueJob::class);
++        $queueJob->shouldReceive('attempts')->once()->andReturn(1);
++        $queueJob->shouldReceive('release')->once()->with(60);
++        $job = (new RunCatalogAuditForShop($run->id, $shop->id))->setJob($queueJob);
++
++        $job->handle(
++            app(\App\Services\Shopify\CatalogAuditBulkService::class),
++            app(\App\Services\Shopify\CatalogAuditJsonlParser::class),
++            app(\App\Services\Shopify\CatalogAuditReconciler::class),
++        );
++
++        $run->refresh();
++        $this->assertSame(CatalogAuditRun::STATUS_RUNNING, $run->status);
++        $this->assertSame(1, CatalogAuditFinding::where('shop_id', $shop->id)->count());
++        Bus::assertNothingDispatched();
++    }
++
++    public function test_job_marks_the_final_failed_attempt_without_touching_stale_findings_or_throwing(): void
++    {
++        $shop = $this->shop('first.myshopify.com');
++        $run = $this->queuedRun($shop);
++        $this->finding($shop, $this->completedRun($shop));
++        Http::fake(['*' => Http::response([], 500)]);
++        $queueJob = Mockery::mock(QueueJob::class);
++        $queueJob->shouldReceive('attempts')->once()->andReturn(2);
++        $queueJob->shouldNotReceive('release');
++        $job = (new RunCatalogAuditForShop($run->id, $shop->id))->setJob($queueJob);
++
++        $job->handle(
++            app(\App\Services\Shopify\CatalogAuditBulkService::class),
++            app(\App\Services\Shopify\CatalogAuditJsonlParser::class),
++            app(\App\Services\Shopify\CatalogAuditReconciler::class),
++        );
++
++        $run->refresh();
++        $this->assertSame(CatalogAuditRun::STATUS_FAILED, $run->status);
++        $this->assertNotNull($run->finished_at);
++        $this->assertNotSame('', $run->error_message);
++        $this->assertSame(1, CatalogAuditFinding::where('shop_id', $shop->id)->count());
++    }
++
++    private function shop(string $domain, bool $active = true): Shop
++    {
++        return Shop::create([
++            'name' => $domain,
++            'domain' => $domain,
++            'access_token' => 'catalog-audit-token',
++            'api_version' => '2025-01',
++            'is_active' => $active,
++        ]);
++    }
++
++    private function queuedRun(Shop $shop): CatalogAuditRun
++    {
++        return CatalogAuditRun::create([
++            'shop_id' => $shop->id,
++            'status' => CatalogAuditRun::STATUS_QUEUED,
++        ]);
++    }
++
++    private function completedRun(Shop $shop): CatalogAuditRun
++    {
++        return CatalogAuditRun::create([
++            'shop_id' => $shop->id,
++            'status' => CatalogAuditRun::STATUS_COMPLETED,
++            'finished_at' => now(),
++        ]);
++    }
++
++    private function finding(Shop $shop, CatalogAuditRun $run): void
++    {
++        CatalogAuditFinding::create([
++            'shop_id' => $shop->id,
++            'last_seen_run_id' => $run->id,
++            'finding_type' => CatalogAuditFinding::TYPE_MISSING_IMAGE,
++            'fingerprint' => 'missing_image:gid://shopify/Product/999',
++            'product_gid' => 'gid://shopify/Product/999',
++            'last_seen_at' => now(),
++        ]);
++    }
++
++    private function configureInMemoryDatabase(): void
++    {
++        Config::set('database.default', 'sqlite');
++        Config::set('database.connections.sqlite.database', ':memory:');
++        Config::set('database.connections.sqlite.foreign_key_constraints', true);
++        DB::purge('sqlite');
++        DB::setDefaultConnection('sqlite');
++
++        Schema::create('shops', function (Blueprint $table) {
++            $table->id();
++            $table->string('name')->nullable();
++            $table->string('domain')->unique();
++            $table->text('access_token');
++            $table->string('api_version')->default('2025-01');
++            $table->boolean('is_source')->default(false);
++            $table->boolean('is_active')->default(true);
++            $table->unsignedBigInteger('location_legacy_id')->nullable();
++            $table->timestamps();
++        });
++
++        Schema::create('catalog_audit_runs', function (Blueprint $table) {
++            $table->id();
++            $table->foreignId('shop_id')->constrained('shops')->cascadeOnDelete();
++            $table->string('status', 20);
++            $table->timestamp('started_at')->nullable();
++            $table->timestamp('finished_at')->nullable();
++            $table->unsignedInteger('missing_image_count')->default(0);
++            $table->unsignedInteger('duplicate_sku_group_count')->default(0);
++            $table->unsignedInteger('duplicate_sku_row_count')->default(0);
++            $table->text('error_message')->nullable();
++            $table->timestamps();
++        });
++
++        Schema::create('catalog_audit_findings', function (Blueprint $table) {
++            $table->id();
++            $table->foreignId('shop_id')->constrained('shops')->cascadeOnDelete();
++            $table->foreignId('last_seen_run_id')->constrained('catalog_audit_runs')->restrictOnDelete();
++            $table->string('finding_type', 30);
++            $table->string('fingerprint');
++            $table->string('product_gid');
++            $table->unsignedBigInteger('product_legacy_id')->nullable();
++            $table->string('product_title')->nullable();
++            $table->string('product_handle')->nullable();
++            $table->string('product_status')->nullable();
++            $table->string('variant_gid')->nullable();
++            $table->unsignedBigInteger('variant_legacy_id')->nullable();
++            $table->string('variant_title')->nullable();
++            $table->string('sku')->nullable();
++            $table->string('normalized_sku')->nullable();
++            $table->string('shopify_admin_url')->nullable();
++            $table->timestamp('last_seen_at')->nullable();
++            $table->timestamps();
++            $table->unique(['shop_id', 'finding_type', 'fingerprint']);
++        });
++    }
++}

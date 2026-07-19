@@ -16,9 +16,11 @@ use Illuminate\Support\Facades\Http;
 use Illuminate\Support\Facades\Log;
 use Illuminate\Support\Facades\Mail;
 use App\Services\Shopify\ProductImagesBackupService;
+use App\Services\Shopify\ShopifyParentIdentityResolver;
 use App\Jobs\BemApplyProductWatermark;
 use App\Services\Shopify\BemWatermark\BemBackupProductImageResolver;
 use App\Services\Shopify\BemWatermark\BemImageIdentityService;
+use App\Services\Shopify\BemWatermark\BemSourceCreateMediaResolver;
 use App\Services\Shopify\BemWatermark\BemProductWatermarkMetafieldService;
 use App\Services\Shopify\BemWatermark\BemShopifyStagedUploadService;
 use App\Services\Shopify\BemWatermark\BemWatermarkEligibilityService;
@@ -28,8 +30,10 @@ class ReplicateProductCreateToShop implements ShouldQueue
 {
     use Dispatchable, InteractsWithQueue, Queueable, SerializesModels;
 
-    public $tries = 5;
+    public $tries = 40;
     public $backoff = [10, 30, 60, 120];
+    public $timeout = 840;
+    public $failOnTimeout = true;
 
     /**
      * Manual collection IDs per target shop domain.
@@ -48,7 +52,7 @@ class ReplicateProductCreateToShop implements ShouldQueue
         public array $payload
     ) {}
 
-    public function handle(): void
+    public function handle(ShopifyParentIdentityResolver $identityResolver): void
     {
         $bemTempPaths = [];
         $creationLock = null;
@@ -99,53 +103,75 @@ class ReplicateProductCreateToShop implements ShouldQueue
                 'target_shop_domain' => $target->domain ?? null,
             ]);
 
-            if ($existingMirror = $this->existingCreatedMirror($target)) {
-                Log::warning('ReplicateProductCreate skipped: existing mirror found, preventing duplicate create', [
-                    'target_shop_id' => $target->id,
-                    'target_shop_domain' => $target->domain,
-                    'source_product_id' => $this->sourceProductId,
-                    'target_product_id' => $existingMirror->target_product_id,
-                    'target_product_gid' => $existingMirror->target_product_gid,
-                ]);
+            $existingMirror = $this->existingCreatedMirror($target);
+            $existingResolution = $identityResolver->resolveProduct(
+                $target,
+                $this->sourceProductId,
+                $existingMirror?->target_product_gid
+            );
 
-                if ($existingMirror->target_product_gid) {
-                    $this->setParentProductMetafield($target, $existingMirror->target_product_gid);
-                    $this->dispatchBemWatermarkIfEligible(
-                        $target,
-                        $existingMirror->target_product_gid,
-                        $existingMirror->target_product_id ? (int) $existingMirror->target_product_id : null
-                    );
-                }
-
-                return;
-            }
-
-            $existingParentProduct = $this->existingShopifyProductByParentProduct($target);
-            if ($existingParentProduct['status'] === 'ambiguous') {
+            if ($existingResolution['status'] === 'ambiguous') {
                 Log::error('ReplicateProductCreate stopped: multiple products share parentproduct', [
                     'source_shop_id' => $this->sourceShopId,
                     'source_product_id' => $this->sourceProductId,
                     'target_shop_id' => $target->id,
                     'target_shop' => $target->domain,
-                    'candidates' => $existingParentProduct['products'],
+                    'candidate_gids' => array_column($existingResolution['candidates'], 'id'),
                 ]);
 
                 return;
             }
 
-            if ($existingParentProduct['status'] === 'found') {
-                $product = $existingParentProduct['products'][0];
-                $this->storeExistingProductMirror($target, $product);
+            if ($existingResolution['status'] === 'found') {
+                $product = $existingResolution['product'];
+                $mirror = $this->storeExistingProductMirror($target, [
+                    'id' => isset($product['legacyResourceId']) ? (int) $product['legacyResourceId'] : null,
+                    'gid' => $product['id'],
+                ]);
 
-                Log::warning('ReplicateProductCreate skipped: existing Shopify parentproduct found, preventing duplicate create', [
+                Log::warning('ReplicateProductCreate skipped: strict parentproduct already exists', [
                     'source_shop_id' => $this->sourceShopId,
                     'source_product_id' => $this->sourceProductId,
                     'target_shop_id' => $target->id,
                     'target_shop' => $target->domain,
-                    'target_product_id' => $product['id'],
-                    'target_product_gid' => $product['gid'],
+                    'target_product_id' => $mirror->target_product_id,
+                    'target_product_gid' => $mirror->target_product_gid,
                 ]);
 
+                $this->setParentProductMetafield($target, $mirror->target_product_gid);
+                if (!$this->continueExistingCreate($identityResolver, $target, $mirror)) {
+                    return;
+                }
+
+                ReplicateProductUpdateToShop::dispatch(
+                    $this->targetShopId,
+                    $this->sourceShopId,
+                    $this->sourceProductId,
+                    $this->payload
+                )->onQueue('replication');
+                $this->dispatchBemWatermarkIfEligible(
+                    $target,
+                    $mirror->target_product_gid,
+                    $mirror->target_product_id ? (int) $mirror->target_product_id : null
+                );
+
+                return;
+            }
+
+            if ($existingMirror) {
+                Log::error('ReplicateProductCreate stopped: local mirror failed strict parentproduct validation', [
+                    'source_shop_id' => $this->sourceShopId,
+                    'source_product_id' => $this->sourceProductId,
+                    'target_shop_id' => $target->id,
+                    'target_shop' => $target->domain,
+                    'cached_target_product_id' => $existingMirror->target_product_id,
+                    'cached_target_product_gid' => $existingMirror->target_product_gid,
+                ]);
+
+                return;
+            }
+
+            if ($this->hydrateDelayedBemSourceMediaBeforeCreate($target)) {
                 return;
             }
 
@@ -173,11 +199,29 @@ class ReplicateProductCreateToShop implements ShouldQueue
 
             // BEM processing can take time. Check again immediately before the
             // write in case another execution created the target meanwhile.
-            $existingParentProduct = $this->existingShopifyProductByParentProduct($target);
-            if ($existingParentProduct['status'] !== 'none') {
-                if ($existingParentProduct['status'] === 'found') {
-                    $product = $existingParentProduct['products'][0];
-                    $this->storeExistingProductMirror($target, $product);
+            $preCreateResolution = $identityResolver->resolveProduct($target, $this->sourceProductId);
+            if ($preCreateResolution['status'] !== 'missing') {
+                if ($preCreateResolution['status'] === 'found') {
+                    $product = $preCreateResolution['product'];
+                    $mirror = $this->storeExistingProductMirror($target, [
+                        'id' => isset($product['legacyResourceId']) ? (int) $product['legacyResourceId'] : null,
+                        'gid' => $product['id'],
+                    ]);
+
+                    $this->setParentProductMetafield($target, $mirror->target_product_gid);
+                    if ($this->continueExistingCreate($identityResolver, $target, $mirror)) {
+                        ReplicateProductUpdateToShop::dispatch(
+                            $this->targetShopId,
+                            $this->sourceShopId,
+                            $this->sourceProductId,
+                            $this->payload
+                        )->onQueue('replication');
+                        $this->dispatchBemWatermarkIfEligible(
+                            $target,
+                            $mirror->target_product_gid,
+                            $mirror->target_product_id ? (int) $mirror->target_product_id : null
+                        );
+                    }
                 }
 
                 Log::warning('ReplicateProductCreate skipped before Shopify create: parentproduct already exists', [
@@ -185,31 +229,21 @@ class ReplicateProductCreateToShop implements ShouldQueue
                     'source_product_id' => $this->sourceProductId,
                     'target_shop_id' => $target->id,
                     'target_shop' => $target->domain,
-                    'status' => $existingParentProduct['status'],
-                    'candidates' => $existingParentProduct['products'],
+                    'status' => $preCreateResolution['status'],
+                    'candidate_gids' => array_column($preCreateResolution['candidates'], 'id'),
                 ]);
 
                 return;
             }
 
             [$productGid, $productLegacyId, $variantMap] = $this->productCreate($target, $payloadForCreate, $metaDescription);
+            $pm = $this->storeExistingProductMirror($target, [
+                'id' => $productLegacyId,
+                'gid' => $productGid,
+            ]);
             $this->setParentProductMetafield($target, $productGid);
 
             $this->attachProductToManualCollection($target, $productGid);
-
-            // Save product mapping (mirror)
-            $pm = ProductMirror::updateOrCreate(
-                [
-                    'source_shop_id'    => $this->sourceShopId,
-                    'source_product_id' => $this->sourceProductId,
-                    'target_shop_id'    => $target->id,
-                ],
-                [
-                    'source_product_gid' => "gid://shopify/Product/{$this->sourceProductId}",
-                    'target_product_gid' => $productGid,
-                    'target_product_id'  => $productLegacyId,
-                ]
-            );
 
             $mirror = ProductMirror::where([
                 'source_shop_id'    => $this->sourceShopId,
@@ -240,40 +274,7 @@ class ReplicateProductCreateToShop implements ShouldQueue
                 $this->dispatchBemWatermarkIfEligible($target, $productGid, $productLegacyId);
             }
 
-            // Save variant mappings (mirrors)
-            if (!empty($variantMap)) {
-                foreach ($variantMap as $vm) {
-                    VariantMirror::updateOrCreate(
-                        [
-                            'product_mirror_id' => $pm->id,
-                            'source_variant_id' => $vm['source_variant_id'], // may be null in some edge payloads
-                        ],
-                        [
-                            'source_options_key'    => $vm['source_options_key'],
-                            'target_variant_gid'    => $vm['target_variant_gid'],
-                            'target_variant_id'     => $vm['target_variant_id'],
-                            'inventory_item_gid'    => $vm['inventory_item_gid'] ?? null,
-                            'last_snapshot'         => $vm['snapshot'],
-                            'variant_fingerprint'   => hash('sha256', json_encode([
-                                'price'   => $vm['snapshot']['price']   ?? null,
-                                'sku'     => $vm['snapshot']['sku']     ?? null,
-                                'barcode' => $vm['snapshot']['barcode'] ?? null,
-                            ])),
-                            'inventory_fingerprint' => hash('sha256', json_encode([
-                                'qty' => $vm['snapshot']['qty'] ?? null,
-                            ])),
-                        ]
-                    );
-
-                    if (!empty($vm['source_variant_id']) && !empty($vm['target_variant_gid'])) {
-                        $this->setParentVariantMetafield(
-                            $target,
-                            $vm['target_variant_gid'],
-                            (int)$vm['source_variant_id']
-                        );
-                    }
-                }
-            }
+            $this->persistVariantMappings($target, $pm, $variantMap);
 
             // Log::info('Replicated product to target shop', [
             //     'target'            => $target->domain,
@@ -283,14 +284,21 @@ class ReplicateProductCreateToShop implements ShouldQueue
             //     'variants_mapped'   => count($variantMap ?? []),
             // ]);
 
-            // Optional: publish the product to all sales channels configured on the target shop
-            try {
-                $this->publishProductToAllChannels($target, $productGid);
-            } catch (\Throwable $e) {
-                Log::warning('Publish to channels failed (non-fatal)', [
+            if ($this->statusFromPayload($this->payload) === 'ACTIVE') {
+                try {
+                    $this->publishProductToAllChannels($target, $productGid);
+                } catch (\Throwable $e) {
+                    Log::warning('Publish to channels failed (non-fatal)', [
+                        'target' => $target->domain,
+                        'productGid' => $productGid,
+                        'error' => $e->getMessage(),
+                    ]);
+                }
+            } else {
+                Log::info('Publish to channels skipped for non-active product', [
                     'target' => $target->domain,
                     'productGid' => $productGid,
-                    'error' => $e->getMessage(),
+                    'status' => $this->statusFromPayload($this->payload),
                 ]);
             }
         } catch (\Throwable $e) {
@@ -367,49 +375,10 @@ class ReplicateProductCreateToShop implements ShouldQueue
             ->first();
     }
 
-    /**
-     * @return array{status: 'none'|'found'|'ambiguous', products: array<int, array{id: int|null, gid: string}>}
-     */
-    private function existingShopifyProductByParentProduct(Shop $target): array
-    {
-        $query = <<<'GQL'
-        query ExistingProductParent($query: String!) {
-          products(first: 10, query: $query) {
-            nodes {
-              id
-              legacyResourceId
-              metafield(namespace: "custom", key: "parentproduct") {
-                value
-              }
-            }
-          }
-        }
-        GQL;
-
-        $response = $this->gql($target, $query, [
-            'query' => 'metafields.custom.parentproduct:'.$this->sourceProductId,
-        ]);
-
-        $products = collect($response['data']['products']['nodes'] ?? [])
-            ->filter(fn (array $product) => (string) data_get($product, 'metafield.value') === (string) $this->sourceProductId)
-            ->filter(fn (array $product) => !empty($product['id']))
-            ->map(fn (array $product) => [
-                'id' => isset($product['legacyResourceId']) ? (int) $product['legacyResourceId'] : null,
-                'gid' => (string) $product['id'],
-            ])
-            ->values()
-            ->all();
-
-        return [
-            'status' => count($products) === 0 ? 'none' : (count($products) === 1 ? 'found' : 'ambiguous'),
-            'products' => $products,
-        ];
-    }
-
     /** @param array{id: int|null, gid: string} $product */
-    private function storeExistingProductMirror(Shop $target, array $product): void
+    private function storeExistingProductMirror(Shop $target, array $product): ProductMirror
     {
-        ProductMirror::updateOrCreate(
+        return ProductMirror::updateOrCreate(
             [
                 'source_shop_id' => $this->sourceShopId,
                 'source_product_id' => $this->sourceProductId,
@@ -421,6 +390,206 @@ class ReplicateProductCreateToShop implements ShouldQueue
                 'target_product_id' => $product['id'],
             ]
         );
+    }
+
+    private function continueExistingCreate(
+        ShopifyParentIdentityResolver $identityResolver,
+        Shop $target,
+        ProductMirror $mirror
+    ): bool {
+        try {
+            $sourceVariantsById = $this->sourceVariantsById($this->payload);
+        } catch (\RuntimeException $e) {
+            Log::error('ReplicateProductCreate continuation stopped: invalid source variants', [
+                'source_product_id' => $this->sourceProductId,
+                'target_shop' => $target->domain,
+                'error' => $e->getMessage(),
+            ]);
+
+            return false;
+        }
+
+        $state = $identityResolver->targetVariantState($target, $mirror->target_product_gid);
+        if (!empty($state['ambiguous_parent_ids'])) {
+            Log::error('ReplicateProductCreate continuation stopped: ambiguous parentvariant values', [
+                'source_product_id' => $this->sourceProductId,
+                'target_shop' => $target->domain,
+                'ambiguous_parentvariant_ids' => array_keys($state['ambiguous_parent_ids']),
+            ]);
+
+            return false;
+        }
+
+        if (!empty($state['unmanaged_gids'])) {
+            $localMirrors = VariantMirror::where('product_mirror_id', $mirror->id)
+                ->whereNotNull('target_variant_gid')
+                ->get()
+                ->keyBy('target_variant_gid');
+
+            foreach ($state['unmanaged_gids'] as $targetVariantGid) {
+                $localMirror = $localMirrors->get($targetVariantGid);
+                $sourceVariantId = (int) ($localMirror?->source_variant_id ?? 0);
+                if ($sourceVariantId <= 0 || !isset($sourceVariantsById[(string) $sourceVariantId])) {
+                    continue;
+                }
+
+                $this->setParentVariantMetafield($target, $targetVariantGid, $sourceVariantId);
+            }
+
+            $state = $identityResolver->targetVariantState($target, $mirror->target_product_gid);
+        }
+
+        $hasMultipleVariants = count($sourceVariantsById) > 1;
+        $hasProductOptions = !empty($this->payload['options']);
+        $isUntouchedMultiVariantShell = count($state['unmanaged_gids']) === 1
+            && empty($state['by_parent_id'])
+            && empty($state['ambiguous_parent_ids'])
+            && ($hasMultipleVariants || $hasProductOptions);
+
+        if ($isUntouchedMultiVariantShell) {
+            $variantMap = $this->createAllOptionsAndVariants(
+                shop: $target,
+                productGid: $mirror->target_product_gid,
+                src: $this->payload,
+                locationLegacyId: $target->location_legacy_id ?? null
+            );
+            $this->persistVariantMappings($target, $mirror, $variantMap);
+            $state = $identityResolver->targetVariantState($target, $mirror->target_product_gid);
+        }
+
+        if (!empty($state['unmanaged_gids']) || !empty($state['ambiguous_parent_ids'])) {
+            Log::error('ReplicateProductCreate continuation stopped: variant identity cannot be proven', [
+                'source_product_id' => $this->sourceProductId,
+                'target_shop' => $target->domain,
+                'unmanaged_variant_gids' => $state['unmanaged_gids'],
+                'ambiguous_parentvariant_ids' => array_keys($state['ambiguous_parent_ids']),
+            ]);
+
+            return false;
+        }
+
+        $variantMap = [];
+        foreach ($state['by_parent_id'] as $sourceVariantId => $targetNode) {
+            $sourceVariant = $sourceVariantsById[(string) $sourceVariantId] ?? null;
+            if (!$sourceVariant || empty($targetNode['id'])) {
+                continue;
+            }
+
+            $optionNames = array_map(
+                static fn (array $option): string => (string) ($option['name'] ?? ''),
+                $this->payload['options'] ?? []
+            );
+            $variantMap[] = [
+                'source_variant_id' => (int) $sourceVariantId,
+                'source_options_key' => $this->buildOptionsKeyFromSource($sourceVariant, $optionNames),
+                'target_variant_gid' => $targetNode['id'],
+                'target_variant_id' => isset($targetNode['legacyResourceId'])
+                    ? (int) $targetNode['legacyResourceId']
+                    : $this->legacyIdFromGid($targetNode['id']),
+                'inventory_item_gid' => null,
+                'snapshot' => [
+                    'price' => $sourceVariant['price'] ?? null,
+                    'sku' => $sourceVariant['sku'] ?? null,
+                    'barcode' => $sourceVariant['barcode'] ?? null,
+                    'qty' => $sourceVariant['inventory_quantity'] ?? null,
+                ],
+            ];
+        }
+        $this->persistVariantMappings($target, $mirror, $variantMap);
+
+        return true;
+    }
+
+    private function persistVariantMappings(Shop $target, ProductMirror $mirror, array $variantMap): void
+    {
+        foreach ($variantMap as $mapping) {
+            $sourceVariantId = (int) ($mapping['source_variant_id'] ?? 0);
+            $targetVariantGid = (string) ($mapping['target_variant_gid'] ?? '');
+            if ($sourceVariantId <= 0 || $targetVariantGid === '') {
+                throw new \RuntimeException('Cannot persist variant mapping without deterministic parent IDs');
+            }
+
+            $snapshot = $mapping['snapshot'] ?? [];
+            VariantMirror::updateOrCreate(
+                [
+                    'product_mirror_id' => $mirror->id,
+                    'source_variant_id' => $sourceVariantId,
+                ],
+                [
+                    'source_options_key' => $mapping['source_options_key'] ?? '',
+                    'target_variant_gid' => $targetVariantGid,
+                    'target_variant_id' => $mapping['target_variant_id'] ?? $this->legacyIdFromGid($targetVariantGid),
+                    'inventory_item_gid' => $mapping['inventory_item_gid'] ?? null,
+                    'last_snapshot' => $snapshot,
+                    'variant_fingerprint' => hash('sha256', json_encode([
+                        'price' => $snapshot['price'] ?? null,
+                        'sku' => $snapshot['sku'] ?? null,
+                        'barcode' => $snapshot['barcode'] ?? null,
+                    ])),
+                    'inventory_fingerprint' => hash('sha256', json_encode([
+                        'qty' => $snapshot['qty'] ?? null,
+                    ])),
+                ]
+            );
+
+            $this->setParentVariantMetafield($target, $targetVariantGid, $sourceVariantId);
+        }
+    }
+
+    private function persistProvisionalSingleVariantMapping(
+        ProductMirror $mirror,
+        array $sourceVariant,
+        array $targetVariant
+    ): void {
+        $sourceVariantId = (int) ($sourceVariant['id'] ?? 0);
+        $targetVariantGid = (string) ($targetVariant['id'] ?? '');
+        if ($sourceVariantId <= 0 || $targetVariantGid === '') {
+            throw new \RuntimeException('Product create did not return deterministic single variant IDs');
+        }
+
+        $optionNames = array_map(
+            static fn (array $option): string => (string) ($option['name'] ?? ''),
+            $this->payload['options'] ?? []
+        );
+        VariantMirror::updateOrCreate(
+            [
+                'product_mirror_id' => $mirror->id,
+                'source_variant_id' => $sourceVariantId,
+            ],
+            [
+                'source_options_key' => $this->buildOptionsKeyFromSource($sourceVariant, $optionNames),
+                'target_variant_gid' => $targetVariantGid,
+                'target_variant_id' => isset($targetVariant['legacyResourceId'])
+                    ? (int) $targetVariant['legacyResourceId']
+                    : $this->legacyIdFromGid($targetVariantGid),
+                'inventory_item_gid' => $targetVariant['inventoryItem']['id'] ?? null,
+                'last_snapshot' => [],
+            ]
+        );
+    }
+
+    /** @return array<string, array> */
+    private function sourceVariantsById(array $payload): array
+    {
+        $variants = array_values($payload['variants'] ?? []);
+        if (empty($variants)) {
+            throw new \RuntimeException('Create payload contains no source variants');
+        }
+
+        $byId = [];
+        foreach ($variants as $variant) {
+            $sourceVariantId = (int) ($variant['id'] ?? 0);
+            if ($sourceVariantId <= 0) {
+                throw new \RuntimeException('Create payload contains a source variant without source variant ID');
+            }
+            if (isset($byId[(string) $sourceVariantId])) {
+                throw new \RuntimeException('Create payload contains duplicate source variant ID '.$sourceVariantId);
+            }
+
+            $byId[(string) $sourceVariantId] = $variant;
+        }
+
+        return $byId;
     }
 
     private function dispatchBemWatermarkIfEligible(Shop $target, string $productGid, ?int $productLegacyId): void
@@ -537,6 +706,67 @@ class ReplicateProductCreateToShop implements ShouldQueue
         ];
     }
 
+    private function hydrateDelayedBemSourceMediaBeforeCreate(Shop $target): bool
+    {
+        if (count($this->extractSourceImages($this->payload)) > 0) {
+            return false;
+        }
+
+        $source = Shop::find($this->sourceShopId);
+        $eligibility = app(BemWatermarkEligibilityService::class);
+        if (!$source
+            || $eligibility->isDryRun()
+            || !$eligibility->isEligiblePayloadForSource($this->payload, $source)
+        ) {
+            return false;
+        }
+
+        $result = app(BemSourceCreateMediaResolver::class)->resolve(
+            $source,
+            'gid://shopify/Product/'.$this->sourceProductId
+        );
+
+        if ($result['status'] === 'ready') {
+            $this->payload['images'] = $result['images'];
+
+            Log::notice('BEM create hydrated delayed source media from Shopify', [
+                'source_shop' => $source->domain,
+                'source_product_id' => $this->sourceProductId,
+                'target_shop' => $target->domain,
+                'images_count' => count($result['images']),
+            ]);
+
+            return false;
+        }
+
+        if ($result['status'] === 'processing' && $this->attempts() >= $this->tries) {
+            throw new \RuntimeException('BEM source media remained PROCESSING during target create retry window');
+        }
+
+        $withinEmptyMediaGrace = $result['status'] === 'empty' && $this->attempts() < 10;
+        if ($result['status'] === 'processing' || $withinEmptyMediaGrace) {
+            Log::warning('BEM create waiting for source media before target creation', [
+                'source_shop' => $source->domain,
+                'source_product_id' => $this->sourceProductId,
+                'target_shop' => $target->domain,
+                'media_status' => $result['status'],
+                'attempt' => $this->attempts(),
+            ]);
+
+            $this->release(15);
+            return true;
+        }
+
+        Log::info('BEM create source has no media after grace period', [
+            'source_shop' => $source->domain,
+            'source_product_id' => $this->sourceProductId,
+            'target_shop' => $target->domain,
+            'attempt' => $this->attempts(),
+        ]);
+
+        return false;
+    }
+
     private function setParentProductMetafield(Shop $target, string $productGid): void
     {
         $mutation = <<<'GQL'
@@ -547,41 +777,38 @@ class ReplicateProductCreateToShop implements ShouldQueue
         }
         GQL;
 
-        try {
-            $response = $this->gql($target, $mutation, [
-                'metafields' => [[
-                    'ownerId' => $productGid,
-                    'namespace' => 'custom',
-                    'key' => 'parentproduct',
-                    'type' => 'number_integer',
-                    'value' => (string) $this->sourceProductId,
-                ]],
-            ]);
+        $response = $this->gql($target, $mutation, [
+            'metafields' => [[
+                'ownerId' => $productGid,
+                'namespace' => 'custom',
+                'key' => 'parentproduct',
+                'type' => 'number_integer',
+                'value' => (string) $this->sourceProductId,
+            ]],
+        ]);
 
-            $errors = $response['data']['metafieldsSet']['userErrors'] ?? [];
-            if (!empty($errors)) {
-                Log::warning('Parentproduct metafield set returned user errors', [
-                    'target_shop' => $target->domain,
-                    'target_product_gid' => $productGid,
-                    'source_product_id' => $this->sourceProductId,
-                    'errors' => $errors,
-                ]);
-                return;
-            }
-
-            Log::info('Parentproduct metafield set on created product', [
-                'target_shop' => $target->domain,
-                'target_product_gid' => $productGid,
-                'source_product_id' => $this->sourceProductId,
-            ]);
-        } catch (\Throwable $e) {
+        $topLevelErrors = $response['errors'] ?? [];
+        $userErrors = $response['data']['metafieldsSet']['userErrors'] ?? [];
+        if (!empty($topLevelErrors) || !empty($userErrors)) {
             Log::error('Parentproduct metafield set failed on created product', [
                 'target_shop' => $target->domain,
                 'target_product_gid' => $productGid,
                 'source_product_id' => $this->sourceProductId,
-                'error' => $e->getMessage(),
+                'errors' => $topLevelErrors,
+                'user_errors' => $userErrors,
             ]);
+
+            throw new \RuntimeException('Parentproduct metafield write failed: '.json_encode([
+                'errors' => $topLevelErrors,
+                'user_errors' => $userErrors,
+            ]));
         }
+
+        Log::info('Parentproduct metafield set on created product', [
+            'target_shop' => $target->domain,
+            'target_product_gid' => $productGid,
+            'source_product_id' => $this->sourceProductId,
+        ]);
     }
 
     private function setParentVariantMetafield(Shop $target, string $targetVariantGid, int $sourceVariantId): void
@@ -594,41 +821,38 @@ class ReplicateProductCreateToShop implements ShouldQueue
         }
         GQL;
 
-        try {
-            $response = $this->gql($target, $mutation, [
-                'metafields' => [[
-                    'ownerId' => $targetVariantGid,
-                    'namespace' => 'custom',
-                    'key' => 'parentvariant',
-                    'type' => 'number_integer',
-                    'value' => (string)$sourceVariantId,
-                ]],
-            ]);
+        $response = $this->gql($target, $mutation, [
+            'metafields' => [[
+                'ownerId' => $targetVariantGid,
+                'namespace' => 'custom',
+                'key' => 'parentvariant',
+                'type' => 'number_integer',
+                'value' => (string) $sourceVariantId,
+            ]],
+        ]);
 
-            $errors = $response['data']['metafieldsSet']['userErrors'] ?? [];
-            if (!empty($errors)) {
-                Log::warning('Parentvariant metafield set returned user errors on created variant', [
-                    'target_shop' => $target->domain,
-                    'target_variant_gid' => $targetVariantGid,
-                    'source_variant_id' => $sourceVariantId,
-                    'errors' => $errors,
-                ]);
-                return;
-            }
-
-            Log::info('Parentvariant metafield set on created variant', [
+        $topLevelErrors = $response['errors'] ?? [];
+        $userErrors = $response['data']['metafieldsSet']['userErrors'] ?? [];
+        if (!empty($topLevelErrors) || !empty($userErrors)) {
+            Log::error('Parentvariant metafield set failed on created variant', [
                 'target_shop' => $target->domain,
                 'target_variant_gid' => $targetVariantGid,
                 'source_variant_id' => $sourceVariantId,
+                'errors' => $topLevelErrors,
+                'user_errors' => $userErrors,
             ]);
-        } catch (\Throwable $e) {
-            Log::warning('Parentvariant metafield set failed on created variant', [
-                'target_shop' => $target->domain,
-                'target_variant_gid' => $targetVariantGid,
-                'source_variant_id' => $sourceVariantId,
-                'error' => $e->getMessage(),
-            ]);
+
+            throw new \RuntimeException('Parentvariant metafield write failed: '.json_encode([
+                'errors' => $topLevelErrors,
+                'user_errors' => $userErrors,
+            ]));
         }
+
+        Log::info('Parentvariant metafield set on created variant', [
+            'target_shop' => $target->domain,
+            'target_variant_gid' => $targetVariantGid,
+            'source_variant_id' => $sourceVariantId,
+        ]);
     }
 
     private function payloadWithCleanImagesForBackupCreate(Shop $target, array $payload): array
@@ -888,6 +1112,7 @@ class ReplicateProductCreateToShop implements ShouldQueue
      */
     private function productCreate(Shop $shop, array $sourcePayload, ?string $metaDescription = null): array
     {
+        $sourceVariantsById = $this->sourceVariantsById($sourcePayload);
         $title           = $sourcePayload['title'] ?? 'Untitled';
         $descriptionHtml = $sourcePayload['body_html'] ?? null;
         $vendor          = $sourcePayload['vendor'] ?? null;
@@ -914,6 +1139,13 @@ class ReplicateProductCreateToShop implements ShouldQueue
             'descriptionHtml' => $descriptionHtml,
             'vendor'          => $vendor,
             'productType'     => $productType,
+            'status'          => $this->statusFromPayload($sourcePayload),
+            'metafields'      => [[
+                'namespace' => 'custom',
+                'key' => 'parentproduct',
+                'type' => 'number_integer',
+                'value' => (string) $this->sourceProductId,
+            ]],
             // create options on the product so variant optionValues are valid
             'productOptions'  => $this->buildProductOptionsFromPayload($sourcePayload),
         ], fn($x) => $x !== null && $x !== '');
@@ -932,18 +1164,15 @@ class ReplicateProductCreateToShop implements ShouldQueue
         $productLegacyId = isset($prod['legacyResourceId']) ? (int)$prod['legacyResourceId'] : null;
         if (!$productGid) throw new \RuntimeException('Missing product GID after create');
 
-        // Attach images if any
-        if (!empty($sourcePayload['images'])) {
-            try { $this->attachImagesWithProductUpdate($shop, $productGid, $sourcePayload['images']); }
-            catch (\Throwable $e) { Log::error('attachImages failed', ['target'=>$shop->domain,'product'=>$productGid,'msg'=>$e->getMessage()]); }
-        }
+        // Persist the immutable target ID immediately. Any later failure can retry
+        // against this product instead of creating a duplicate.
+        $productMirror = $this->storeExistingProductMirror($shop, [
+            'id' => $productLegacyId,
+            'gid' => $productGid,
+        ]);
 
-        // Update simple product fields
-        $this->updateProductFields($shop, $productGid, $sourcePayload, $metaDescription);
-
-        // Multi-variant or single?
         $hasOptions  = !empty($sourcePayload['options']);
-        $hasManyVars = count($sourcePayload['variants'] ?? []) > 1;
+        $hasManyVars = count($sourceVariantsById) > 1;
 
         if ($hasOptions || $hasManyVars) {
             $variantMap = $this->createAllOptionsAndVariants(
@@ -952,41 +1181,64 @@ class ReplicateProductCreateToShop implements ShouldQueue
                 src: $sourcePayload,
                 locationLegacyId: $shop->location_legacy_id ?? null
             );
-            return [$productGid, $productLegacyId, $variantMap];
+        } else {
+            $sourceVariant = array_values($sourceVariantsById)[0];
+            $defaultTargetVariant = $prod['variants']['nodes'][0] ?? [];
+            $this->persistProvisionalSingleVariantMapping(
+                $productMirror,
+                $sourceVariant,
+                $defaultTargetVariant
+            );
+
+            [$variantId, $inventoryItemId] = $this->updateDefaultVariant(
+                shop: $shop,
+                productGid: $productGid,
+                src: $sourcePayload,
+                locationLegacyId: $shop->location_legacy_id ?? null,
+                sourceFlags: $this->readSourceVariantFlags(
+                    sourceShop: Shop::find($this->sourceShopId),
+                    sourceProductLegacyId: $this->sourceProductId
+                )
+            );
+
+            $sv          = $sourceVariant;
+            $svId        = (int) $sv['id'];
+            $optionNames = array_map(fn($o) => (string)$o['name'], $sourcePayload['options'] ?? []);
+            $optionsKey  = $this->buildOptionsKeyFromSource($sv, $optionNames);
+
+            $variantMap = [[
+                'source_variant_id'  => $svId,
+                'source_options_key' => $optionsKey,
+                'target_variant_gid' => $variantId,
+                'target_variant_id'  => $this->legacyIdFromGid($variantId),
+                'inventory_item_gid' => $inventoryItemId,
+                'snapshot' => [
+                    'price'   => $sv['price']   ?? null,
+                    'sku'     => $sv['sku']     ?? null,
+                    'barcode' => $sv['barcode'] ?? null,
+                    'qty'     => $sv['inventory_quantity'] ?? null,
+                ],
+            ]];
         }
 
-        // Single-variant flow
-        [$variantId, $inventoryItemId] = $this->updateDefaultVariant(
-            shop: $shop,
-            productGid: $productGid,
-            src: $sourcePayload,
-            locationLegacyId: $shop->location_legacy_id ?? null,
-            sourceFlags: $this->readSourceVariantFlags(
-                sourceShop: Shop::find($this->sourceShopId),
-                sourceProductLegacyId: $this->sourceProductId
-            )
-        );
+        $this->persistVariantMappings($shop, $productMirror, $variantMap);
 
-        $sv          = $sourcePayload['variants'][0] ?? [];
-        $svId        = $sv['id'] ?? null; // legacy id from webhook
-        $optionNames = array_map(fn($o) => (string)$o['name'], $sourcePayload['options'] ?? []);
-        $optionsKey  = $this->buildOptionsKeyFromSource($sv, $optionNames);
+        if (!empty($sourcePayload['images'])) {
+            $this->attachImagesWithProductUpdate($shop, $productGid, $sourcePayload['images']);
+        }
 
-        $variantMap = [[
-            'source_variant_id'  => $svId,
-            'source_options_key' => $optionsKey,
-            'target_variant_gid' => $variantId,
-            'target_variant_id'  => $this->legacyIdFromGid($variantId),
-            'inventory_item_gid' => $inventoryItemId,
-            'snapshot' => [
-                'price'   => $sv['price']   ?? null,
-                'sku'     => $sv['sku']     ?? null,
-                'barcode' => $sv['barcode'] ?? null,
-                'qty'     => $sv['inventory_quantity'] ?? null,
-            ],
-        ]];
+        $this->updateProductFields($shop, $productGid, $sourcePayload, $metaDescription);
 
         return [$productGid, $productLegacyId, $variantMap];
+    }
+
+    private function statusFromPayload(array $payload): string
+    {
+        return match (strtolower((string) ($payload['status'] ?? 'draft'))) {
+            'active' => 'ACTIVE',
+            'archived' => 'ARCHIVED',
+            default => 'DRAFT',
+        };
     }
 
     /**
@@ -1018,6 +1270,10 @@ class ReplicateProductCreateToShop implements ShouldQueue
 
         // Map from payload + fallbacks
         $v0        = $src['variants'][0] ?? [];
+        $sourceVariantId = (int) ($v0['id'] ?? 0);
+        if ($sourceVariantId <= 0) {
+            throw new \RuntimeException('Cannot update default variant without source variant ID');
+        }
         $price     = isset($v0['price']) ? (string)$v0['price'] : null;
         $compareAt = isset($v0['compare_at_price']) ? (string)$v0['compare_at_price'] : null;
         $barcode   = $v0['barcode'] ?? null;
@@ -1083,6 +1339,12 @@ class ReplicateProductCreateToShop implements ShouldQueue
             'barcode'         => $barcode,
             'inventoryPolicy' => $policy,
             'inventoryItem'   => $inventoryItemInput ?: null,
+            'metafields'      => [[
+                'namespace' => 'custom',
+                'key' => 'parentvariant',
+                'type' => 'number_integer',
+                'value' => (string) $sourceVariantId,
+            ]],
         ], fn($v) => $v !== null && $v !== []);
 
         if ($variantInput) {
@@ -1509,8 +1771,14 @@ class ReplicateProductCreateToShop implements ShouldQueue
         if (!$input) return;
 
         $res = $this->gql($shop, $mutation, ['product' => $input]);
-        if (!empty($res['errors']) || !empty(($res['data']['productUpdate']['userErrors'] ?? []))) {
+        if (!empty($res['errors'])) {
             Log::error('productUpdate errors', ['target' => $shop->domain, 'res' => $res]);
+            throw new \RuntimeException('productUpdate errors: '.json_encode($res['errors']));
+        }
+        $userErrors = $res['data']['productUpdate']['userErrors'] ?? [];
+        if (!empty($userErrors)) {
+            Log::error('productUpdate userErrors', ['target' => $shop->domain, 'userErrors' => $userErrors]);
+            throw new \RuntimeException('productUpdate userErrors: '.json_encode($userErrors));
         }
 
         if ($seoInput) {
@@ -1631,8 +1899,19 @@ class ReplicateProductCreateToShop implements ShouldQueue
         // Build variants input
         $mapUnit = fn($u) => ['kg'=>'KILOGRAMS','g'=>'GRAMS','lb'=>'POUNDS','oz'=>'OUNCES'][strtolower((string)$u)] ?? null;
 
+        $sourceVariants = array_values($src['variants'] ?? []);
+        $sourceVariantsById = [];
         $variantsInput = [];
-        foreach (($src['variants'] ?? []) as $v) {
+        foreach ($sourceVariants as $v) {
+            $sourceVariantId = isset($v['id']) ? (int) $v['id'] : 0;
+            if ($sourceVariantId <= 0) {
+                throw new \RuntimeException('Cannot create target variant without source variant ID');
+            }
+            if (isset($sourceVariantsById[(string) $sourceVariantId])) {
+                throw new \RuntimeException('Duplicate source variant ID in create payload: '.$sourceVariantId);
+            }
+            $sourceVariantsById[(string) $sourceVariantId] = $v;
+
             // option1/2/3 → optionValues with correct optionName
             $ov = [];
             $vals = [ $v['option1'] ?? null, $v['option2'] ?? null, $v['option3'] ?? null ];
@@ -1668,6 +1947,12 @@ class ReplicateProductCreateToShop implements ShouldQueue
                 'inventoryPolicy' => isset($v['inventory_policy']) && strtolower($v['inventory_policy']) === 'continue' ? 'CONTINUE' : 'DENY',
                 'optionValues'    => $ov,
                 'inventoryItem'   => $inventoryItem ?: null,
+                'metafields'      => [[
+                    'namespace' => 'custom',
+                    'key' => 'parentvariant',
+                    'type' => 'number_integer',
+                    'value' => (string) $sourceVariantId,
+                ]],
             ], fn($x) => $x !== null && $x !== []);
         }
 
@@ -1682,7 +1967,7 @@ class ReplicateProductCreateToShop implements ShouldQueue
           productVariantsBulkCreate(productId: $productId, variants: $variants, strategy: $strategy) {
             productVariants {
               id
-              selectedOptions { name value }
+              metafield(namespace: "custom", key: "parentvariant") { value }
               inventoryItem { id }
             }
             userErrors { field message }
@@ -1705,26 +1990,33 @@ class ReplicateProductCreateToShop implements ShouldQueue
         }
 
         $created = $resp['data']['productVariantsBulkCreate']['productVariants'] ?? [];
-
-        // Build a mapping between source variants and created target variants via options key
-        $optionNames = array_map(fn($o) => (string)$o['name'], $src['options'] ?? []);
-
-        $byKeySource = [];
-        foreach (($src['variants'] ?? []) as $sv) {
-            $key = $this->buildOptionsKeyFromSource($sv, $optionNames);
-            $byKeySource[$key] = $sv;
+        if (count($created) !== count($sourceVariants)) {
+            throw new \RuntimeException(sprintf(
+                'Variant create response count mismatch: expected %d, received %d',
+                count($sourceVariants),
+                count($created)
+            ));
         }
 
+        // Identity is returned from the atomically-created parentvariant metafield.
+        // Response order and mutable option values are never used for correlation.
+        $optionNames = array_map(fn($o) => (string)$o['name'], $src['options'] ?? []);
         $variantMap = [];
         foreach ($created as $node) {
-            $key        = $this->buildOptionsKeyFromSelectedOptions($node['selectedOptions'] ?? []);
-            $sv         = $byKeySource[$key] ?? [];
-            $svId       = $sv['id'] ?? null; // legacy id from source webhook
+            $svId       = (int) ($node['metafield']['value'] ?? 0);
+            $sv         = $sourceVariantsById[(string) $svId] ?? null;
+            if (!$sv || isset($variantMap[(string) $svId])) {
+                throw new \RuntimeException('Invalid or duplicate parentvariant returned after variant create');
+            }
+            $key        = $this->buildOptionsKeyFromSource($sv, $optionNames);
             $tvGid      = $node['id'] ?? null;
+            if (!$tvGid) {
+                throw new \RuntimeException('Missing target variant GID in bulk create response');
+            }
             $tvId       = $this->legacyIdFromGid($tvGid);
             $invItemGid = $node['inventoryItem']['id'] ?? null;
 
-            $variantMap[] = [
+            $variantMap[(string) $svId] = [
                 'source_variant_id'  => $svId,
                 'source_options_key' => $key,
                 'target_variant_gid' => $tvGid,
@@ -1738,6 +2030,8 @@ class ReplicateProductCreateToShop implements ShouldQueue
                 ],
             ];
         }
+
+        $variantMap = array_values($variantMap);
 
         // Set stock for each created variant (if we have a location)
         if ($locationLegacyId) {
@@ -1802,19 +2096,6 @@ class ReplicateProductCreateToShop implements ShouldQueue
         }
         return implode('|', $parts);
     }
-
-    /**
-     * Deterministic key for a GraphQL selectedOptions node array.
-     */
-    private function buildOptionsKeyFromSelectedOptions(array $selectedOptions): string
-    {
-        $parts = [];
-        foreach ($selectedOptions as $so) {
-            $parts[] = ($so['name'] ?? '').'='.trim((string)($so['value'] ?? ''));
-        }
-        return implode('|', $parts);
-    }
-
 
     private function canonUrl(?string $url): ?string
     {

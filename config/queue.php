@@ -42,6 +42,15 @@ return [
             'after_commit' => false,
         ],
 
+        'database_catalog_audit' => [
+            'driver' => 'database',
+            'connection' => null,
+            'table' => 'jobs',
+            'queue' => 'catalog_audit',
+            'retry_after' => (int) env('CATALOG_AUDIT_QUEUE_RETRY_AFTER', 2700),
+            'after_commit' => false,
+        ],
+
         'beanstalkd' => [
             'driver' => 'beanstalkd',
             'host' => 'localhost',

@@ -3,9 +3,9 @@
 namespace App\Services\Shopify\BemWatermark;
 
 use App\Models\ProductMirror;
-use App\Models\ProductParentBackfillCandidate;
 use App\Models\Shop;
 use App\Models\ShopConnection;
+use App\Services\Shopify\ShopifyParentIdentityResolver;
 use Illuminate\Support\Collection;
 use Illuminate\Support\Facades\Log;
 
@@ -17,7 +17,8 @@ class BemWatermarkUpdateBootstrapService
         private readonly BemProductWatermarkMetafieldService $metafieldService,
         private readonly BemImageIdentityService $identity,
         private readonly BemWatermarkEligibilityService $eligibility,
-        private readonly BemShopifyStagedUploadService $uploadService
+        private readonly BemShopifyStagedUploadService $uploadService,
+        private readonly ShopifyParentIdentityResolver $parentIdentityResolver
     ) {
     }
 
@@ -54,9 +55,6 @@ class BemWatermarkUpdateBootstrapService
             return BemWatermarkUpdateBootstrapResult::skipped('source_has_no_images');
         }
 
-        $handle = (string) ($sourceState['handle'] ?? ($sourcePayload['handle'] ?? ''));
-        $skus = $this->sourceSkus($sourceState, $sourcePayload);
-
         $changes = [];
 
         $backupMirror = $this->ensureMirror(
@@ -64,16 +62,12 @@ class BemWatermarkUpdateBootstrapService
             target: $backup,
             sourceProductId: $sourceProductId,
             sourceProductGid: $sourceProductGid,
-            handle: $handle,
-            skus: $skus,
             role: 'backup'
         );
 
         if (!$backupMirror || !$backupMirror->target_product_gid) {
             return BemWatermarkUpdateBootstrapResult::skipped('backup_product_not_found', [
                 'source_product_id' => $sourceProductId,
-                'handle' => $handle,
-                'skus' => $skus,
             ]);
         }
 
@@ -220,7 +214,7 @@ class BemWatermarkUpdateBootstrapService
             $changes[] = 'backup_mirror_created';
         }
 
-        $linkedTargets = $this->linkExistingTargetMirrors($source, $sourceProductId, $sourceProductGid, $handle, $skus, $backup);
+        $linkedTargets = $this->linkExistingTargetMirrors($source, $sourceProductId, $sourceProductGid, $backup);
         if ($linkedTargets > 0) {
             $changes[] = 'target_mirrors_created';
         }
@@ -259,8 +253,6 @@ class BemWatermarkUpdateBootstrapService
         Shop $target,
         int $sourceProductId,
         string $sourceProductGid,
-        string $handle,
-        array $skus,
         string $role
     ): ?ProductMirror {
         $existing = ProductMirror::where([
@@ -269,22 +261,32 @@ class BemWatermarkUpdateBootstrapService
             'target_shop_id' => $target->id,
         ])->first();
 
-        if ($existing && $existing->target_product_gid) {
-            return $existing;
-        }
+        $resolution = $this->parentIdentityResolver->resolveProduct(
+            $target,
+            $sourceProductId,
+            $existing?->target_product_gid
+        );
 
-        $candidate = $this->findTargetProduct($target, $sourceProductId, $handle, $skus);
-        if (!$candidate) {
-            Log::info('BEM update bootstrap: no target candidate found', [
+        if ($resolution['status'] !== 'found' || empty($resolution['product']['id'])) {
+            Log::warning('BEM update bootstrap stopped: strict parentproduct resolution failed', [
                 'role' => $role,
                 'target_shop' => $target->domain,
                 'source_product_id' => $sourceProductId,
-                'handle' => $handle,
-                'skus' => $skus,
+                'status' => $resolution['status'],
+                'cached_target_product_gid' => $existing?->target_product_gid,
+                'candidates' => array_map(static fn (array $candidate): array => [
+                    'target_product_gid' => $candidate['id'] ?? null,
+                    'target_product_id' => $candidate['legacyResourceId'] ?? null,
+                    'target_title' => $candidate['title'] ?? null,
+                    'target_handle' => $candidate['handle'] ?? null,
+                    'parentproduct' => $candidate['metafield']['value'] ?? null,
+                ], $resolution['candidates'] ?? []),
             ]);
 
             return null;
         }
+
+        $candidate = $resolution['product'];
 
         $mirror = ProductMirror::updateOrCreate(
             [
@@ -308,188 +310,6 @@ class BemWatermarkUpdateBootstrapService
         ]);
 
         return $mirror;
-    }
-
-    private function findTargetProduct(Shop $target, int $sourceProductId, string $handle, array $skus): ?array
-    {
-        $snapshotMatches = ProductParentBackfillCandidate::query()
-            ->where('target_shop_id', $target->id)
-            ->where('source_product_id', $sourceProductId)
-            ->where('parentproduct_value', $sourceProductId)
-            ->get();
-
-        if ($snapshotMatches->count() === 1) {
-            $match = $snapshotMatches->first();
-
-            return [
-                'id' => $match->target_product_gid,
-                'legacyResourceId' => (string) $match->target_product_id,
-                'handle' => $match->target_handle,
-                'title' => $match->target_title,
-                'metafield' => [
-                    'value' => (string) $match->parentproduct_value,
-                ],
-                'variants' => [
-                    'nodes' => [],
-                ],
-            ];
-        }
-
-        if ($snapshotMatches->count() > 1) {
-            $this->sendParentProductBootstrapIssueEmail([
-                'mode' => 'bem_watermark_update_bootstrap',
-                'issue' => 'ambiguous_parentproduct_snapshot',
-                'target_shop_id' => $target->id,
-                'target_shop' => $target->domain,
-                'source_product_id' => $sourceProductId,
-                'searched' => [
-                    'type' => 'local_backfill_snapshot',
-                    'value' => $sourceProductId,
-                ],
-                'source_handle' => $handle,
-                'source_skus' => $skus,
-                'candidates' => $snapshotMatches
-                    ->map(fn (ProductParentBackfillCandidate $match) => [
-                        'source_product_id' => $match->source_product_id,
-                        'target_product_id' => $match->target_product_id,
-                        'target_product_gid' => $match->target_product_gid,
-                        'target_title' => $match->target_title,
-                        'target_handle' => $match->target_handle,
-                        'match_status' => $match->match_status,
-                    ])
-                    ->values()
-                    ->all(),
-            ]);
-
-            throw new \RuntimeException('BEM update bootstrap ambiguous parentproduct snapshot match on '.$target->domain.' for source product '.$sourceProductId);
-        }
-
-        $byParentProduct = $this->searchProducts(
-            $target,
-            'metafields.custom.parentproduct:'.$this->quoteSearchValue((string) $sourceProductId)
-        );
-        $parentMatches = array_values(array_filter($byParentProduct, static function (array $product) use ($sourceProductId): bool {
-            return (string) ($product['metafield']['value'] ?? '') === (string) $sourceProductId;
-        }));
-
-        if (count($parentMatches) === 1) {
-            return $parentMatches[0];
-        }
-
-        if (count($parentMatches) > 1) {
-            $this->sendParentProductBootstrapIssueEmail([
-                'mode' => 'bem_watermark_update_bootstrap',
-                'issue' => 'ambiguous_parentproduct_shopify',
-                'target_shop_id' => $target->id,
-                'target_shop' => $target->domain,
-                'source_product_id' => $sourceProductId,
-                'searched' => [
-                    'type' => 'custom.parentproduct',
-                    'value' => $sourceProductId,
-                ],
-                'source_handle' => $handle,
-                'source_skus' => $skus,
-                'candidates' => $this->candidateSummaries($parentMatches),
-            ]);
-
-            throw new \RuntimeException('BEM update bootstrap ambiguous parentproduct match on '.$target->domain.' for source product '.$sourceProductId);
-        }
-
-        if ($handle !== '') {
-            $byHandle = $this->searchProducts($target, 'handle:'.$this->quoteSearchValue($handle));
-            $exact = array_values(array_filter($byHandle, static fn (array $product) => ($product['handle'] ?? null) === $handle));
-            if (count($exact) === 1) {
-                return $exact[0];
-            }
-
-            if (count($exact) > 1 || count($byHandle) > 1) {
-                $this->sendParentProductBootstrapIssueEmail([
-                    'mode' => 'bem_watermark_update_bootstrap',
-                    'issue' => 'ambiguous_handle',
-                    'target_shop_id' => $target->id,
-                    'target_shop' => $target->domain,
-                    'source_product_id' => $sourceProductId,
-                    'searched' => [
-                        'type' => 'handle',
-                        'value' => $handle,
-                    ],
-                    'source_handle' => $handle,
-                    'source_skus' => $skus,
-                    'candidates' => $this->candidateSummaries($byHandle),
-                ]);
-
-                throw new \RuntimeException('BEM update bootstrap ambiguous handle match on '.$target->domain.' for handle '.$handle);
-            }
-        }
-
-        if (empty($skus)) {
-            return null;
-        }
-
-        $parts = array_map(fn (string $sku) => 'sku:'.$this->quoteSearchValue($sku), array_values(array_unique($skus)));
-        $bySku = $this->searchProducts($target, implode(' OR ', $parts));
-        $matches = [];
-
-        foreach ($bySku as $product) {
-            $productSkus = $this->productSkus($product);
-            if (array_intersect($skus, $productSkus)) {
-                $matches[$product['id']] = $product;
-            }
-        }
-
-        if (count($matches) === 1) {
-            return array_values($matches)[0];
-        }
-
-        if (count($matches) > 1) {
-            $this->sendParentProductBootstrapIssueEmail([
-                'mode' => 'bem_watermark_update_bootstrap',
-                'issue' => 'ambiguous_sku',
-                'target_shop_id' => $target->id,
-                'target_shop' => $target->domain,
-                'source_product_id' => $sourceProductId,
-                'searched' => [
-                    'type' => 'sku',
-                    'value' => $skus,
-                ],
-                'source_handle' => $handle,
-                'source_skus' => $skus,
-                'candidates' => $this->candidateSummaries(array_values($matches)),
-            ]);
-
-            throw new \RuntimeException('BEM update bootstrap ambiguous SKU match on '.$target->domain);
-        }
-
-        return null;
-    }
-
-    /**
-     * @return array<int, array<string, mixed>>
-     */
-    private function searchProducts(Shop $shop, string $queryString): array
-    {
-        $query = <<<'GQL'
-        query BemBootstrapProductSearch($query: String!) {
-          products(first: 3, query: $query) {
-            nodes {
-              id
-              legacyResourceId
-              handle
-              title
-              metafield(namespace: "custom", key: "parentproduct") {
-                value
-              }
-              variants(first: 100) {
-                nodes { sku }
-              }
-            }
-          }
-        }
-        GQL;
-
-        $response = $this->graphql->request($shop, $query, ['query' => $queryString]);
-
-        return $response['data']['products']['nodes'] ?? [];
     }
 
     private function fetchSourceState(Shop $source, string $sourceProductGid): array
@@ -562,8 +382,6 @@ class BemWatermarkUpdateBootstrapService
         Shop $source,
         int $sourceProductId,
         string $sourceProductGid,
-        string $handle,
-        array $skus,
         Shop $backup
     ): int {
         $targets = ShopConnection::where('source_shop_id', $source->id)
@@ -585,8 +403,6 @@ class BemWatermarkUpdateBootstrapService
                 target: $target,
                 sourceProductId: $sourceProductId,
                 sourceProductGid: $sourceProductGid,
-                handle: $handle,
-                skus: $skus,
                 role: 'target'
             );
 
@@ -819,6 +635,10 @@ class BemWatermarkUpdateBootstrapService
 
     private function normalizeImages(array $nodes): array
     {
+        if (isset($nodes['nodes']) && is_array($nodes['nodes'])) {
+            $nodes = $nodes['nodes'];
+        }
+
         $images = [];
 
         foreach ($nodes as $index => $node) {
@@ -868,34 +688,6 @@ class BemWatermarkUpdateBootstrapService
                 'updated_at' => now()->toIso8601String(),
             ];
         }, $images));
-    }
-
-    private function sourceSkus(array $sourceState, array $sourcePayload): array
-    {
-        $skus = $this->productSkus($sourceState);
-
-        foreach (($sourcePayload['variants'] ?? []) as $variant) {
-            $sku = trim((string) ($variant['sku'] ?? ''));
-            if ($sku !== '') {
-                $skus[] = $sku;
-            }
-        }
-
-        return array_values(array_unique($skus));
-    }
-
-    private function productSkus(array $product): array
-    {
-        $skus = [];
-
-        foreach (($product['variants']['nodes'] ?? []) as $variant) {
-            $sku = trim((string) ($variant['sku'] ?? ''));
-            if ($sku !== '') {
-                $skus[] = $sku;
-            }
-        }
-
-        return array_values(array_unique($skus));
     }
 
     private function isSupportedWatermarkTarget(Shop $target, Shop $backup): bool
@@ -954,32 +746,6 @@ class BemWatermarkUpdateBootstrapService
 
         return in_array((string) $sourceProductId, array_map('strval', $productIds), true)
             || in_array($sourceProductGid, array_map('strval', $productGids), true);
-    }
-
-    private function quoteSearchValue(string $value): string
-    {
-        $escaped = str_replace(['\\', '"'], ['\\\\', '\\"'], $value);
-
-        return '"'.$escaped.'"';
-    }
-
-    private function candidateSummaries(array $candidates): array
-    {
-        return array_values(array_map(fn (array $candidate) => [
-            'target_product_gid' => $candidate['id'] ?? null,
-            'target_product_id' => $candidate['legacyResourceId'] ?? $this->legacyIdFromGid($candidate['id'] ?? null),
-            'target_title' => $candidate['title'] ?? null,
-            'target_handle' => $candidate['handle'] ?? null,
-            'parentproduct' => $candidate['metafield']['value'] ?? null,
-            'skus' => $this->productSkus($candidate),
-        ], $candidates));
-    }
-
-    private function sendParentProductBootstrapIssueEmail(array $context): void
-    {
-        $context['created_at'] = now()->toIso8601String();
-
-        Log::warning('Parentproduct bootstrap issue email suppressed', $context);
     }
 
     private function legacyIdFromGid(?string $gid): ?string

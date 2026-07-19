@@ -358,10 +358,6 @@ class ProcessShopifyWebhook implements ShouldQueue
         string $sourceProductGid,
         int $sourceProductId
     ): void {
-        if (empty($sourceImages)) {
-            return;
-        }
-
         $eligibility = app(BemWatermarkEligibilityService::class);
         if (!$eligibility->isEligiblePayloadForSource($payload, $sourceShop)) {
             return;

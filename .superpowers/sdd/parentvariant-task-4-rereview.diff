@@ -1,0 +1,569 @@
+# Review package: a833a1e..HEAD
+
+## Commits
+0602d29 test: clarify legacy bootstrap safety contracts
+b6a7cbb test: guard legacy parentvariant bootstrap scope
+
+## Files changed
+ app/Jobs/ReplicateProductUpdateToShop.php          | 323 ++++++++++-----------
+ .../Shopify/LegacyParentVariantBootstrapPolicy.php |   4 +-
+ .../ReplicateProductUpdateIdentityContractTest.php |  64 +++-
+ 3 files changed, 225 insertions(+), 166 deletions(-)
+
+## Diff
+diff --git a/app/Jobs/ReplicateProductUpdateToShop.php b/app/Jobs/ReplicateProductUpdateToShop.php
+index e9cd1f6..8c46568 100644
+--- a/app/Jobs/ReplicateProductUpdateToShop.php
++++ b/app/Jobs/ReplicateProductUpdateToShop.php
+@@ -64,205 +64,204 @@ public function middleware(): array
+             $this->targetShopId,
+         ]);
+ 
+         return [
+             (new WithoutOverlapping($key))
+                 ->releaseAfter(30)
+                 ->expireAfter(900),
+         ];
+     }
+ 
+-public function handle(
+-    ShopifyParentIdentityResolver $identityResolver,
+-    LegacyParentVariantBootstrapPolicy $bootstrapPolicy
+-): void
+-{
+-    if (SourceProductDeletion::existsFor($this->sourceShopId, $this->sourceProductId)) {
+-        Log::warning('ReplicateProductUpdate skipped: source product was deleted', [
+-            'source_shop_id' => $this->sourceShopId,
+-            'source_product_id' => $this->sourceProductId,
+-            'target_shop_id' => $this->targetShopId,
+-        ]);
+-        return;
+-    }
++    public function handle(
++        ShopifyParentIdentityResolver $identityResolver,
++        LegacyParentVariantBootstrapPolicy $bootstrapPolicy
++    ): void {
++        if (SourceProductDeletion::existsFor($this->sourceShopId, $this->sourceProductId)) {
++            Log::warning('ReplicateProductUpdate skipped: source product was deleted', [
++                'source_shop_id' => $this->sourceShopId,
++                'source_product_id' => $this->sourceProductId,
++                'target_shop_id' => $this->targetShopId,
++            ]);
++            return;
++        }
+ 
+-    $target = Shop::findOrFail($this->targetShopId);
+-    if ((int)$target->id === 8 || $target->domain === 'eiluminat-bg.myshopify.com') {
+-        Log::info('ReplicateProductUpdateToShop skipped for BG store', [
+-            'target_shop' => $target->domain,
+-            'source_shop' => $this->sourceShopId,
+-            'source_product_id' => $this->sourceProductId,
+-        ]);
+-        return;
+-    }
+-
+-    $metaDescription = $this->fetchMetaDescriptionFromSource();
+-    $skipDirectImageSyncForBem = $this->shouldSkipDirectImageSyncForBem();
+-
+-    $mirror = ProductMirror::where([
+-        'source_shop_id'    => $this->sourceShopId,
+-        'target_shop_id'    => $this->targetShopId,
+-        'source_product_id' => $this->sourceProductId,
+-    ])->first();
+-
+-    $productResolution = $identityResolver->resolveProduct(
+-        $target,
+-        $this->sourceProductId,
+-        $mirror?->target_product_gid
+-    );
+-
+-    if ($productResolution['status'] !== 'found') {
+-        Log::warning('ReplicateProductUpdate skipped: strict parentproduct mapping unavailable', [
+-            'reason' => $productResolution['status'] === 'ambiguous'
+-                ? 'ambiguous_parentproduct_mapping'
+-                : 'missing_parentproduct_mapping',
+-            'source_shop_id' => $this->sourceShopId,
+-            'source_product_id' => $this->sourceProductId,
+-            'target_shop_id' => $target->id,
+-            'target_shop' => $target->domain,
+-            'candidate_gids' => array_values(array_filter(array_map(
+-                static fn (array $candidate): ?string => $candidate['id'] ?? null,
+-                $productResolution['candidates'] ?? []
+-            ))),
+-        ]);
++        $target = Shop::findOrFail($this->targetShopId);
++        if ((int)$target->id === 8 || $target->domain === 'eiluminat-bg.myshopify.com') {
++            Log::info('ReplicateProductUpdateToShop skipped for BG store', [
++                'target_shop' => $target->domain,
++                'source_shop' => $this->sourceShopId,
++                'source_product_id' => $this->sourceProductId,
++            ]);
++            return;
++        }
+ 
+-        return;
+-    }
++        $metaDescription = $this->fetchMetaDescriptionFromSource();
++        $skipDirectImageSyncForBem = $this->shouldSkipDirectImageSyncForBem();
+ 
+-    $resolvedProduct = $productResolution['product'];
+-    $mirror = ProductMirror::updateOrCreate(
+-        [
+-            'source_shop_id' => $this->sourceShopId,
+-            'target_shop_id' => $this->targetShopId,
++        $mirror = ProductMirror::where([
++            'source_shop_id'    => $this->sourceShopId,
++            'target_shop_id'    => $this->targetShopId,
+             'source_product_id' => $this->sourceProductId,
+-        ],
+-        [
+-            'source_product_gid' => 'gid://shopify/Product/'.$this->sourceProductId,
+-            'target_product_gid' => $resolvedProduct['id'],
+-            'target_product_id' => (int) (
+-                $resolvedProduct['legacyResourceId']
+-                ?? $this->numericIdFromGid($resolvedProduct['id'])
+-                ?? 0
+-            ),
+-        ]
+-    );
+-
+-    $source = Shop::find($this->sourceShopId);
+-    if (!$this->syncVariantsStrict(
+-        $identityResolver,
+-        $bootstrapPolicy,
+-        $mirror,
+-        $target,
+-        $source
+-    )) {
+-        return;
+-    }
+-
+-    $updateSucceeded = false;
+-    // Log::info('Replicate update start', [
+-    //     'target_shop' => $target->domain,
+-    //     'target_gid'  => $mirror->target_product_gid,
+-    //     'source_pid'  => $this->sourceProductId,
+-    // ]);
+-
+-    // === 1) Core product diff & patch ===
+-    $lastSnap = $mirror->last_snapshot;
+-    if (is_string($lastSnap)) {
+-        $lastSnap = json_decode($lastSnap, true) ?: [];
+-    } elseif (!is_array($lastSnap)) {
+-        $lastSnap = [];
+-    }
+-
+-    try {
+-    $productDiff = $this->computeProductDiff($this->payload);
+-        if (!empty($productDiff)) {
+-            $this->productUpdate($target, $mirror->target_product_gid, $productDiff);
+-            Log::info('Product core updated', ['fields' => array_keys($productDiff)]);
+-        } else {
+-            Log::info('Product core no-op (no changes)');
+-        }
+-
+-        // === 1.1) Options diff (raport) ===
+-        $srcOptions = $this->normalizeOptionsFromPayload($this->payload);
+-        $currOptFp  = $this->optionsFingerprint($srcOptions);
+-        $prevOptFp  = $lastSnap['options_fingerprint'] ?? null;
++        ])->first();
+ 
+-        if ($currOptFp !== $prevOptFp) {
+-            // Log::info('Options changed → syncing', [
+-            //     'target_shop' => $target->domain,
+-            //     'names'       => array_map(fn($o) => $o['name'], $srcOptions),
+-            // ]);
+-            // lăsăm doar raport aici; crearea efectivă doar dacă target are "Default Title"
+-        } else {
+-            Log::info('Options unchanged, skipping', ['target_shop' => $target->domain]);
+-        }
++        $productResolution = $identityResolver->resolveProduct(
++            $target,
++            $this->sourceProductId,
++            $mirror?->target_product_gid
++        );
+ 
+-        // === 2) Images sync (always replace) ===
+-        if ($skipDirectImageSyncForBem) {
+-            Log::warning('BEM update image sync skipped: source payload images may be watermarked', [
+-                'target_shop' => $target->domain,
++        if ($productResolution['status'] !== 'found') {
++            Log::warning('ReplicateProductUpdate skipped: strict parentproduct mapping unavailable', [
++                'reason' => $productResolution['status'] === 'ambiguous'
++                    ? 'ambiguous_parentproduct_mapping'
++                    : 'missing_parentproduct_mapping',
+                 'source_shop_id' => $this->sourceShopId,
+                 'source_product_id' => $this->sourceProductId,
+-                'target_product_gid' => $mirror->target_product_gid,
++                'target_shop_id' => $target->id,
++                'target_shop' => $target->domain,
++                'candidate_gids' => array_values(array_filter(array_map(
++                    static fn (array $candidate): ?string => $candidate['id'] ?? null,
++                    $productResolution['candidates'] ?? []
++                ))),
+             ]);
+-        } else {
+-            $srcImages = $this->extractSourceImages($this->payload);
+-            // Log::info('Images syncing (force replace)', [
+-            //     'target_shop' => $target->domain,
+-            //     'count'       => count($srcImages),
+-            // ]);
+-            $this->syncImagesReplaceAll($target, $mirror->target_product_gid, $srcImages);
+-            // Log::info('Images synced', [
+-            //     'target_shop' => $target->domain,
+-            //     'count'       => count($srcImages),
+-            // ]);
+-        }
+ 
+-        if ($mirror->target_product_gid) {
+-            $this->syncMetaobjectMetafields(
+-                source: $source,
+-                target: $target,
+-                sourceProductGid: 'gid://shopify/Product/' . $this->sourceProductId,
+-                targetProductGid: $mirror->target_product_gid,
+-            );
++            return;
+         }
+ 
+-        if ($metaDescription !== null && $metaDescription !== '') {
+-            $this->applyMetaDescriptionToTarget($target, $mirror->target_product_gid, $metaDescription);
+-        }
++        $resolvedProduct = $productResolution['product'];
++        $mirror = ProductMirror::updateOrCreate(
++            [
++                'source_shop_id' => $this->sourceShopId,
++                'target_shop_id' => $this->targetShopId,
++                'source_product_id' => $this->sourceProductId,
++            ],
++            [
++                'source_product_gid' => 'gid://shopify/Product/'.$this->sourceProductId,
++                'target_product_gid' => $resolvedProduct['id'],
++                'target_product_id' => (int) (
++                    $resolvedProduct['legacyResourceId']
++                    ?? $this->numericIdFromGid($resolvedProduct['id'])
++                    ?? 0
++                ),
++            ]
++        );
+ 
+-        $updateSucceeded = true;
++        $source = Shop::find($this->sourceShopId);
++        if (!$this->syncVariantsStrict(
++            $identityResolver,
++            $bootstrapPolicy,
++            $mirror,
++            $target,
++            $source
++        )) {
++            return;
++        }
+ 
+-        // Log::info('Replicate update done', [
++        $updateSucceeded = false;
++        // Log::info('Replicate update start', [
+         //     'target_shop' => $target->domain,
+         //     'target_gid'  => $mirror->target_product_gid,
++        //     'source_pid'  => $this->sourceProductId,
+         // ]);
+-    } finally {
+-        if ($updateSucceeded) {
+-            $newSnap = $this->normalizeProductSnapshot($this->payload);
++
++        // === 1) Core product diff & patch ===
++        $lastSnap = $mirror->last_snapshot;
++        if (is_string($lastSnap)) {
++            $lastSnap = json_decode($lastSnap, true) ?: [];
++        } elseif (!is_array($lastSnap)) {
++            $lastSnap = [];
++        }
++
++        try {
++        $productDiff = $this->computeProductDiff($this->payload);
++            if (!empty($productDiff)) {
++                $this->productUpdate($target, $mirror->target_product_gid, $productDiff);
++                Log::info('Product core updated', ['fields' => array_keys($productDiff)]);
++            } else {
++                Log::info('Product core no-op (no changes)');
++            }
++
++            // === 1.1) Options diff (raport) ===
++            $srcOptions = $this->normalizeOptionsFromPayload($this->payload);
++            $currOptFp  = $this->optionsFingerprint($srcOptions);
++            $prevOptFp  = $lastSnap['options_fingerprint'] ?? null;
++
++            if ($currOptFp !== $prevOptFp) {
++                // Log::info('Options changed → syncing', [
++                //     'target_shop' => $target->domain,
++                //     'names'       => array_map(fn($o) => $o['name'], $srcOptions),
++                // ]);
++                // lăsăm doar raport aici; crearea efectivă doar dacă target are "Default Title"
++            } else {
++                Log::info('Options unchanged, skipping', ['target_shop' => $target->domain]);
++            }
++
++            // === 2) Images sync (always replace) ===
+             if ($skipDirectImageSyncForBem) {
+-                $previousSnapshot = $mirror->last_snapshot ?? [];
+-                $previousImages = $previousSnapshot['images'] ?? [];
+-                $newSnap['images'] = $previousImages;
+-                $newSnap['images_fingerprint'] = $this->fingerprintImages($previousImages);
+-
+-                foreach (['bem_update_media_synced_at', 'bem_repaired_at'] as $preservedKey) {
+-                    if (array_key_exists($preservedKey, $previousSnapshot)) {
+-                        $newSnap[$preservedKey] = $previousSnapshot[$preservedKey];
++                Log::warning('BEM update image sync skipped: source payload images may be watermarked', [
++                    'target_shop' => $target->domain,
++                    'source_shop_id' => $this->sourceShopId,
++                    'source_product_id' => $this->sourceProductId,
++                    'target_product_gid' => $mirror->target_product_gid,
++                ]);
++            } else {
++                $srcImages = $this->extractSourceImages($this->payload);
++                // Log::info('Images syncing (force replace)', [
++                //     'target_shop' => $target->domain,
++                //     'count'       => count($srcImages),
++                // ]);
++                $this->syncImagesReplaceAll($target, $mirror->target_product_gid, $srcImages);
++                // Log::info('Images synced', [
++                //     'target_shop' => $target->domain,
++                //     'count'       => count($srcImages),
++                // ]);
++            }
++
++            if ($mirror->target_product_gid) {
++                $this->syncMetaobjectMetafields(
++                    source: $source,
++                    target: $target,
++                    sourceProductGid: 'gid://shopify/Product/' . $this->sourceProductId,
++                    targetProductGid: $mirror->target_product_gid,
++                );
++            }
++
++            if ($metaDescription !== null && $metaDescription !== '') {
++                $this->applyMetaDescriptionToTarget($target, $mirror->target_product_gid, $metaDescription);
++            }
++
++            $updateSucceeded = true;
++
++            // Log::info('Replicate update done', [
++            //     'target_shop' => $target->domain,
++            //     'target_gid'  => $mirror->target_product_gid,
++            // ]);
++        } finally {
++            if ($updateSucceeded) {
++                $newSnap = $this->normalizeProductSnapshot($this->payload);
++                if ($skipDirectImageSyncForBem) {
++                    $previousSnapshot = $mirror->last_snapshot ?? [];
++                    $previousImages = $previousSnapshot['images'] ?? [];
++                    $newSnap['images'] = $previousImages;
++                    $newSnap['images_fingerprint'] = $this->fingerprintImages($previousImages);
++
++                    foreach (['bem_update_media_synced_at', 'bem_repaired_at'] as $preservedKey) {
++                        if (array_key_exists($preservedKey, $previousSnapshot)) {
++                            $newSnap[$preservedKey] = $previousSnapshot[$preservedKey];
++                        }
+                     }
+                 }
++                $mirror->last_snapshot = $newSnap;
++                $mirror->save();
+             }
+-            $mirror->last_snapshot = $newSnap;
+-            $mirror->save();
+         }
+     }
+-}
+ 
+ 
+ 
+ 
+     private function bootstrapLegacyVariantIdentity(
+         LegacyParentVariantBootstrapPolicy $policy,
+         ShopifyParentIdentityResolver $identityResolver,
+         ProductMirror $mirror,
+         Shop $target,
+         array $sourceById,
+diff --git a/app/Services/Shopify/LegacyParentVariantBootstrapPolicy.php b/app/Services/Shopify/LegacyParentVariantBootstrapPolicy.php
+index 4e3456b..02ee0b6 100644
+--- a/app/Services/Shopify/LegacyParentVariantBootstrapPolicy.php
++++ b/app/Services/Shopify/LegacyParentVariantBootstrapPolicy.php
+@@ -6,28 +6,28 @@ final class LegacyParentVariantBootstrapPolicy
+ {
+     /**
+      * @return array{status:'not_needed'|'eligible'|'unsafe', action:?string, reason:?string}
+      */
+     public function decide(array $targetState, int $sourceVariantCount): array
+     {
+         if ($sourceVariantCount < 1) {
+             return $this->unsafe('legacy_variant_bootstrap_source_payload_invalid');
+         }
+ 
+-        if (!empty($targetState['ambiguous_parent_ids'])) {
++        if (! empty($targetState['ambiguous_parent_ids'])) {
+             return $this->unsafe('legacy_variant_bootstrap_ambiguous_parentvariant');
+         }
+ 
+         $unmanaged = array_values($targetState['unmanaged_gids'] ?? []);
+         $managed = $targetState['by_parent_id'] ?? [];
+ 
+-        if (!$unmanaged) {
++        if (! $unmanaged) {
+             return ['status' => 'not_needed', 'action' => null, 'reason' => null];
+         }
+ 
+         if (count($unmanaged) > 1) {
+             return $this->unsafe('legacy_variant_bootstrap_multiple_unmanaged');
+         }
+ 
+         if ($managed || count($targetState['nodes_by_gid'] ?? []) !== 1) {
+             return $this->unsafe('legacy_variant_bootstrap_mixed_identity_state');
+         }
+diff --git a/tests/Unit/ReplicateProductUpdateIdentityContractTest.php b/tests/Unit/ReplicateProductUpdateIdentityContractTest.php
+index 7257ea7..09d2399 100644
+--- a/tests/Unit/ReplicateProductUpdateIdentityContractTest.php
++++ b/tests/Unit/ReplicateProductUpdateIdentityContractTest.php
+@@ -1,16 +1,16 @@
+ <?php
+ 
+ namespace Tests\Unit;
+ 
+-use App\Jobs\ReplicateProductUpdateToShop;
+ use App\Jobs\ReplicateProductCreateToShop;
++use App\Jobs\ReplicateProductUpdateToShop;
+ use App\Services\Shopify\LegacyParentVariantBootstrapPolicy;
+ use App\Services\Shopify\ShopifyParentIdentityResolver;
+ use Illuminate\Queue\Middleware\WithoutOverlapping;
+ use Illuminate\Support\Facades\Http;
+ use ReflectionMethod;
+ use Tests\TestCase;
+ 
+ class ReplicateProductUpdateIdentityContractTest extends TestCase
+ {
+     public function test_update_job_requires_identity_resolver_and_legacy_bootstrap_policy(): void
+@@ -45,44 +45,104 @@ public function test_single_legacy_variant_is_reused_without_product_set(): void
+ 
+         $this->assertStringContainsString("'attach_single'", $source);
+         $this->assertStringContainsString('$this->setParentVariantMetafield(', $source);
+         $this->assertStringContainsString("'legacy_bootstrap_single'", $source);
+         $this->assertStringNotContainsString('productVariantsBulkDelete', $source);
+     }
+ 
+     public function test_legacy_structure_bootstrap_uses_product_set_without_retained_variant_gid(): void
+     {
+         $source = $this->methodSource('bootstrapLegacyVariantIdentity');
++        $attachBranch = strpos($source, '$decision[\'action\'] === \'attach_single\'');
++        $replacementBranch = strpos($source, '$decision[\'action\'] === \'replace_structure\'');
++        $attachSetMetafield = strpos($source, '$this->setParentVariantMetafield(');
++        $attachVerifiedState = strpos($source, '$identityResolver->targetVariantState(');
++        $attachPostcondition = strpos($source, '$this->assertBootstrapIdentityState(');
++        $attachReplaceMirrors = strpos($source, '$this->replaceVariantMirrorsFromVerifiedState(');
++        $replacementProductSet = strpos($source, '$this->productSetVariantStructure(');
++        $replacementVerifiedState = strrpos($source, '$identityResolver->targetVariantState(');
++        $replacementPostcondition = strrpos($source, '$this->assertBootstrapIdentityState(');
++        $replacementReplaceMirrors = strrpos($source, '$this->replaceVariantMirrorsFromVerifiedState(');
+ 
+         $this->assertStringContainsString("'replace_structure'", $source);
+         $this->assertStringContainsString('$this->productSetVariantStructure(', $source);
+         $this->assertStringContainsString('allowCompatibleOptionStructure: true', $source);
+         $this->assertStringContainsString('$this->assertBootstrapIdentityState(', $source);
+         $this->assertStringContainsString('$this->replaceVariantMirrorsFromVerifiedState(', $source);
++        $this->assertNotFalse($attachBranch);
++        $this->assertNotFalse($replacementBranch);
++        $this->assertNotFalse($attachSetMetafield);
++        $this->assertNotFalse($attachVerifiedState);
++        $this->assertNotFalse($attachPostcondition);
++        $this->assertNotFalse($attachReplaceMirrors);
++        $this->assertNotFalse($replacementProductSet);
++        $this->assertNotFalse($replacementVerifiedState);
++        $this->assertNotFalse($replacementPostcondition);
++        $this->assertNotFalse($replacementReplaceMirrors);
++        $this->assertTrue($attachBranch < $attachSetMetafield);
++        $this->assertTrue($attachSetMetafield < $attachVerifiedState);
++        $this->assertTrue($attachVerifiedState < $attachPostcondition);
++        $this->assertTrue($attachPostcondition < $attachReplaceMirrors);
++        $this->assertTrue($attachReplaceMirrors < $replacementBranch);
++        $this->assertTrue($replacementBranch < $replacementProductSet);
++        $this->assertTrue($replacementProductSet < $replacementVerifiedState);
++        $this->assertTrue($replacementVerifiedState < $replacementPostcondition);
++        $this->assertTrue($replacementPostcondition < $replacementReplaceMirrors);
+     }
+ 
+     public function test_product_set_can_be_explicitly_enabled_for_legacy_default_variant_bootstrap(): void
+     {
+         $source = $this->methodSource('productSetVariantStructure');
+ 
+         $this->assertStringContainsString('bool $allowCompatibleOptionStructure = false', $source);
+         $this->assertStringContainsString('!$allowCompatibleOptionStructure', $source);
+     }
+ 
+     public function test_bootstrap_policy_is_checked_only_when_unmanaged_variants_exist(): void
+     {
+         $source = $this->methodSource('bootstrapLegacyVariantIdentity');
+ 
+         $this->assertStringContainsString('$decision[\'status\'] === \'not_needed\'', $source);
+         $this->assertStringContainsString("'status' => 'not_needed'", $source);
+     }
+ 
++    public function test_legacy_bootstrap_has_no_mutable_identity_fallback_and_bg_exits_first(): void
++    {
++        $bootstrap = $this->methodSource('bootstrapLegacyVariantIdentity');
++        $handle = $this->methodSource('handle');
++
++        foreach (['sku', 'title', 'handle', 'options_key', 'position', 'price'] as $forbidden) {
++            $this->assertStringNotContainsString($forbidden, strtolower($bootstrap));
++        }
++
++        $bgExit = strpos($handle, 'eiluminat-bg.myshopify.com');
++        $strictSync = strpos($handle, '$this->syncVariantsStrict(');
++
++        $this->assertNotFalse($bgExit);
++        $this->assertNotFalse($strictSync);
++        $this->assertLessThan($strictSync, $bgExit);
++    }
++
++    public function test_unsafe_bootstrap_returns_before_shopify_mutations(): void
++    {
++        $source = $this->methodSource('bootstrapLegacyVariantIdentity');
++        $unsafe = strpos($source, '$decision[\'status\'] === \'unsafe\'');
++        $setMetafield = strpos($source, '$this->setParentVariantMetafield(');
++        $productSet = strpos($source, '$this->productSetVariantStructure(');
++
++        $this->assertNotFalse($unsafe);
++        $this->assertNotFalse($setMetafield);
++        $this->assertNotFalse($productSet);
++        $this->assertTrue($unsafe < $setMetafield);
++        $this->assertTrue($unsafe < $productSet);
++    }
++
+     public function test_update_job_contains_no_product_handle_or_sku_fallback_methods(): void
+     {
+         $source = file_get_contents(app_path('Jobs/ReplicateProductUpdateToShop.php'));
+ 
+         $this->assertStringNotContainsString('searchTargetProductByHandle', $source);
+         $this->assertStringNotContainsString('searchTargetProductBySkus', $source);
+         $this->assertStringNotContainsString('ProductParentBackfillCandidate', $source);
+     }
+ 
+     public function test_update_job_contains_no_variant_identity_fallbacks(): void
+@@ -123,21 +183,21 @@ public function test_new_variants_receive_parentvariant_atomically(): void
+         $lines = file(app_path('Jobs/ReplicateProductUpdateToShop.php'));
+         $source = implode('', array_slice(
+             $lines,
+             $reflection->getStartLine() - 1,
+             $reflection->getEndLine() - $reflection->getStartLine() + 1
+         ));
+ 
+         $this->assertStringContainsString("'metafields'", $source);
+         $this->assertStringContainsString("'key' => 'parentvariant'", $source);
+         $this->assertStringContainsString("'value' => (string) \$sourceId", $source);
+-        $this->assertStringContainsString("metafield(namespace: \"custom\", key: \"parentvariant\")", $source);
++        $this->assertStringContainsString('metafield(namespace: "custom", key: "parentvariant")', $source);
+         $this->assertStringContainsString("\$node['metafield']['value']", $source);
+     }
+ 
+     public function test_updates_are_serialized_per_source_and_target_product(): void
+     {
+         $job = new ReplicateProductUpdateToShop(4, 3, 700, []);
+         $middleware = $job->middleware();
+ 
+         $this->assertCount(1, $middleware);
+         $this->assertInstanceOf(WithoutOverlapping::class, $middleware[0]);

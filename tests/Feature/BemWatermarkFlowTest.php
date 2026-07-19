@@ -74,7 +74,9 @@ class BemWatermarkFlowTest extends TestCase
         $metafieldPayload = null;
         $cleanImage = $this->pngFixture();
 
-        Http::fake(function ($request) use ($cleanImage, &$metafieldPayload) {
+        $mediaOperations = [];
+
+        Http::fake(function ($request) use ($cleanImage, &$metafieldPayload, &$mediaOperations) {
             $url = $request->url();
 
             if ($url === 'https://cdn.test/backup-clean-image.png') {
@@ -105,23 +107,30 @@ class BemWatermarkFlowTest extends TestCase
                 ]);
             }
 
-            if (str_contains($url, 'lustreled.myshopify.com') && str_contains($query, 'BemProductMediaIds')) {
+            if (str_contains($url, 'lustreled.myshopify.com') && str_contains($query, 'BemProductImageMediaIds')) {
                 return Http::response([
                     'data' => [
                         'product' => [
                             'media' => [
-                                'nodes' => [['id' => 'gid://shopify/MediaImage/old']],
+                                'nodes' => [[
+                                    'id' => 'gid://shopify/MediaImage/old',
+                                    'mediaContentType' => 'IMAGE',
+                                ]],
                             ],
                         ],
                     ],
                 ]);
             }
 
-            if (str_contains($url, 'lustreled.myshopify.com') && str_contains($query, 'BemReplaceProductImages')) {
+            if (str_contains($url, 'lustreled.myshopify.com') && str_contains($query, 'BemAppendProductImages')) {
+                $mediaOperations[] = 'append';
+
                 return Http::response([
                     'data' => [
-                        'deleteResult' => ['deletedMediaIds' => ['gid://shopify/MediaImage/old'], 'mediaUserErrors' => []],
-                        'createResult' => ['media' => [['id' => 'gid://shopify/MediaImage/new', 'status' => 'READY']], 'mediaUserErrors' => []],
+                        'productCreateMedia' => [
+                            'media' => [['id' => 'gid://shopify/MediaImage/new', 'status' => 'PROCESSING']],
+                            'mediaUserErrors' => [],
+                        ],
                     ],
                 ]);
             }
@@ -145,6 +154,19 @@ class BemWatermarkFlowTest extends TestCase
                                     ],
                                 ]],
                             ],
+                        ],
+                    ],
+                ]);
+            }
+
+            if (str_contains($url, 'lustreled.myshopify.com') && str_contains($query, 'BemDeleteProductImages')) {
+                $mediaOperations[] = 'delete';
+
+                return Http::response([
+                    'data' => [
+                        'productDeleteMedia' => [
+                            'deletedMediaIds' => ['gid://shopify/MediaImage/old'],
+                            'mediaUserErrors' => [],
                         ],
                     ],
                 ]);
@@ -236,7 +258,98 @@ class BemWatermarkFlowTest extends TestCase
         $this->assertSame('png', $metafieldPayload['images'][0]['original_extension']);
         $this->assertSame('completed', $metafieldPayload['images'][0]['status']);
         $this->assertSame('https://cdn.shopify.test/final/lustreled_lustra-led-moderna_w_p_1.png', $metafieldPayload['images'][0]['watermarked_url']);
+        $this->assertSame(['append', 'delete'], $mediaOperations);
         $this->assertSame([], $this->bemTestTempFiles());
+    }
+
+    public function test_bem_safe_replace_keeps_existing_images_when_appended_media_fails(): void
+    {
+        $target = $this->shop(4, 'lustreled.myshopify.com');
+        $processedPath = storage_path('app/watermark/bem_tmp/tests/manual/test-failed-replacement.png');
+
+        if (!is_dir(dirname($processedPath))) {
+            mkdir(dirname($processedPath), 0755, true);
+        }
+
+        file_put_contents($processedPath, $this->pngFixture());
+        $appendCalled = false;
+        $deleteCalled = false;
+
+        Http::fake(function ($request) use (&$appendCalled, &$deleteCalled) {
+            $url = $request->url();
+            if ($url === 'https://staged.test/failed-upload/1') {
+                return Http::response('', 204);
+            }
+
+            $query = (string) ($request->data()['query'] ?? '');
+            if (str_contains($query, 'BemStageUploads')) {
+                return Http::response(['data' => ['stagedUploadsCreate' => [
+                    'stagedTargets' => [[
+                        'url' => 'https://staged.test/failed-upload/1',
+                        'resourceUrl' => 'https://cdn.shopify.test/staged/failed.png',
+                        'parameters' => [['name' => 'key', 'value' => 'value']],
+                    ]],
+                    'userErrors' => [],
+                ]]]);
+            }
+
+            if (str_contains($query, 'BemProductImageMediaIds')) {
+                return Http::response(['data' => ['product' => ['media' => ['nodes' => [[
+                    'id' => 'gid://shopify/MediaImage/original',
+                    'mediaContentType' => 'IMAGE',
+                ]]]]]]);
+            }
+
+            if (str_contains($query, 'BemAppendProductImages')) {
+                $appendCalled = true;
+                return Http::response(['data' => ['productCreateMedia' => [
+                    'media' => [['id' => 'gid://shopify/MediaImage/failed', 'status' => 'PROCESSING']],
+                    'mediaUserErrors' => [],
+                ]]]);
+            }
+
+            if (str_contains($query, 'BemProductWatermarkedMediaImages')) {
+                return Http::response(['data' => ['product' => ['media' => ['nodes' => [[
+                    'id' => 'gid://shopify/MediaImage/failed',
+                    'mediaContentType' => 'IMAGE',
+                    'status' => 'FAILED',
+                    'preview' => ['image' => null],
+                    'image' => null,
+                ]]]]]]);
+            }
+
+            if (str_contains($query, 'BemDeleteProductImages')) {
+                $deleteCalled = true;
+            }
+
+            return Http::response(['errors' => [['message' => 'Unexpected request '.$url]]], 500);
+        });
+
+        try {
+            app(BemShopifyStagedUploadService::class)->replaceProductImages(
+                $target,
+                'gid://shopify/Product/failed',
+                [[
+                    'position' => 1,
+                    'source_url' => 'https://cdn.test/original.png',
+                    'filename' => 'failed.png',
+                    'original_extension' => 'png',
+                    'status' => 'processed',
+                    'path' => $processedPath,
+                    'mime' => 'image/png',
+                    'alt' => 'Failed replacement',
+                ]]
+            );
+
+            $this->fail('Expected failed replacement media to stop the safe swap.');
+        } catch (\RuntimeException $e) {
+            $this->assertStringContainsString('failed', strtolower($e->getMessage()));
+        } finally {
+            @unlink($processedPath);
+        }
+
+        $this->assertTrue($appendCalled);
+        $this->assertFalse($deleteCalled);
     }
 
     public function test_bem_watermark_processor_preserves_webp_extension(): void
@@ -410,6 +523,66 @@ class BemWatermarkFlowTest extends TestCase
         $this->assertTrue($deleteCalled);
         $this->assertSame('uploaded', $uploaded[0]['status']);
         $this->assertSame('https://cdn.shopify.test/staged/eiluminat-source.png', $uploaded[0]['watermarked_url']);
+    }
+
+    public function test_partial_media_create_is_cleaned_up_before_retry(): void
+    {
+        $target = $this->shop(4, 'lustreled.myshopify.com');
+        $operations = [];
+
+        Http::fake(function ($request) use (&$operations) {
+            $query = (string) ($request->data()['query'] ?? '');
+
+            if (str_contains($query, 'BemAppendProductImages')) {
+                $operations[] = 'append-partial';
+
+                return Http::response(['data' => ['productCreateMedia' => [
+                    'media' => [[
+                        'id' => 'gid://shopify/MediaImage/partial',
+                        'status' => 'PROCESSING',
+                    ]],
+                    'mediaUserErrors' => [[
+                        'field' => ['media', '1'],
+                        'message' => 'Invalid image',
+                    ]],
+                ]]]);
+            }
+
+            if (str_contains($query, 'BemDeleteProductImages')) {
+                $operations[] = 'cleanup-partial';
+                $this->assertSame(
+                    ['gid://shopify/MediaImage/partial'],
+                    $request->data()['variables']['mediaIds']
+                );
+
+                return Http::response(['data' => ['productDeleteMedia' => [
+                    'deletedMediaIds' => ['gid://shopify/MediaImage/partial'],
+                    'mediaUserErrors' => [],
+                ]]]);
+            }
+
+            return Http::response(['errors' => [['message' => 'Unexpected request']]], 500);
+        });
+
+        $service = app(BemShopifyStagedUploadService::class);
+        $method = new \ReflectionMethod($service, 'createMedia');
+
+        try {
+            $method->invoke($service, $target, 'gid://shopify/Product/333', [[
+                'mediaContentType' => 'IMAGE',
+                'originalSource' => 'https://cdn.shopify.test/staged/one.jpg',
+            ], [
+                'mediaContentType' => 'IMAGE',
+                'originalSource' => 'invalid',
+            ]]);
+            $this->fail('Expected partial media create to throw');
+        } catch (\ReflectionException $e) {
+            throw $e;
+        } catch (\Throwable $e) {
+            $this->assertStringContainsString('userErrors', $e->getMessage());
+        }
+
+        $this->assertSame(['append-partial', 'cleanup-partial'], $operations);
     }
 
     private function shop(int $id, string $domain): Shop

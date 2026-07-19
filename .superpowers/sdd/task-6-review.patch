@@ -1,0 +1,665 @@
+diff --git a/app/Http/Controllers/CatalogAuditController.php b/app/Http/Controllers/CatalogAuditController.php
+new file mode 100644
+index 0000000..86c6cd7
+--- /dev/null
++++ b/app/Http/Controllers/CatalogAuditController.php
+@@ -0,0 +1,172 @@
++<?php
++
++namespace App\Http\Controllers;
++
++use App\Models\CatalogAuditFinding;
++use App\Models\CatalogAuditRun;
++use App\Models\Shop;
++use Illuminate\Database\Eloquent\Builder;
++use Illuminate\Http\Request;
++
++class CatalogAuditController extends Controller
++{
++    public function missingImages(Request $request, string $shop)
++    {
++        $auditShop = $this->resolveAuditShop($shop);
++        $findings = $this->findingsQuery($auditShop, CatalogAuditFinding::TYPE_MISSING_IMAGE, $request)
++            ->orderBy('product_title')
++            ->orderBy('product_legacy_id')
++            ->paginate(25)
++            ->withQueryString();
++
++        return view('catalog-audit.index', $this->viewData(
++            $auditShop,
++            $shop,
++            'missing-images',
++            $request,
++            ['findings' => $findings],
++        ));
++    }
++
++    public function duplicateSkus(Request $request, string $shop)
++    {
++        $auditShop = $this->resolveAuditShop($shop);
++        $groups = $this->findingsQuery($auditShop, CatalogAuditFinding::TYPE_DUPLICATE_SKU, $request)
++            ->whereNotNull('normalized_sku')
++            ->selectRaw('normalized_sku, COUNT(*) as affected_rows')
++            ->groupBy('normalized_sku')
++            ->orderBy('normalized_sku')
++            ->paginate(10)
++            ->withQueryString();
++        $normalizedSkus = collect($groups->items())->pluck('normalized_sku');
++
++        $findingsByGroup = $normalizedSkus->isEmpty()
++            ? collect()
++            : $this->currentFindingsQuery($auditShop, CatalogAuditFinding::TYPE_DUPLICATE_SKU)
++                ->whereIn('normalized_sku', $normalizedSkus)
++                ->orderBy('normalized_sku')
++                ->orderBy('product_title')
++                ->orderBy('variant_title')
++                ->get()
++                ->groupBy('normalized_sku');
++
++        return view('catalog-audit.index', $this->viewData(
++            $auditShop,
++            $shop,
++            'duplicate-skus',
++            $request,
++            [
++                'duplicateGroups' => $groups,
++                'findingsByGroup' => $findingsByGroup,
++            ],
++        ));
++    }
++
++    private function findingsQuery(Shop $shop, string $findingType, Request $request): Builder
++    {
++        return $this->currentFindingsQuery($shop, $findingType)
++            ->when($request->filled('search'), function (Builder $query) use ($request): void {
++                $search = trim((string) $request->input('search'));
++
++                $query->where(function (Builder $inner) use ($search): void {
++                    $like = '%'.$search.'%';
++
++                    $inner->where('product_title', 'like', $like)
++                        ->orWhere('product_handle', 'like', $like)
++                        ->orWhere('sku', 'like', $like)
++                        ->orWhere('normalized_sku', 'like', $like)
++                        ->orWhere('variant_title', 'like', $like);
++
++                    if (ctype_digit($search)) {
++                        $inner->orWhere('product_legacy_id', (int) $search)
++                            ->orWhere('variant_legacy_id', (int) $search);
++                    }
++                });
++            });
++    }
++
++    private function currentFindingsQuery(Shop $shop, string $findingType): Builder
++    {
++        return CatalogAuditFinding::query()
++            ->where('shop_id', $shop->id)
++            ->where('finding_type', $findingType);
++    }
++
++    private function resolveAuditShop(string $slug): Shop
++    {
++        $domain = config('catalog_audit.shops', [])[$slug] ?? null;
++
++        abort_unless($domain, 404);
++
++        return Shop::query()
++            ->where('domain', $domain)
++            ->where('is_active', true)
++            ->firstOrFail();
++    }
++
++    /** @return array<string, mixed> */
++    private function viewData(Shop $shop, string $slug, string $reportType, Request $request, array $reportData): array
++    {
++        $latestRun = CatalogAuditRun::query()
++            ->where('shop_id', $shop->id)
++            ->latest('created_at')
++            ->first();
++        $lastSuccessfulRun = CatalogAuditRun::query()
++            ->where('shop_id', $shop->id)
++            ->where('status', CatalogAuditRun::STATUS_COMPLETED)
++            ->latest('finished_at')
++            ->first();
++
++        return [
++            ...$reportData,
++            'auditShop' => $shop,
++            'currentShopSlug' => $slug,
++            'reportType' => $reportType,
++            'shopTabs' => $this->shopTabs(),
++            'filters' => $request->only('search'),
++            'latestRun' => $latestRun,
++            'lastSuccessfulRun' => $lastSuccessfulRun,
++            'currentCounts' => [
++                'missing_images' => CatalogAuditFinding::query()
++                    ->where('shop_id', $shop->id)
++                    ->where('finding_type', CatalogAuditFinding::TYPE_MISSING_IMAGE)
++                    ->count(),
++                'duplicate_groups' => CatalogAuditFinding::query()
++                    ->where('shop_id', $shop->id)
++                    ->where('finding_type', CatalogAuditFinding::TYPE_DUPLICATE_SKU)
++                    ->whereNotNull('normalized_sku')
++                    ->distinct()
++                    ->count('normalized_sku'),
++                'duplicate_rows' => CatalogAuditFinding::query()
++                    ->where('shop_id', $shop->id)
++                    ->where('finding_type', CatalogAuditFinding::TYPE_DUPLICATE_SKU)
++                    ->count(),
++            ],
++        ];
++    }
++
++    /** @return array<int, array{slug: string, label: string, domain: string}> */
++    private function shopTabs(): array
++    {
++        $configuredShops = config('catalog_audit.shops', []);
++        $shopsByDomain = Shop::query()
++            ->where('is_active', true)
++            ->whereIn('domain', array_values($configuredShops))
++            ->get(['name', 'domain'])
++            ->keyBy('domain');
++
++        return collect($configuredShops)
++            ->map(function (string $domain, string $slug) use ($shopsByDomain): ?array {
++                $shop = $shopsByDomain->get($domain);
++
++                return $shop === null ? null : [
++                    'slug' => $slug,
++                    'label' => $shop->name ?: $domain,
++                    'domain' => $domain,
++                ];
++            })
++            ->filter()
++            ->values()
++            ->all();
++    }
++}
+diff --git a/resources/views/catalog-audit/index.blade.php b/resources/views/catalog-audit/index.blade.php
+new file mode 100644
+index 0000000..e3be7e1
+--- /dev/null
++++ b/resources/views/catalog-audit/index.blade.php
+@@ -0,0 +1,208 @@
++<x-app-layout>
++    <x-slot name="header">
++        <div>
++            <h2 style="margin:0;font-size:20px;font-weight:700;color:#111827;">Audit catalog - {{ $auditShop->name ?: $auditShop->domain }}</h2>
++            <div style="margin-top:4px;font-size:13px;color:#64748b;">{{ $auditShop->domain }}</div>
++        </div>
++    </x-slot>
++
++    <style>
++        .audit-page { min-height: 100vh; background: #f4f7fb; color: #172033; padding: 28px 18px 48px; }
++        .audit-wrap { max-width: 1500px; margin: 0 auto; }
++        .audit-tabs { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 14px; }
++        .audit-tab { display: inline-flex; align-items: center; min-height: 38px; padding: 0 14px; border: 1px solid #c7d2e0; border-radius: 7px; background: #fff; color: #334155; font-size: 14px; font-weight: 700; text-decoration: none; }
++        .audit-tab:hover { background: #edf3fa; }
++        .audit-tab.is-active { border-color: #146c94; background: #146c94; color: #fff; }
++        .audit-report-tabs { display: flex; gap: 18px; margin: 4px 0 20px; border-bottom: 1px solid #cbd5e1; }
++        .audit-report-tab { padding: 10px 2px; border-bottom: 3px solid transparent; color: #536274; font-size: 14px; font-weight: 800; text-decoration: none; }
++        .audit-report-tab.is-active { border-color: #d36f21; color: #172033; }
++        .audit-status { display: grid; grid-template-columns: minmax(0, 1.5fr) repeat(3, minmax(130px, .65fr)); gap: 14px; margin-bottom: 18px; padding: 16px; border: 1px solid #d6e0ea; background: #fff; }
++        .audit-status-label { color: #64748b; font-size: 11px; font-weight: 800; letter-spacing: .03em; text-transform: uppercase; }
++        .audit-status-value { margin-top: 6px; color: #172033; font-size: 17px; font-weight: 800; line-height: 1.25; }
++        .audit-status-meta { margin-top: 5px; color: #64748b; font-size: 12px; line-height: 1.45; }
++        .audit-badge { display: inline-flex; align-items: center; min-height: 24px; padding: 0 8px; border: 1px solid #b9c8d8; border-radius: 999px; background: #f5f8fc; color: #334155; font-size: 12px; font-weight: 800; text-transform: capitalize; }
++        .audit-badge.completed { border-color: #9ed3b0; background: #e9f8ef; color: #19633a; }
++        .audit-badge.failed { border-color: #f1b7ad; background: #fff0ed; color: #a33328; }
++        .audit-badge.running, .audit-badge.queued { border-color: #a9c8e5; background: #ecf6ff; color: #1c5b8d; }
++        .audit-warning { margin: -4px 0 18px; padding: 12px 14px; border-left: 4px solid #c7621a; background: #fff5e9; color: #713c18; font-size: 14px; line-height: 1.45; }
++        .audit-stats { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 14px; margin-bottom: 18px; }
++        .audit-stat { padding: 16px; border: 1px solid #d6e0ea; background: #fff; }
++        .audit-stat-value { margin-top: 8px; color: #172033; font-size: 28px; font-weight: 800; line-height: 1; }
++        .audit-filter { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 12px; align-items: end; margin-bottom: 18px; padding: 16px; border: 1px solid #d6e0ea; background: #fff; }
++        .audit-label { display: block; margin-bottom: 7px; color: #526174; font-size: 12px; font-weight: 800; text-transform: uppercase; }
++        .audit-input { width: 100%; height: 42px; box-sizing: border-box; border: 1px solid #b9c8d8; border-radius: 6px; background: #fff; color: #172033; padding: 0 11px; font-size: 14px; }
++        .audit-input:focus { border-color: #146c94; box-shadow: 0 0 0 3px rgba(20, 108, 148, .16); outline: none; }
++        .audit-actions { display: flex; gap: 8px; }
++        .audit-button { display: inline-flex; align-items: center; justify-content: center; min-height: 40px; padding: 0 13px; border: 1px solid transparent; border-radius: 6px; background: #146c94; color: #fff; font-size: 13px; font-weight: 800; text-decoration: none; cursor: pointer; white-space: nowrap; }
++        .audit-button:hover { background: #0e587a; }
++        .audit-button-secondary { border-color: #b9c8d8; background: #fff; color: #334155; }
++        .audit-button-secondary:hover { background: #edf3fa; }
++        .audit-button-admin { min-height: 32px; background: #27744c; }
++        .audit-button-admin:hover { background: #1d5d3c; }
++        .audit-results { border: 1px solid #d6e0ea; background: #fff; overflow: hidden; }
++        .audit-scroll { overflow-x: auto; }
++        .audit-table { width: 100%; min-width: 940px; border-collapse: collapse; font-size: 14px; }
++        .audit-table th { padding: 13px 15px; border-bottom: 1px solid #cbd5e1; background: #eaf0f6; color: #405068; font-size: 11px; font-weight: 900; letter-spacing: .03em; text-align: left; text-transform: uppercase; }
++        .audit-table td { padding: 14px 15px; border-bottom: 1px solid #e1e8f0; color: #1f2937; vertical-align: top; }
++        .audit-table tr:last-child td { border-bottom: 0; }
++        .audit-title { color: #172033; font-weight: 800; line-height: 1.4; }
++        .audit-meta { margin-top: 5px; color: #64748b; font-size: 12px; line-height: 1.45; overflow-wrap: anywhere; }
++        .audit-sku { display: inline-block; max-width: 280px; overflow-wrap: anywhere; color: #25364d; font-family: monospace; font-size: 13px; font-weight: 700; }
++        .audit-group { padding: 18px; border-bottom: 1px solid #d6e0ea; }
++        .audit-group:last-child { border-bottom: 0; }
++        .audit-group-heading { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; margin-bottom: 12px; }
++        .audit-group-count { color: #64748b; font-size: 13px; white-space: nowrap; }
++        .audit-empty { padding: 48px 18px; color: #64748b; font-size: 14px; text-align: center; }
++        .audit-pagination { padding: 14px 16px; border-top: 1px solid #d6e0ea; }
++        .audit-pagination nav { display: flex; flex-wrap: wrap; gap: 6px; }
++        .audit-pagination a, .audit-pagination span { display: inline-flex; align-items: center; justify-content: center; min-width: 34px; min-height: 34px; padding: 0 8px; border: 1px solid #cbd5e1; border-radius: 5px; background: #fff; color: #334155; font-size: 13px; text-decoration: none; }
++        .audit-pagination span[aria-current="page"] span { border-color: #146c94; background: #146c94; color: #fff; }
++        @media (max-width: 880px) { .audit-page { padding: 20px 12px 36px; } .audit-status, .audit-stats, .audit-filter { grid-template-columns: 1fr; } .audit-actions { width: 100%; } .audit-actions .audit-button { flex: 1; } .audit-report-tabs { gap: 12px; } }
++    </style>
++
++    @php
++        $isMissingImages = $reportType === 'missing-images';
++        $routeName = $isMissingImages ? 'catalog-audit.missing-images' : 'catalog-audit.duplicate-skus';
++        $currentTotal = $isMissingImages ? $currentCounts['missing_images'] : $currentCounts['duplicate_groups'];
++    @endphp
++
++    <div class="audit-page">
++        <div class="audit-wrap">
++            <div class="audit-tabs" aria-label="Magazine">
++                @foreach ($shopTabs as $tab)
++                    <a class="audit-tab {{ $currentShopSlug === $tab['slug'] ? 'is-active' : '' }}" href="{{ route($routeName, ['shop' => $tab['slug']]) }}">{{ $tab['label'] }}</a>
++                @endforeach
++            </div>
++
++            <div class="audit-report-tabs" aria-label="Rapoarte audit">
++                <a class="audit-report-tab {{ $isMissingImages ? 'is-active' : '' }}" href="{{ route('catalog-audit.missing-images', ['shop' => $currentShopSlug]) }}">Produse fara imagini</a>
++                <a class="audit-report-tab {{ ! $isMissingImages ? 'is-active' : '' }}" href="{{ route('catalog-audit.duplicate-skus', ['shop' => $currentShopSlug]) }}">SKU-uri duplicate</a>
++            </div>
++
++            <section class="audit-status" aria-label="Starea ultimei rulări">
++                <div>
++                    <div class="audit-status-label">Ultima rulare</div>
++                    <div class="audit-status-value">
++                        @if ($latestRun)
++                            <span class="audit-badge {{ $latestRun->status }}">{{ $latestRun->status }}</span>
++                        @else
++                            Nu exista rulări
++                        @endif
++                    </div>
++                    <div class="audit-status-meta">
++                        @if ($latestRun?->finished_at)
++                            Finalizata: {{ $latestRun->finished_at->format('d.m.Y H:i') }}
++                        @elseif ($latestRun?->started_at)
++                            Pornita: {{ $latestRun->started_at->format('d.m.Y H:i') }}
++                        @else
++                            Auditul nu a fost rulat pentru acest magazin.
++                        @endif
++                    </div>
++                </div>
++                <div>
++                    <div class="audit-status-label">Fara imagini</div>
++                    <div class="audit-status-value">{{ $currentCounts['missing_images'] }}</div>
++                    <div class="audit-status-meta">constatari curente</div>
++                </div>
++                <div>
++                    <div class="audit-status-label">Grupuri SKU</div>
++                    <div class="audit-status-value">{{ $currentCounts['duplicate_groups'] }}</div>
++                    <div class="audit-status-meta">constatari curente</div>
++                </div>
++                <div>
++                    <div class="audit-status-label">Randuri SKU</div>
++                    <div class="audit-status-value">{{ $currentCounts['duplicate_rows'] }}</div>
++                    <div class="audit-status-meta">variante afectate</div>
++                </div>
++            </section>
++
++            @if ($latestRun?->status === \App\Models\CatalogAuditRun::STATUS_FAILED)
++                <div class="audit-warning">
++                    <strong>Raportul poate fi neactualizat.</strong>
++                    Rularea din {{ optional($latestRun->finished_at)->format('d.m.Y H:i') ?: 'ultima actualizare' }} a esuat; sunt afisate constatarile ultimei rulări reusite{{ $lastSuccessfulRun?->finished_at ? ' din '.$lastSuccessfulRun->finished_at->format('d.m.Y H:i') : '' }}.
++                    @if ($latestRun->error_message) Detalii: {{ $latestRun->error_message }} @endif
++                </div>
++            @endif
++
++            <section class="audit-stats" aria-label="Rezumat raport">
++                <div class="audit-stat">
++                    <div class="audit-status-label">{{ $isMissingImages ? 'Produse fara imagini' : 'Grupuri SKU duplicate' }}</div>
++                    <div class="audit-stat-value">{{ $currentTotal }}</div>
++                </div>
++                <div class="audit-stat">
++                    <div class="audit-status-label">Ultima rulare reusita</div>
++                    <div class="audit-stat-value" style="font-size:17px;line-height:1.25;">{{ $lastSuccessfulRun?->finished_at?->format('d.m.Y H:i') ?: 'Nedisponibil' }}</div>
++                </div>
++                <div class="audit-stat">
++                    <div class="audit-status-label">Afisare</div>
++                    <div class="audit-stat-value">{{ $isMissingImages ? '25' : '10' }}</div>
++                    <div class="audit-status-meta">{{ $isMissingImages ? 'produse pe pagina' : 'grupuri pe pagina' }}</div>
++                </div>
++            </section>
++
++            <form method="GET" action="{{ route($routeName, ['shop' => $currentShopSlug]) }}" class="audit-filter">
++                <div>
++                    <label class="audit-label" for="search">Cauta</label>
++                    <input class="audit-input" id="search" name="search" type="search" value="{{ $filters['search'] ?? '' }}" placeholder="ID produs sau varianta, titlu, handle sau SKU">
++                </div>
++                <div class="audit-actions">
++                    <button class="audit-button" type="submit">Filtreaza</button>
++                    <a class="audit-button audit-button-secondary" href="{{ route($routeName, ['shop' => $currentShopSlug]) }}">Reseteaza</a>
++                </div>
++            </form>
++
++            <section class="audit-results" aria-live="polite">
++                @if ($isMissingImages)
++                    @if ($findings->isEmpty())
++                        <div class="audit-empty">Nu exista constatari pentru produsele fara imagini.</div>
++                    @else
++                        <div class="audit-scroll">
++                            <table class="audit-table">
++                                <thead><tr><th>Produs</th><th>ID / handle</th><th>Ultima confirmare</th><th>Actiune</th></tr></thead>
++                                <tbody>
++                                    @foreach ($findings as $finding)
++                                        <tr>
++                                            <td><div class="audit-title">{{ $finding->product_title ?: 'Fara titlu' }}</div><div class="audit-meta">Status: {{ $finding->product_status ?: 'necunoscut' }}</div></td>
++                                            <td><div>{{ $finding->product_legacy_id ? '#'.$finding->product_legacy_id : 'ID indisponibil' }}</div><div class="audit-meta">{{ $finding->product_handle ? '/'.$finding->product_handle : 'Handle indisponibil' }}</div></td>
++                                            <td>{{ $finding->last_seen_at?->format('d.m.Y H:i') ?: 'Nedisponibil' }}</td>
++                                            <td>@if ($finding->shopify_admin_url)<a class="audit-button audit-button-admin" href="{{ $finding->shopify_admin_url }}" target="_blank" rel="noopener noreferrer">Shopify Admin</a>@else <span class="audit-meta">Link indisponibil</span> @endif</td>
++                                        </tr>
++                                    @endforeach
++                                </tbody>
++                            </table>
++                        </div>
++                        <div class="audit-pagination">{{ $findings->links() }}</div>
++                    @endif
++                @elseif ($duplicateGroups->isEmpty())
++                    <div class="audit-empty">Nu exista constatari pentru SKU-uri duplicate.</div>
++                @else
++                    @foreach ($duplicateGroups as $group)
++                        <article class="audit-group">
++                            <div class="audit-group-heading">
++                                <div><div class="audit-status-label">SKU normalizat</div><div class="audit-sku">{{ $group->normalized_sku }}</div></div>
++                                <div class="audit-group-count">{{ $group->affected_rows }} variante afectate</div>
++                            </div>
++                            <div class="audit-scroll">
++                                <table class="audit-table">
++                                    <thead><tr><th>Produs</th><th>Varianta</th><th>SKU original</th><th>ID / handle</th><th>Actiune</th></tr></thead>
++                                    <tbody>
++                                        @foreach ($findingsByGroup->get($group->normalized_sku, collect()) as $finding)
++                                            <tr>
++                                                <td><div class="audit-title">{{ $finding->product_title ?: 'Fara titlu' }}</div><div class="audit-meta">{{ $finding->product_status ?: 'Status necunoscut' }}</div></td>
++                                                <td><div class="audit-title">{{ $finding->variant_title ?: 'Varianta implicita' }}</div><div class="audit-meta">{{ $finding->variant_legacy_id ? '#'.$finding->variant_legacy_id : 'ID indisponibil' }}</div></td>
++                                                <td><span class="audit-sku">{{ $finding->sku ?: 'Indisponibil' }}</span></td>
++                                                <td><div>{{ $finding->product_legacy_id ? '#'.$finding->product_legacy_id : 'ID indisponibil' }}</div><div class="audit-meta">{{ $finding->product_handle ? '/'.$finding->product_handle : 'Handle indisponibil' }}</div></td>
++                                                <td>@if ($finding->shopify_admin_url)<a class="audit-button audit-button-admin" href="{{ $finding->shopify_admin_url }}" target="_blank" rel="noopener noreferrer">Shopify Admin</a>@else <span class="audit-meta">Link indisponibil</span> @endif</td>
++                                            </tr>
++                                        @endforeach
++                                    </tbody>
++                                </table>
++                            </div>
++                        </article>
++                    @endforeach
++                    <div class="audit-pagination">{{ $duplicateGroups->links() }}</div>
++                @endif
++            </section>
++        </div>
++    </div>
++</x-app-layout>
+diff --git a/routes/web.php b/routes/web.php
+new file mode 100755
+index 0000000..926c683
+--- /dev/null
++++ b/routes/web.php
+@@ -0,0 +1,47 @@
++<?php
++
++use App\Http\Controllers\CatalogAuditController;
++use App\Http\Controllers\ProductParentBackfillController;
++use App\Http\Controllers\ProfileController;
++use App\Http\Controllers\WebhookController;
++use Illuminate\Support\Facades\Route;
++
++/*
++|--------------------------------------------------------------------------
++| Web Routes
++|--------------------------------------------------------------------------
++|
++| Here is where you can register web routes for your application. These
++| routes are loaded by the RouteServiceProvider and all of them will
++| be assigned to the "web" middleware group. Make something great!
++|
++*/
++
++Route::get('/', function () {
++    return view('welcome');
++});
++
++Route::get('/dashboard', [WebhookController::class, 'index'])->middleware(['auth', 'verified'])->name('dashboard');
++
++Route::middleware(['auth', 'verified'])->group(function () {
++    Route::get('/dashboard/catalog-audit/{shop}/missing-images', [CatalogAuditController::class, 'missingImages'])
++        ->name('catalog-audit.missing-images');
++    Route::get('/dashboard/catalog-audit/{shop}/duplicate-skus', [CatalogAuditController::class, 'duplicateSkus'])
++        ->name('catalog-audit.duplicate-skus');
++    Route::get('/dashboard/product-parent-backfill', [ProductParentBackfillController::class, 'index'])
++        ->name('product-parent-backfill.index');
++    Route::get('/dashboard/product-parent-backfill/unmatched', [ProductParentBackfillController::class, 'unmatched'])
++        ->name('product-parent-backfill.unmatched');
++    Route::get('/dashboard/product-parent-backfill/duplicates', [ProductParentBackfillController::class, 'duplicates'])
++        ->name('product-parent-backfill.duplicates');
++    Route::get('/dashboard/duplicates/{shop}', [ProductParentBackfillController::class, 'duplicatesByShop'])
++        ->name('product-parent-duplicates.shop');
++});
++
++Route::middleware('auth')->group(function () {
++    Route::get('/profile', [ProfileController::class, 'edit'])->name('profile.edit');
++    Route::patch('/profile', [ProfileController::class, 'update'])->name('profile.update');
++    Route::delete('/profile', [ProfileController::class, 'destroy'])->name('profile.destroy');
++});
++
++require __DIR__.'/auth.php';
+diff --git a/resources/views/layouts/navigation.blade.php b/resources/views/layouts/navigation.blade.php
+new file mode 100755
+index 0000000..78e2bf5
+--- /dev/null
++++ b/resources/views/layouts/navigation.blade.php
+@@ -0,0 +1,118 @@
++<nav x-data="{ open: false }" class="bg-white dark:bg-gray-800 border-b border-gray-100 dark:border-gray-700">
++    <!-- Primary Navigation Menu -->
++    <div class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8">
++        <div class="flex justify-between h-16">
++            <div class="flex">
++                <!-- Logo -->
++                <div class="shrink-0 flex items-center">
++                    <a href="{{ route('dashboard') }}">
++                        <x-application-logo class="block h-9 w-auto fill-current text-gray-800 dark:text-gray-200" />
++                    </a>
++                </div>
++
++                <!-- Navigation Links -->
++                <div class="hidden space-x-8 sm:-my-px sm:ms-10 sm:flex">
++                    @php($catalogAuditFirstShop = array_key_first(config('catalog_audit.shops', [])))
++                    <x-nav-link :href="route('dashboard')" :active="request()->routeIs('dashboard')">
++                        {{ __('Dashboard') }}
++                    </x-nav-link>
++                    <x-nav-link :href="route('product-parent-backfill.index')" :active="request()->routeIs('product-parent-backfill.*')">
++                        {{ __('Parent Products') }}
++                    </x-nav-link>
++                    @if ($catalogAuditFirstShop)
++                        <x-nav-link :href="route('catalog-audit.missing-images', ['shop' => $catalogAuditFirstShop])" :active="request()->routeIs('catalog-audit.*')">
++                            {{ __('Catalog Audit') }}
++                        </x-nav-link>
++                    @endif
++                </div>
++            </div>
++
++            <!-- Settings Dropdown -->
++            <div class="hidden sm:flex sm:items-center sm:ms-6">
++                <x-dropdown align="right" width="48">
++                    <x-slot name="trigger">
++                        <button class="inline-flex items-center px-3 py-2 border border-transparent text-sm leading-4 font-medium rounded-md text-gray-500 dark:text-gray-400 bg-white dark:bg-gray-800 hover:text-gray-700 dark:hover:text-gray-300 focus:outline-none transition ease-in-out duration-150">
++                            <div>{{ Auth::user()->name }}</div>
++
++                            <div class="ms-1">
++                                <svg class="fill-current h-4 w-4" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20">
++                                    <path fill-rule="evenodd" d="M5.293 7.293a1 1 0 011.414 0L10 10.586l3.293-3.293a1 1 0 111.414 1.414l-4 4a1 1 0 01-1.414 0l-4-4a1 1 0 010-1.414z" clip-rule="evenodd" />
++                                </svg>
++                            </div>
++                        </button>
++                    </x-slot>
++
++                    <x-slot name="content">
++                        <x-dropdown-link :href="route('profile.edit')">
++                            {{ __('Profile') }}
++                        </x-dropdown-link>
++
++                        <!-- Authentication -->
++                        <form method="POST" action="{{ route('logout') }}">
++                            @csrf
++
++                            <x-dropdown-link :href="route('logout')"
++                                    onclick="event.preventDefault();
++                                                this.closest('form').submit();">
++                                {{ __('Log Out') }}
++                            </x-dropdown-link>
++                        </form>
++                    </x-slot>
++                </x-dropdown>
++            </div>
++
++            <!-- Hamburger -->
++            <div class="-me-2 flex items-center sm:hidden">
++                <button @click="open = ! open" class="inline-flex items-center justify-center p-2 rounded-md text-gray-400 dark:text-gray-500 hover:text-gray-500 dark:hover:text-gray-400 hover:bg-gray-100 dark:hover:bg-gray-900 focus:outline-none focus:bg-gray-100 dark:focus:bg-gray-900 focus:text-gray-500 dark:focus:text-gray-400 transition duration-150 ease-in-out">
++                    <svg class="h-6 w-6" stroke="currentColor" fill="none" viewBox="0 0 24 24">
++                        <path :class="{'hidden': open, 'inline-flex': ! open }" class="inline-flex" stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 6h16M4 12h16M4 18h16" />
++                        <path :class="{'hidden': ! open, 'inline-flex': open }" class="hidden" stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12" />
++                    </svg>
++                </button>
++            </div>
++        </div>
++    </div>
++
++    <!-- Responsive Navigation Menu -->
++    <div :class="{'block': open, 'hidden': ! open}" class="hidden sm:hidden">
++        <div class="pt-2 pb-3 space-y-1">
++            @php($catalogAuditFirstShop = array_key_first(config('catalog_audit.shops', [])))
++            <x-responsive-nav-link :href="route('dashboard')" :active="request()->routeIs('dashboard')">
++                {{ __('Dashboard') }}
++            </x-responsive-nav-link>
++            <x-responsive-nav-link :href="route('product-parent-backfill.index')" :active="request()->routeIs('product-parent-backfill.*')">
++                {{ __('Parent Products') }}
++            </x-responsive-nav-link>
++            @if ($catalogAuditFirstShop)
++                <x-responsive-nav-link :href="route('catalog-audit.missing-images', ['shop' => $catalogAuditFirstShop])" :active="request()->routeIs('catalog-audit.*')">
++                    {{ __('Catalog Audit') }}
++                </x-responsive-nav-link>
++            @endif
++        </div>
++
++        <!-- Responsive Settings Options -->
++        <div class="pt-4 pb-1 border-t border-gray-200 dark:border-gray-600">
++            <div class="px-4">
++                <div class="font-medium text-base text-gray-800 dark:text-gray-200">{{ Auth::user()->name }}</div>
++                <div class="font-medium text-sm text-gray-500">{{ Auth::user()->email }}</div>
++            </div>
++
++            <div class="mt-3 space-y-1">
++                <x-responsive-nav-link :href="route('profile.edit')">
++                    {{ __('Profile') }}
++                </x-responsive-nav-link>
++
++                <!-- Authentication -->
++                <form method="POST" action="{{ route('logout') }}">
++                    @csrf
++
++                    <x-responsive-nav-link :href="route('logout')"
++                            onclick="event.preventDefault();
++                                        this.closest('form').submit();">
++                        {{ __('Log Out') }}
++                    </x-responsive-nav-link>
++                </form>
++            </div>
++        </div>
++    </div>
++</nav>
+diff --git a/tests/Feature/CatalogAuditControllerTest.php b/tests/Feature/CatalogAuditControllerTest.php
+new file mode 100644
+index 0000000..d62466a
+--- /dev/null
++++ b/tests/Feature/CatalogAuditControllerTest.php
+@@ -0,0 +1,90 @@
++<?php
++
++namespace Tests\Feature;
++
++use Tests\TestCase;
++
++class CatalogAuditControllerTest extends TestCase
++{
++    public function test_catalog_audit_routes_require_authenticated_verified_users(): void
++    {
++        $routes = file_get_contents(base_path('routes/web.php'));
++
++        $this->assertStringContainsString("Route::middleware(['auth', 'verified'])->group", $routes);
++        $this->assertStringContainsString('/dashboard/catalog-audit/{shop}/missing-images', $routes);
++        $this->assertStringContainsString("->name('catalog-audit.missing-images')", $routes);
++        $this->assertStringContainsString('/dashboard/catalog-audit/{shop}/duplicate-skus', $routes);
++        $this->assertStringContainsString("->name('catalog-audit.duplicate-skus')", $routes);
++
++        $this->get('/dashboard/catalog-audit/eiluminat/missing-images')
++            ->assertRedirect(route('login'));
++        $this->get('/dashboard/catalog-audit/eiluminat/duplicate-skus')
++            ->assertRedirect(route('login'));
++    }
++
++    public function test_controller_resolves_only_active_configured_shop_slugs(): void
++    {
++        $controller = $this->controllerSource();
++
++        $this->assertStringContainsString("config('catalog_audit.shops'", $controller);
++        $this->assertStringContainsString('abort_unless($domain, 404)', $controller);
++        $this->assertStringContainsString("->where('is_active', true)", $controller);
++        $this->assertStringContainsString('->firstOrFail()', $controller);
++    }
++
++    public function test_missing_image_findings_are_scoped_searched_and_paginated_by_twenty_five(): void
++    {
++        $controller = $this->controllerSource();
++
++        $this->assertStringContainsString('CatalogAuditFinding::TYPE_MISSING_IMAGE', $controller);
++        $this->assertStringContainsString('->where(\'shop_id\', $shop->id)', $controller);
++        $this->assertStringContainsString('product_legacy_id', $controller);
++        $this->assertStringContainsString('product_title', $controller);
++        $this->assertStringContainsString('product_handle', $controller);
++        $this->assertStringContainsString('->paginate(25)', $controller);
++        $this->assertStringContainsString('->withQueryString()', $controller);
++    }
++
++    public function test_duplicate_sku_groups_are_scoped_searched_paginated_and_then_hydrated(): void
++    {
++        $controller = $this->controllerSource();
++
++        $this->assertStringContainsString('CatalogAuditFinding::TYPE_DUPLICATE_SKU', $controller);
++        $this->assertStringContainsString("->groupBy('normalized_sku')", $controller);
++        $this->assertStringContainsString('->paginate(10)', $controller);
++        $this->assertStringContainsString('->whereIn(\'normalized_sku\', $normalizedSkus)', $controller);
++        $this->assertStringContainsString("->orderBy('normalized_sku')", $controller);
++        $this->assertStringContainsString("->groupBy('normalized_sku')", $controller);
++        $this->assertStringContainsString('currentFindingsQuery($auditShop, CatalogAuditFinding::TYPE_DUPLICATE_SKU)', $controller);
++    }
++
++    public function test_view_contract_includes_stale_status_tabs_admin_links_and_custom_css(): void
++    {
++        $view = file_get_contents(resource_path('views/catalog-audit/index.blade.php'));
++
++        $this->assertStringContainsString('audit-', $view);
++        $this->assertStringContainsString('Raportul poate fi neactualizat', $view);
++        $this->assertStringContainsString('catalog-audit.missing-images', $view);
++        $this->assertStringContainsString('catalog-audit.duplicate-skus', $view);
++        $this->assertStringContainsString('Shopify Admin', $view);
++        $this->assertStringContainsString('Nu exista constatari', $view);
++    }
++
++    public function test_navigation_links_to_the_first_configured_catalog_audit_shop_for_desktop_and_mobile(): void
++    {
++        $navigation = file_get_contents(resource_path('views/layouts/navigation.blade.php'));
++
++        $this->assertSame(2, substr_count($navigation, "route('catalog-audit.missing-images'"));
++        $this->assertStringContainsString("request()->routeIs('catalog-audit.*')", $navigation);
++        $this->assertStringContainsString("array_key_first(config('catalog_audit.shops', []))", $navigation);
++    }
++
++    private function controllerSource(): string
++    {
++        $path = app_path('Http/Controllers/CatalogAuditController.php');
++
++        $this->assertFileExists($path);
++
++        return file_get_contents($path);
++    }
++}

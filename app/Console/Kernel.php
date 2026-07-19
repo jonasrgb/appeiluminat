@@ -26,6 +26,11 @@ class Kernel extends ConsoleKernel
             ->timezone('Europe/Bucharest')
             ->withoutOverlapping()
             ->runInBackground();
+        $schedule->command('catalog-audit:scan')
+            ->dailyAt('01:00')
+            ->timezone('Europe/Bucharest')
+            ->withoutOverlapping()
+            ->runInBackground();
         //$schedule->command('app:check-products-count')->sundays()->at('00:00');
         $schedule->command('emails:sync-inbox-raw')
         ->everyFiveMinutes()

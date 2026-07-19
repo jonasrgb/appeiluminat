@@ -1,3 +1,15 @@
+@php
+    $catalogAuditConfiguredShops = config('catalog_audit.shops', []);
+    $catalogAuditActiveDomains = \App\Models\Shop::query()
+        ->where('is_active', true)
+        ->whereIn('domain', array_values($catalogAuditConfiguredShops))
+        ->pluck('domain')
+        ->all();
+    $catalogAuditFirstShop = collect($catalogAuditConfiguredShops)
+        ->search(fn (string $domain) => in_array($domain, $catalogAuditActiveDomains, true));
+    $catalogAuditFirstShop = $catalogAuditFirstShop === false ? null : $catalogAuditFirstShop;
+@endphp
+
 <nav x-data="{ open: false }" class="bg-white dark:bg-gray-800 border-b border-gray-100 dark:border-gray-700">
     <!-- Primary Navigation Menu -->
     <div class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8">
@@ -18,6 +30,11 @@
                     <x-nav-link :href="route('product-parent-backfill.index')" :active="request()->routeIs('product-parent-backfill.*')">
                         {{ __('Parent Products') }}
                     </x-nav-link>
+                    @if ($catalogAuditFirstShop)
+                        <x-nav-link :href="route('catalog-audit.missing-images', ['shop' => $catalogAuditFirstShop])" :active="request()->routeIs('catalog-audit.*')">
+                            {{ __('Catalog Audit') }}
+                        </x-nav-link>
+                    @endif
                 </div>
             </div>
 
@@ -76,6 +93,11 @@
             <x-responsive-nav-link :href="route('product-parent-backfill.index')" :active="request()->routeIs('product-parent-backfill.*')">
                 {{ __('Parent Products') }}
             </x-responsive-nav-link>
+            @if ($catalogAuditFirstShop)
+                <x-responsive-nav-link :href="route('catalog-audit.missing-images', ['shop' => $catalogAuditFirstShop])" :active="request()->routeIs('catalog-audit.*')">
+                    {{ __('Catalog Audit') }}
+                </x-responsive-nav-link>
+            @endif
         </div>
 
         <!-- Responsive Settings Options -->

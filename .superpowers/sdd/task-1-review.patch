@@ -1,0 +1,343 @@
+diff --git a/database/migrations/2026_07_18_200000_create_catalog_audit_runs_table.php b/database/migrations/2026_07_18_200000_create_catalog_audit_runs_table.php
+new file mode 100644
+index 0000000..caf36bf
+--- /dev/null
++++ b/database/migrations/2026_07_18_200000_create_catalog_audit_runs_table.php
+@@ -0,0 +1,29 @@
++<?php
++
++use Illuminate\Database\Migrations\Migration;
++use Illuminate\Database\Schema\Blueprint;
++use Illuminate\Support\Facades\Schema;
++
++return new class extends Migration
++{
++    public function up(): void
++    {
++        Schema::create('catalog_audit_runs', function (Blueprint $table) {
++            $table->id();
++            $table->foreignId('shop_id')->constrained('shops')->cascadeOnDelete();
++            $table->string('status', 20)->index();
++            $table->timestamp('started_at')->nullable();
++            $table->timestamp('finished_at')->nullable();
++            $table->unsignedInteger('missing_image_count')->default(0);
++            $table->unsignedInteger('duplicate_sku_group_count')->default(0);
++            $table->unsignedInteger('duplicate_sku_row_count')->default(0);
++            $table->text('error_message')->nullable();
++            $table->timestamps();
++        });
++    }
++
++    public function down(): void
++    {
++        Schema::dropIfExists('catalog_audit_runs');
++    }
++};
+diff --git a/database/migrations/2026_07_18_200100_create_catalog_audit_findings_table.php b/database/migrations/2026_07_18_200100_create_catalog_audit_findings_table.php
+new file mode 100644
+index 0000000..704cf2c
+--- /dev/null
++++ b/database/migrations/2026_07_18_200100_create_catalog_audit_findings_table.php
+@@ -0,0 +1,43 @@
++<?php
++
++use Illuminate\Database\Migrations\Migration;
++use Illuminate\Database\Schema\Blueprint;
++use Illuminate\Support\Facades\Schema;
++
++return new class extends Migration
++{
++    public function up(): void
++    {
++        Schema::create('catalog_audit_findings', function (Blueprint $table) {
++            $table->id();
++            $table->foreignId('shop_id')->constrained('shops')->cascadeOnDelete();
++            $table->foreignId('last_seen_run_id')->constrained('catalog_audit_runs')->restrictOnDelete();
++            $table->string('finding_type', 30)->index();
++            $table->string('fingerprint');
++            $table->string('product_gid');
++            $table->unsignedBigInteger('product_legacy_id')->nullable();
++            $table->string('product_title')->nullable();
++            $table->string('product_handle')->nullable();
++            $table->string('product_status')->nullable();
++            $table->string('variant_gid')->nullable();
++            $table->unsignedBigInteger('variant_legacy_id')->nullable();
++            $table->string('variant_title')->nullable();
++            $table->string('sku')->nullable();
++            $table->string('normalized_sku')->nullable();
++            $table->string('shopify_admin_url')->nullable();
++            $table->timestamp('last_seen_at')->nullable();
++            $table->timestamps();
++
++            $table->unique(
++                ['shop_id', 'finding_type', 'fingerprint'],
++                'catalog_audit_finding_identity_unique'
++            );
++            $table->index(['shop_id', 'finding_type', 'normalized_sku']);
++        });
++    }
++
++    public function down(): void
++    {
++        Schema::dropIfExists('catalog_audit_findings');
++    }
++};
+diff --git a/app/Models/CatalogAuditRun.php b/app/Models/CatalogAuditRun.php
+new file mode 100644
+index 0000000..8e28cc5
+--- /dev/null
++++ b/app/Models/CatalogAuditRun.php
+@@ -0,0 +1,42 @@
++<?php
++
++namespace App\Models;
++
++use Illuminate\Database\Eloquent\Factories\HasFactory;
++use Illuminate\Database\Eloquent\Model;
++
++class CatalogAuditRun extends Model
++{
++    use HasFactory;
++
++    public const STATUS_QUEUED = 'queued';
++    public const STATUS_RUNNING = 'running';
++    public const STATUS_COMPLETED = 'completed';
++    public const STATUS_FAILED = 'failed';
++
++    protected $fillable = [
++        'shop_id',
++        'status',
++        'started_at',
++        'finished_at',
++        'missing_image_count',
++        'duplicate_sku_group_count',
++        'duplicate_sku_row_count',
++        'error_message',
++    ];
++
++    protected $casts = [
++        'started_at' => 'datetime',
++        'finished_at' => 'datetime',
++    ];
++
++    public function shop()
++    {
++        return $this->belongsTo(Shop::class);
++    }
++
++    public function findings()
++    {
++        return $this->hasMany(CatalogAuditFinding::class, 'last_seen_run_id');
++    }
++}
+diff --git a/app/Models/CatalogAuditFinding.php b/app/Models/CatalogAuditFinding.php
+new file mode 100644
+index 0000000..8b15f3d
+--- /dev/null
++++ b/app/Models/CatalogAuditFinding.php
+@@ -0,0 +1,47 @@
++<?php
++
++namespace App\Models;
++
++use Illuminate\Database\Eloquent\Factories\HasFactory;
++use Illuminate\Database\Eloquent\Model;
++
++class CatalogAuditFinding extends Model
++{
++    use HasFactory;
++
++    public const TYPE_MISSING_IMAGE = 'missing_image';
++    public const TYPE_DUPLICATE_SKU = 'duplicate_sku';
++
++    protected $fillable = [
++        'shop_id',
++        'last_seen_run_id',
++        'finding_type',
++        'fingerprint',
++        'product_gid',
++        'product_legacy_id',
++        'product_title',
++        'product_handle',
++        'product_status',
++        'variant_gid',
++        'variant_legacy_id',
++        'variant_title',
++        'sku',
++        'normalized_sku',
++        'shopify_admin_url',
++        'last_seen_at',
++    ];
++
++    protected $casts = [
++        'last_seen_at' => 'datetime',
++    ];
++
++    public function shop()
++    {
++        return $this->belongsTo(Shop::class);
++    }
++
++    public function lastSeenRun()
++    {
++        return $this->belongsTo(CatalogAuditRun::class, 'last_seen_run_id');
++    }
++}
+diff --git a/config/catalog_audit.php b/config/catalog_audit.php
+new file mode 100644
+index 0000000..359e6f9
+--- /dev/null
++++ b/config/catalog_audit.php
+@@ -0,0 +1,14 @@
++<?php
++
++return [
++    'shops' => [
++        'eiluminat' => 'eiluminat.myshopify.com',
++        'lustreled' => 'lustreled.myshopify.com',
++        'powerleds' => 'powerleds-ro.myshopify.com',
++        'industrial' => 'iluminat-industrial.myshopify.com',
++        'bulgaria' => 'eiluminat-bg.myshopify.com',
++    ],
++    'queue' => 'bulk_ops',
++    'timeout_seconds' => 1200,
++    'poll_seconds' => 5,
++];
+diff --git a/tests/Unit/CatalogAuditSchemaContractTest.php b/tests/Unit/CatalogAuditSchemaContractTest.php
+new file mode 100644
+index 0000000..ceb7ffe
+--- /dev/null
++++ b/tests/Unit/CatalogAuditSchemaContractTest.php
+@@ -0,0 +1,132 @@
++<?php
++
++namespace Tests\Unit;
++
++use App\Models\CatalogAuditFinding;
++use App\Models\CatalogAuditRun;
++use Illuminate\Support\Facades\Config;
++use Tests\TestCase;
++
++class CatalogAuditSchemaContractTest extends TestCase
++{
++    public function test_catalog_audit_run_migration_contains_the_required_schema_contract(): void
++    {
++        $migration = file_get_contents(
++            base_path('database/migrations/2026_07_18_200000_create_catalog_audit_runs_table.php')
++        );
++
++        $this->assertNotFalse($migration);
++        $this->assertStringContainsString("Schema::create('catalog_audit_runs'", $migration);
++        $this->assertStringContainsString("foreignId('shop_id')->constrained('shops')->cascadeOnDelete()", $migration);
++        $this->assertStringContainsString("string('status', 20)->index()", $migration);
++        $this->assertStringContainsString("timestamp('started_at')->nullable()", $migration);
++        $this->assertStringContainsString("timestamp('finished_at')->nullable()", $migration);
++        $this->assertStringContainsString("unsignedInteger('missing_image_count')->default(0)", $migration);
++        $this->assertStringContainsString("unsignedInteger('duplicate_sku_group_count')->default(0)", $migration);
++        $this->assertStringContainsString("unsignedInteger('duplicate_sku_row_count')->default(0)", $migration);
++        $this->assertStringContainsString("text('error_message')->nullable()", $migration);
++    }
++
++    public function test_catalog_audit_finding_migration_contains_identity_and_metadata_fields(): void
++    {
++        $migration = file_get_contents(
++            base_path('database/migrations/2026_07_18_200100_create_catalog_audit_findings_table.php')
++        );
++
++        $this->assertNotFalse($migration);
++        $this->assertStringContainsString("Schema::create('catalog_audit_findings'", $migration);
++        $this->assertStringContainsString("foreignId('shop_id')->constrained('shops')->cascadeOnDelete()", $migration);
++        $this->assertStringContainsString("foreignId('last_seen_run_id')->constrained('catalog_audit_runs')->restrictOnDelete()", $migration);
++        $this->assertStringNotContainsString(
++            "foreignId('last_seen_run_id')->constrained('catalog_audit_runs')->cascadeOnDelete()",
++            $migration
++        );
++
++        foreach ([
++            "string('finding_type', 30)",
++            "string('fingerprint')",
++            "string('product_gid')",
++            "unsignedBigInteger('product_legacy_id')->nullable()",
++            "string('product_title')->nullable()",
++            "string('product_handle')->nullable()",
++            "string('product_status')->nullable()",
++            "string('variant_gid')->nullable()",
++            "unsignedBigInteger('variant_legacy_id')->nullable()",
++            "string('variant_title')->nullable()",
++            "string('sku')->nullable()",
++            "string('normalized_sku')->nullable()",
++            "string('shopify_admin_url')->nullable()",
++            "timestamp('last_seen_at')->nullable()",
++        ] as $field) {
++            $this->assertStringContainsString($field, $migration);
++        }
++
++        $this->assertStringContainsString("['shop_id', 'finding_type', 'fingerprint']", $migration);
++        $this->assertStringContainsString("'catalog_audit_finding_identity_unique'", $migration);
++        $this->assertStringContainsString(
++            "['shop_id', 'finding_type', 'normalized_sku']",
++            $migration
++        );
++    }
++
++    public function test_models_expose_the_required_constants_fillable_fields_and_casts(): void
++    {
++        $this->assertSame('queued', CatalogAuditRun::STATUS_QUEUED);
++        $this->assertSame('running', CatalogAuditRun::STATUS_RUNNING);
++        $this->assertSame('completed', CatalogAuditRun::STATUS_COMPLETED);
++        $this->assertSame('failed', CatalogAuditRun::STATUS_FAILED);
++
++        $this->assertSame('missing_image', CatalogAuditFinding::TYPE_MISSING_IMAGE);
++        $this->assertSame('duplicate_sku', CatalogAuditFinding::TYPE_DUPLICATE_SKU);
++
++        $run = new CatalogAuditRun();
++        $this->assertSame([
++            'shop_id',
++            'status',
++            'started_at',
++            'finished_at',
++            'missing_image_count',
++            'duplicate_sku_group_count',
++            'duplicate_sku_row_count',
++            'error_message',
++        ], $run->getFillable());
++        $this->assertSame('datetime', $run->getCasts()['started_at']);
++        $this->assertSame('datetime', $run->getCasts()['finished_at']);
++
++        $finding = new CatalogAuditFinding();
++        $this->assertSame([
++            'shop_id',
++            'last_seen_run_id',
++            'finding_type',
++            'fingerprint',
++            'product_gid',
++            'product_legacy_id',
++            'product_title',
++            'product_handle',
++            'product_status',
++            'variant_gid',
++            'variant_legacy_id',
++            'variant_title',
++            'sku',
++            'normalized_sku',
++            'shopify_admin_url',
++            'last_seen_at',
++        ], $finding->getFillable());
++        $this->assertSame('datetime', $finding->getCasts()['last_seen_at']);
++    }
++
++    public function test_catalog_audit_config_has_the_approved_ordered_shops_and_runtime_limits(): void
++    {
++        $this->assertSame([
++            'eiluminat' => 'eiluminat.myshopify.com',
++            'lustreled' => 'lustreled.myshopify.com',
++            'powerleds' => 'powerleds-ro.myshopify.com',
++            'industrial' => 'iluminat-industrial.myshopify.com',
++            'bulgaria' => 'eiluminat-bg.myshopify.com',
++        ], Config::get('catalog_audit.shops'));
++        $this->assertSame('bulk_ops', Config::get('catalog_audit.queue'));
++        $this->assertSame(1200, Config::get('catalog_audit.timeout_seconds'));
++        $this->assertSame(5, Config::get('catalog_audit.poll_seconds'));
++        $this->assertNotContains('eiluminatbackup.myshopify.com', Config::get('catalog_audit.shops'));
++    }
++}

@@ -97,12 +97,15 @@ class BemShopifyStagedUploadService
             ];
         }
 
-        $mediaIds = $this->fetchProductMediaIds($target, $productGid);
-        $this->replaceMedia($target, $productGid, $mediaIds, $mediaInputs);
+        $existingMediaIds = $this->fetchProductImageMediaIds($target, $productGid);
+        $createdMedia = $this->createMedia($target, $productGid, $mediaInputs);
+        $createdMediaIds = $this->createdMediaIds($createdMedia, count($uploadable));
+        $shopifyImages = $this->waitForReadyProductMedia($target, $productGid, $createdMediaIds);
+        $this->deleteProductMedia($target, $productGid, $existingMediaIds);
 
-        $shopifyImages = $this->waitForProductImages($target, $productGid, count($uploadable));
         foreach ($uploadable as $index => $image) {
             $shopifyImage = $shopifyImages[$index] ?? null;
+            $uploadable[$index]['media_id'] = $createdMediaIds[$index];
             if (!empty($shopifyImage['url'])) {
                 $uploadable[$index]['watermarked_url'] = $shopifyImage['url'];
             }
@@ -164,12 +167,15 @@ class BemShopifyStagedUploadService
                 ];
             }
 
-            $mediaIds = $this->fetchProductMediaIds($target, $productGid);
-            $this->replaceMedia($target, $productGid, $mediaIds, $mediaInputs);
+            $existingMediaIds = $this->fetchProductImageMediaIds($target, $productGid);
+            $createdMedia = $this->createMedia($target, $productGid, $mediaInputs);
+            $createdMediaIds = $this->createdMediaIds($createdMedia, count($images));
+            $shopifyImages = $this->waitForReadyProductMedia($target, $productGid, $createdMediaIds);
+            $this->deleteProductMedia($target, $productGid, $existingMediaIds);
 
-            $shopifyImages = $this->waitForProductImages($target, $productGid, count($images));
             foreach ($images as $index => $image) {
                 $shopifyImage = $shopifyImages[$index] ?? null;
+                $images[$index]['media_id'] = $createdMediaIds[$index];
                 if (!empty($shopifyImage['url'])) {
                     $images[$index]['uploaded_url'] = $shopifyImage['url'];
                 }
@@ -232,7 +238,12 @@ class BemShopifyStagedUploadService
             ];
         }
 
-        $this->createMedia($target, $productGid, $mediaInputs);
+        $createdMedia = $this->createMedia($target, $productGid, $mediaInputs);
+        $createdMediaIds = $this->createdMediaIds($createdMedia, count($uploadable));
+
+        foreach ($uploadable as $index => $image) {
+            $uploadable[$index]['media_id'] = $createdMediaIds[$index];
+        }
 
         return $uploadable;
     }
@@ -473,7 +484,8 @@ class BemShopifyStagedUploadService
         }
     }
 
-    private function createMedia(Shop $target, string $productGid, array $mediaInputs): void
+    /** @return array<int, array{id: string|null, status: string|null}> */
+    private function createMedia(Shop $target, string $productGid, array $mediaInputs): array
     {
         $mutation = <<<'GQL'
         mutation BemAppendProductImages($productId: ID!, $media: [CreateMediaInput!]!) {
@@ -489,10 +501,30 @@ class BemShopifyStagedUploadService
             'media' => $mediaInputs,
         ]);
 
+        $createdMedia = array_values($response['data']['productCreateMedia']['media'] ?? []);
         $errors = $response['data']['productCreateMedia']['mediaUserErrors'] ?? [];
         if (!empty($errors)) {
+            $partialMediaIds = array_values(array_filter(array_map(
+                static fn (array $media): ?string => $media['id'] ?? null,
+                $createdMedia
+            )));
+
+            if ($partialMediaIds) {
+                try {
+                    $this->deleteProductMedia($target, $productGid, $partialMediaIds);
+                } catch (\Throwable $cleanupError) {
+                    throw new \RuntimeException(
+                        'BEM append product images userErrors and partial media cleanup failed: '
+                        .json_encode($errors).'; cleanup: '.$cleanupError->getMessage(),
+                        previous: $cleanupError
+                    );
+                }
+            }
+
             throw new \RuntimeException('BEM append product images userErrors: '.json_encode($errors));
         }
+
+        return $createdMedia;
     }
 
     private function replaceMedia(Shop $target, string $productGid, array $mediaIds, array $mediaInputs): void
@@ -595,48 +627,78 @@ class BemShopifyStagedUploadService
     }
 
     /**
-     * @return array<int, array{url: string|null, id: string|null}>
+     * @param array<int, string> $mediaIds
+     * @return array<int, array{url: string|null, id: string|null, status: string|null}>
      */
-    private function waitForProductImages(Shop $target, string $productGid, int $expectedCount): array
+    public function waitForReadyProductMedia(Shop $target, string $productGid, array $mediaIds): array
     {
-        $images = [];
+        $mediaIds = array_values(array_unique(array_filter(array_map('strval', $mediaIds))));
+        if (empty($mediaIds)) {
+            throw new \RuntimeException('BEM appended media IDs are missing');
+        }
 
+        $imagesById = [];
         $maxAttempts = 30;
 
         for ($attempt = 1; $attempt <= $maxAttempts; $attempt++) {
-            $images = $this->fetchProductMediaImages($target, $productGid);
-            $ready = count($images) >= $expectedCount;
+            $imagesById = [];
+            foreach ($this->fetchProductMediaImages($target, $productGid) as $image) {
+                if (!empty($image['id'])) {
+                    $imagesById[(string) $image['id']] = $image;
+                }
+            }
 
-            foreach (array_slice($images, 0, $expectedCount) as $image) {
-                if (($image['status'] ?? null) === 'FAILED' || empty($image['url'])) {
+            $ready = true;
+            foreach ($mediaIds as $mediaId) {
+                $image = $imagesById[$mediaId] ?? null;
+                if (($image['status'] ?? null) === 'FAILED') {
+                    throw new \RuntimeException('BEM appended media failed for '.$mediaId);
+                }
+
+                if (($image['status'] ?? null) !== 'READY' || empty($image['url'])) {
                     $ready = false;
-                    break;
                 }
             }
 
             if ($ready) {
-                return $images;
+                return array_map(
+                    static fn (string $mediaId): array => $imagesById[$mediaId],
+                    $mediaIds
+                );
             }
 
             usleep(500000);
         }
 
-        Log::warning('BEM product images were not ready after media replace wait', [
+        Log::warning('BEM appended product images were not ready; existing media kept', [
             'target_shop' => $target->domain,
             'product_gid' => $productGid,
-            'expected_count' => $expectedCount,
-            'actual_count' => count($images),
-            'ready_urls' => count(array_filter(
-                array_slice($images, 0, $expectedCount),
-                static fn ($image) => !empty($image['url'])
-            )),
+            'expected_media_ids' => $mediaIds,
             'statuses' => array_values(array_map(
-                static fn ($image) => $image['status'] ?? null,
-                array_slice($images, 0, $expectedCount)
+                static fn (string $mediaId) => $imagesById[$mediaId]['status'] ?? null,
+                $mediaIds
             )),
         ]);
 
-        return $images;
+        throw new \RuntimeException('BEM appended media readiness timeout; existing media kept');
+    }
+
+    /**
+     * @param array<int, array{id?: string|null}> $createdMedia
+     * @return array<int, string>
+     */
+    private function createdMediaIds(array $createdMedia, int $expectedCount): array
+    {
+        $mediaIds = array_values(array_filter(array_map(
+            static fn (array $media): ?string => !empty($media['id']) ? (string) $media['id'] : null,
+            $createdMedia
+        )));
+
+        if (count($mediaIds) !== $expectedCount || count(array_unique($mediaIds)) !== $expectedCount) {
+            throw new \RuntimeException('BEM appended media ID count mismatch');
+        }
+
+        return $mediaIds;
     }
 
     private function filenameFromUrl(string $url): ?string
