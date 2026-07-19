@@ -2,8 +2,8 @@
 
 namespace Tests\Unit;
 
-use App\Jobs\ReplicateProductUpdateToShop;
 use App\Jobs\ReplicateProductCreateToShop;
+use App\Jobs\ReplicateProductUpdateToShop;
 use App\Services\Shopify\LegacyParentVariantBootstrapPolicy;
 use App\Services\Shopify\ShopifyParentIdentityResolver;
 use Illuminate\Queue\Middleware\WithoutOverlapping;
@@ -76,6 +76,37 @@ class ReplicateProductUpdateIdentityContractTest extends TestCase
         $this->assertStringContainsString("'status' => 'not_needed'", $source);
     }
 
+    public function test_legacy_bootstrap_has_no_mutable_identity_fallback_and_bg_exits_first(): void
+    {
+        $bootstrap = $this->methodSource('bootstrapLegacyVariantIdentity');
+        $handle = $this->methodSource('handle');
+
+        foreach (['sku', 'title', 'handle', 'options_key', 'position', 'price'] as $forbidden) {
+            $this->assertStringNotContainsString($forbidden, strtolower($bootstrap));
+        }
+
+        $bgExit = strpos($handle, 'eiluminat-bg.myshopify.com');
+        $strictSync = strpos($handle, '$this->syncVariantsStrict(');
+
+        $this->assertNotFalse($bgExit);
+        $this->assertNotFalse($strictSync);
+        $this->assertLessThan($strictSync, $bgExit);
+    }
+
+    public function test_unsafe_bootstrap_returns_before_shopify_mutations(): void
+    {
+        $source = $this->methodSource('bootstrapLegacyVariantIdentity');
+        $unsafe = strpos($source, '$decision[\'status\'] === \'unsafe\'');
+        $setMetafield = strpos($source, '$this->setParentVariantMetafield(');
+        $productSet = strpos($source, '$this->productSetVariantStructure(');
+
+        $this->assertNotFalse($unsafe);
+        $this->assertNotFalse($setMetafield);
+        $this->assertNotFalse($productSet);
+        $this->assertLessThan($setMetafield, $unsafe);
+        $this->assertLessThan($productSet, $unsafe);
+    }
+
     public function test_update_job_contains_no_product_handle_or_sku_fallback_methods(): void
     {
         $source = file_get_contents(app_path('Jobs/ReplicateProductUpdateToShop.php'));
@@ -130,7 +161,7 @@ class ReplicateProductUpdateIdentityContractTest extends TestCase
         $this->assertStringContainsString("'metafields'", $source);
         $this->assertStringContainsString("'key' => 'parentvariant'", $source);
         $this->assertStringContainsString("'value' => (string) \$sourceId", $source);
-        $this->assertStringContainsString("metafield(namespace: \"custom\", key: \"parentvariant\")", $source);
+        $this->assertStringContainsString('metafield(namespace: "custom", key: "parentvariant")', $source);
         $this->assertStringContainsString("\$node['metafield']['value']", $source);
     }
 
