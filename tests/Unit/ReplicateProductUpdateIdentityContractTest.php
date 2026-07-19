@@ -52,12 +52,41 @@ class ReplicateProductUpdateIdentityContractTest extends TestCase
     public function test_legacy_structure_bootstrap_uses_product_set_without_retained_variant_gid(): void
     {
         $source = $this->methodSource('bootstrapLegacyVariantIdentity');
+        $attachBranch = strpos($source, '$decision[\'action\'] === \'attach_single\'');
+        $replacementBranch = strpos($source, '$decision[\'action\'] === \'replace_structure\'');
+        $attachSetMetafield = strpos($source, '$this->setParentVariantMetafield(');
+        $attachVerifiedState = strpos($source, '$identityResolver->targetVariantState(');
+        $attachPostcondition = strpos($source, '$this->assertBootstrapIdentityState(');
+        $attachReplaceMirrors = strpos($source, '$this->replaceVariantMirrorsFromVerifiedState(');
+        $replacementProductSet = strpos($source, '$this->productSetVariantStructure(');
+        $replacementVerifiedState = strrpos($source, '$identityResolver->targetVariantState(');
+        $replacementPostcondition = strrpos($source, '$this->assertBootstrapIdentityState(');
+        $replacementReplaceMirrors = strrpos($source, '$this->replaceVariantMirrorsFromVerifiedState(');
 
         $this->assertStringContainsString("'replace_structure'", $source);
         $this->assertStringContainsString('$this->productSetVariantStructure(', $source);
         $this->assertStringContainsString('allowCompatibleOptionStructure: true', $source);
         $this->assertStringContainsString('$this->assertBootstrapIdentityState(', $source);
         $this->assertStringContainsString('$this->replaceVariantMirrorsFromVerifiedState(', $source);
+        $this->assertNotFalse($attachBranch);
+        $this->assertNotFalse($replacementBranch);
+        $this->assertNotFalse($attachSetMetafield);
+        $this->assertNotFalse($attachVerifiedState);
+        $this->assertNotFalse($attachPostcondition);
+        $this->assertNotFalse($attachReplaceMirrors);
+        $this->assertNotFalse($replacementProductSet);
+        $this->assertNotFalse($replacementVerifiedState);
+        $this->assertNotFalse($replacementPostcondition);
+        $this->assertNotFalse($replacementReplaceMirrors);
+        $this->assertTrue($attachBranch < $attachSetMetafield);
+        $this->assertTrue($attachSetMetafield < $attachVerifiedState);
+        $this->assertTrue($attachVerifiedState < $attachPostcondition);
+        $this->assertTrue($attachPostcondition < $attachReplaceMirrors);
+        $this->assertTrue($attachReplaceMirrors < $replacementBranch);
+        $this->assertTrue($replacementBranch < $replacementProductSet);
+        $this->assertTrue($replacementProductSet < $replacementVerifiedState);
+        $this->assertTrue($replacementVerifiedState < $replacementPostcondition);
+        $this->assertTrue($replacementPostcondition < $replacementReplaceMirrors);
     }
 
     public function test_product_set_can_be_explicitly_enabled_for_legacy_default_variant_bootstrap(): void
@@ -103,8 +132,8 @@ class ReplicateProductUpdateIdentityContractTest extends TestCase
         $this->assertNotFalse($unsafe);
         $this->assertNotFalse($setMetafield);
         $this->assertNotFalse($productSet);
-        $this->assertLessThan($setMetafield, $unsafe);
-        $this->assertLessThan($productSet, $unsafe);
+        $this->assertTrue($unsafe < $setMetafield);
+        $this->assertTrue($unsafe < $productSet);
     }
 
     public function test_update_job_contains_no_product_handle_or_sku_fallback_methods(): void

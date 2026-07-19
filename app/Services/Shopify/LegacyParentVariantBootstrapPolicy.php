@@ -13,14 +13,14 @@ final class LegacyParentVariantBootstrapPolicy
             return $this->unsafe('legacy_variant_bootstrap_source_payload_invalid');
         }
 
-        if (!empty($targetState['ambiguous_parent_ids'])) {
+        if (! empty($targetState['ambiguous_parent_ids'])) {
             return $this->unsafe('legacy_variant_bootstrap_ambiguous_parentvariant');
         }
 
         $unmanaged = array_values($targetState['unmanaged_gids'] ?? []);
         $managed = $targetState['by_parent_id'] ?? [];
 
-        if (!$unmanaged) {
+        if (! $unmanaged) {
             return ['status' => 'not_needed', 'action' => null, 'reason' => null];
         }
 
