@@ -132,6 +132,12 @@ class ReplicateProductUpdateIdentityContractTest extends TestCase
         $this->assertNotFalse($unsafe);
         $this->assertNotFalse($setMetafield);
         $this->assertNotFalse($productSet);
+        $unsafeBranch = substr($source, $unsafe, min($setMetafield, $productSet) - $unsafe);
+
+        $this->assertMatchesRegularExpression(
+            '/^\$decision\[\'status\'\] === \'unsafe\'\) \{.*?return \[/s',
+            $unsafeBranch
+        );
         $this->assertTrue($unsafe < $setMetafield);
         $this->assertTrue($unsafe < $productSet);
     }
