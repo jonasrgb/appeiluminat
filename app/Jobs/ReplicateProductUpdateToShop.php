@@ -336,7 +336,44 @@ public function handle(
             ];
         }
 
-        // The replace_structure branch is added in Task 3.
+        if ($decision['action'] === 'replace_structure') {
+            $targetOptions = $this->fetchTargetOptions($target, $mirror->target_product_gid);
+
+            $this->productSetVariantStructure(
+                $target,
+                $mirror->target_product_gid,
+                $sourceById,
+                $sourceOptions,
+                $targetOptions,
+                [],
+                allowCompatibleOptionStructure: true
+            );
+
+            $verifiedState = $identityResolver->targetVariantState(
+                $target,
+                $mirror->target_product_gid
+            );
+            $this->assertBootstrapIdentityState($verifiedState, array_keys($sourceById));
+            $this->replaceVariantMirrorsFromVerifiedState(
+                $mirror,
+                $sourceById,
+                $verifiedState
+            );
+
+            Log::notice('Variant identity structure bootstrapped declaratively', [
+                'source_product_id' => $this->sourceProductId,
+                'target_shop' => $target->domain,
+                'target_product_gid' => $mirror->target_product_gid,
+                'source_variant_ids' => array_map('intval', array_keys($sourceById)),
+            ]);
+
+            return [
+                'status' => 'bootstrapped',
+                'target_state' => $verifiedState,
+                'reset_mirrors' => true,
+            ];
+        }
+
         throw new \RuntimeException('Unsupported legacy parentvariant bootstrap action');
     }
 
@@ -783,13 +820,16 @@ public function handle(
         array $sourceById,
         array $sourceOptions,
         array $targetOptions,
-        array $verifiedMirrors
+        array $verifiedMirrors,
+        bool $allowCompatibleOptionStructure = false
     ): array {
         if (!$sourceById || !$sourceOptions) {
             throw new \RuntimeException('productSet structural replacement requires variants and options');
         }
 
-        if ($this->mixedReplacementHasCompatibleOptions($sourceOptions, $targetOptions)) {
+        if (!$allowCompatibleOptionStructure
+            && $this->mixedReplacementHasCompatibleOptions($sourceOptions, $targetOptions)
+        ) {
             throw new \RuntimeException('productSet structural replacement was called for compatible options');
         }
 

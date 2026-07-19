@@ -49,6 +49,33 @@ class ReplicateProductUpdateIdentityContractTest extends TestCase
         $this->assertStringNotContainsString('productVariantsBulkDelete', $source);
     }
 
+    public function test_legacy_structure_bootstrap_uses_product_set_without_retained_variant_gid(): void
+    {
+        $source = $this->methodSource('bootstrapLegacyVariantIdentity');
+
+        $this->assertStringContainsString("'replace_structure'", $source);
+        $this->assertStringContainsString('$this->productSetVariantStructure(', $source);
+        $this->assertStringContainsString('allowCompatibleOptionStructure: true', $source);
+        $this->assertStringContainsString('$this->assertBootstrapIdentityState(', $source);
+        $this->assertStringContainsString('$this->replaceVariantMirrorsFromVerifiedState(', $source);
+    }
+
+    public function test_product_set_can_be_explicitly_enabled_for_legacy_default_variant_bootstrap(): void
+    {
+        $source = $this->methodSource('productSetVariantStructure');
+
+        $this->assertStringContainsString('bool $allowCompatibleOptionStructure = false', $source);
+        $this->assertStringContainsString('!$allowCompatibleOptionStructure', $source);
+    }
+
+    public function test_bootstrap_policy_is_checked_only_when_unmanaged_variants_exist(): void
+    {
+        $source = $this->methodSource('bootstrapLegacyVariantIdentity');
+
+        $this->assertStringContainsString('$decision[\'status\'] === \'not_needed\'', $source);
+        $this->assertStringContainsString("'status' => 'not_needed'", $source);
+    }
+
     public function test_update_job_contains_no_product_handle_or_sku_fallback_methods(): void
     {
         $source = file_get_contents(app_path('Jobs/ReplicateProductUpdateToShop.php'));
