@@ -3,16 +3,19 @@
 namespace App\Jobs;
 
 use App\Models\ProductMirror;
-use App\Models\ProductParentBackfillCandidate;
 use App\Models\VariantMirror;
 use App\Models\Shop;
 use App\Models\SourceProductDeletion;
+use App\Services\Shopify\LegacyParentVariantBootstrapPolicy;
+use App\Services\Shopify\ShopifyParentIdentityResolver;
 use Illuminate\Bus\Queueable;
 use Illuminate\Contracts\Queue\ShouldQueue;
 use Illuminate\Foundation\Bus\Dispatchable;
 use Illuminate\Queue\InteractsWithQueue;
+use Illuminate\Queue\Middleware\WithoutOverlapping;
 use Illuminate\Queue\SerializesModels;
 use Illuminate\Support\Facades\Http;
+use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Log;
 use App\Services\Shopify\BemWatermark\BemWatermarkEligibilityService;
 
@@ -22,6 +25,8 @@ class ReplicateProductUpdateToShop implements ShouldQueue
 
     public $tries = 5;
     public $backoff = [10, 30, 60, 120];
+    public $timeout = 840;
+    public $failOnTimeout = true;
 
     private const META_NAMESPACE = 'custom';
 
@@ -50,7 +55,26 @@ class ReplicateProductUpdateToShop implements ShouldQueue
         public array $payload
     ) {}
 
-public function handle(): void
+    public function middleware(): array
+    {
+        $key = implode(':', [
+            'product-replication-update',
+            $this->sourceShopId,
+            $this->sourceProductId,
+            $this->targetShopId,
+        ]);
+
+        return [
+            (new WithoutOverlapping($key))
+                ->releaseAfter(30)
+                ->expireAfter(900),
+        ];
+    }
+
+public function handle(
+    ShopifyParentIdentityResolver $identityResolver,
+    LegacyParentVariantBootstrapPolicy $bootstrapPolicy
+): void
 {
     if (SourceProductDeletion::existsFor($this->sourceShopId, $this->sourceProductId)) {
         Log::warning('ReplicateProductUpdate skipped: source product was deleted', [
@@ -80,214 +104,57 @@ public function handle(): void
         'source_product_id' => $this->sourceProductId,
     ])->first();
 
-    if (!$mirror || !$mirror->target_product_gid) {
-        // Feature-flagged hook for future auto-bootstrap when mirror is missing
-        if (config('features.mirror_bootstrap.enabled')) {
-            $handle = $this->payload['handle'] ?? null;
-            $skus = [];
-            if (!empty($this->payload['variants']) && is_array($this->payload['variants'])) {
-                foreach ($this->payload['variants'] as $v) {
-                    $sku = $v['sku'] ?? null;
-                    if ($sku !== null && $sku !== '') $skus[] = (string)$sku;
-                }
-            }
-            // Log::notice('Mirror missing: auto-bootstrap feature enabled (dry-run may suppress writes)', [
-            //     'target_shop' => $target->domain,
-            //     'source_shop' => $this->sourceShopId,
-            //     'source_pid'  => $this->sourceProductId,
-            //     'dry_run'     => (bool)config('features.mirror_bootstrap.dry_run'),
-            //     'handle'      => $handle,
-            //     'skus'        => $skus,
-            // ]);
-            // Read-only discovery (handle first, then SKUs). Always logs; no writes in this step.
-            try {
-                $candidate = null;
-                $strategy  = null;
+    $productResolution = $identityResolver->resolveProduct(
+        $target,
+        $this->sourceProductId,
+        $mirror?->target_product_gid
+    );
 
-                $found = $this->searchTargetProductByParentProduct($target, $this->sourceProductId);
-                if (!empty($found['gid'])) {
-                    $candidate = $found;
-                    $strategy = 'parentproduct';
-                } elseif (!empty($found['ambiguous'])) {
-                    Log::warning('Auto-bootstrap: parentproduct search ambiguous or multiple matches', [
-                        'target_shop' => $target->domain,
-                        'source_pid' => $this->sourceProductId,
-                    ]);
-                    $this->sendParentProductBootstrapIssueEmail([
-                        'mode' => 'replicate_product_update',
-                        'issue' => 'ambiguous_parentproduct',
-                        'target_shop_id' => $target->id,
-                        'target_shop' => $target->domain,
-                        'source_shop_id' => $this->sourceShopId,
-                        'source_product_id' => $this->sourceProductId,
-                        'source_title' => $this->payload['title'] ?? null,
-                        'source_handle' => $handle,
-                        'source_skus' => $skus,
-                        'searched' => [
-                            'type' => 'custom.parentproduct',
-                            'value' => $this->sourceProductId,
-                        ],
-                        'candidates' => $found['candidates'] ?? [],
-                    ]);
-                    return;
-                }
+    if ($productResolution['status'] !== 'found') {
+        Log::warning('ReplicateProductUpdate skipped: strict parentproduct mapping unavailable', [
+            'reason' => $productResolution['status'] === 'ambiguous'
+                ? 'ambiguous_parentproduct_mapping'
+                : 'missing_parentproduct_mapping',
+            'source_shop_id' => $this->sourceShopId,
+            'source_product_id' => $this->sourceProductId,
+            'target_shop_id' => $target->id,
+            'target_shop' => $target->domain,
+            'candidate_gids' => array_values(array_filter(array_map(
+                static fn (array $candidate): ?string => $candidate['id'] ?? null,
+                $productResolution['candidates'] ?? []
+            ))),
+        ]);
 
-                if (!$candidate && $handle) {
-                    $found = $this->searchTargetProductByHandle($target, $handle);
-                    if (!empty($found['gid'])) {
-                        $candidate = $found;
-                        $strategy  = 'handle';
-                    } elseif (!empty($found['ambiguous'])) {
-                        Log::warning('Auto-bootstrap: handle search ambiguous or multiple matches', [
-                            'target_shop' => $target->domain,
-                            'handle'      => $handle,
-                        ]);
-                        $this->sendParentProductBootstrapIssueEmail([
-                            'mode' => 'replicate_product_update',
-                            'issue' => 'ambiguous_handle',
-                            'target_shop_id' => $target->id,
-                            'target_shop' => $target->domain,
-                            'source_shop_id' => $this->sourceShopId,
-                            'source_product_id' => $this->sourceProductId,
-                            'source_title' => $this->payload['title'] ?? null,
-                            'source_handle' => $handle,
-                            'source_skus' => $skus,
-                            'searched' => [
-                                'type' => 'handle',
-                                'value' => $handle,
-                            ],
-                            'candidates' => $found['candidates'] ?? [],
-                        ]);
-                    } else {
-                    Log::info('Auto-bootstrap: no product found by handle', [
-                        'target_shop' => $target->domain,
-                        'source_pid'  => $this->sourceProductId,
-                        'handle'      => $handle,
-                    ]);
-                    }
-                }
+        return;
+    }
 
-                if (!$candidate && !empty($skus)) {
-                    $found = $this->searchTargetProductBySkus($target, $skus);
-                    if (!empty($found['gid'])) {
-                        $candidate = $found;
-                        $strategy  = 'sku';
-                    } elseif (!empty($found['ambiguous'])) {
-                        Log::warning('Auto-bootstrap: SKU search ambiguous or multiple products matched', [
-                            'target_shop' => $target->domain,
-                            'skus'        => $skus,
-                        ]);
-                        $this->sendParentProductBootstrapIssueEmail([
-                            'mode' => 'replicate_product_update',
-                            'issue' => 'ambiguous_sku',
-                            'target_shop_id' => $target->id,
-                            'target_shop' => $target->domain,
-                            'source_shop_id' => $this->sourceShopId,
-                            'source_product_id' => $this->sourceProductId,
-                            'source_title' => $this->payload['title'] ?? null,
-                            'source_handle' => $handle,
-                            'source_skus' => $skus,
-                            'searched' => [
-                                'type' => 'sku',
-                                'value' => $skus,
-                            ],
-                            'candidates' => $found['candidates'] ?? [],
-                        ]);
-                    } else {
-                    Log::info('Auto-bootstrap: no product found by SKUs', [
-                        'target_shop' => $target->domain,
-                        'source_pid'  => $this->sourceProductId,
-                        'skus'        => $skus,
-                    ]);
-                    }
-                }
+    $resolvedProduct = $productResolution['product'];
+    $mirror = ProductMirror::updateOrCreate(
+        [
+            'source_shop_id' => $this->sourceShopId,
+            'target_shop_id' => $this->targetShopId,
+            'source_product_id' => $this->sourceProductId,
+        ],
+        [
+            'source_product_gid' => 'gid://shopify/Product/'.$this->sourceProductId,
+            'target_product_gid' => $resolvedProduct['id'],
+            'target_product_id' => (int) (
+                $resolvedProduct['legacyResourceId']
+                ?? $this->numericIdFromGid($resolvedProduct['id'])
+                ?? 0
+            ),
+        ]
+    );
 
-                if ($candidate) {
-                    Log::notice('Auto-bootstrap DRY-RUN candidate found', [
-                        'target_shop' => $target->domain,
-                        'strategy'    => $strategy,
-                        'product_gid' => $candidate['gid'] ?? null,
-                        'handle'      => $candidate['handle'] ?? null,
-                        'title'       => $candidate['title'] ?? null,
-                    ]);
-                } else {
-                    Log::notice('Auto-bootstrap DRY-RUN: no suitable candidate found', [
-                        'target_shop' => $target->domain,
-                        'handle'      => $handle,
-                        'skus'        => $skus,
-                    ]);
-                    Log::warning('Auto-bootstrap skipped: no candidate found', [
-                        'target_shop' => $target->domain,
-                        'source_pid'  => $this->sourceProductId,
-                        'handle'      => $handle,
-                        'skus'        => $skus,
-                    ]);
-                }
-            } catch (\Throwable $e) {
-                Log::error('Auto-bootstrap discovery failed', [
-                    'target_shop' => $target->domain,
-                    'error'       => $e->getMessage(),
-                ]);
-            }
-            if ((bool)config('features.mirror_bootstrap.dry_run')) {
-                Log::info('Auto-bootstrap DRY-RUN: skipping DB writes and updates', [
-                    'target_shop' => $target->domain,
-                ]);
-                return;
-            }
-
-            if (empty($candidate['gid'] ?? null)) {
-                Log::warning('Auto-bootstrap skipped: no candidate found (no writes)', [
-                    'target_shop' => $target->domain,
-                    'source_pid'  => $this->sourceProductId,
-                    'handle'      => $handle,
-                    'skus'        => $skus,
-                ]);
-                return;
-            }
-
-            try {
-                $pm = ProductMirror::updateOrCreate(
-                    [
-                        'source_shop_id'    => $this->sourceShopId,
-                        'target_shop_id'    => $this->targetShopId,
-                        'source_product_id' => $this->sourceProductId,
-                    ],
-                    [
-                        'source_product_gid' => 'gid://shopify/Product/' . $this->sourceProductId,
-                        'target_product_gid' => $candidate['gid'],
-                        'target_product_id'  => (int)($this->numericIdFromGid($candidate['gid']) ?? 0),
-                    ]
-                );
-
-                $pm->last_snapshot = $this->normalizeProductSnapshot($this->payload);
-                $pm->save();
-
-                $opt  = $this->normalizeOptionsFromPayload($this->payload);
-                $vars = $this->normalizeSourceVariants($this->payload, $opt);
-                $this->ensureVariantMirrors($pm, $target, $opt, $vars);
-
-                Log::notice('Auto-bootstrap mapping created', [
-                    'target_shop' => $target->domain,
-                    'target_gid'  => $candidate['gid'],
-                ]);
-
-                $mirror = $pm;
-            } catch (\Throwable $e) {
-                Log::error('Auto-bootstrap mapping failed', [
-                    'target_shop' => $target->domain,
-                    'error'       => $e->getMessage(),
-                ]);
-                return;
-            }
-        } else {
-            Log::warning('Update skipped: no product mirror mapping', [
-                'target_shop' => $target->domain,
-                'source_shop' => $this->sourceShopId,
-                'source_pid'  => $this->sourceProductId,
-            ]);
-            return;
-        }
+    $source = Shop::find($this->sourceShopId);
+    if (!$this->syncVariantsStrict(
+        $identityResolver,
+        $bootstrapPolicy,
+        $mirror,
+        $target,
+        $source
+    )) {
+        return;
     }
 
     $updateSucceeded = false;
@@ -350,395 +217,6 @@ public function handle(): void
             // ]);
         }
 
-        // === 2.1) Dacă target are "Default Title", creăm schema de opțiuni (fără variante) ===
-        $desiredOptions = $this->buildOptionCreateInputsFromPayload($this->payload);
-        if (!empty($desiredOptions)) {
-            $targetOptions = $this->fetchTargetOptions($target, $mirror->target_product_gid);
-
-            $hasOnlyDefaultTitle = false;
-            if (count($targetOptions) === 1) {
-                $only = $targetOptions[0];
-                $name = strtolower($only['name'] ?? '');
-                $vals = array_map('strval', $only['values'] ?? []);
-                $hasOnlyDefaultTitle = ($name === 'title') || ($vals === ['Default Title']);
-            }
-
-            if ($hasOnlyDefaultTitle) {
-                Log::info('Options changed → creating on target', [
-                    'target_shop' => $target->domain,
-                    'names' => array_map(fn($o) => $o['name'] ?? null, $desiredOptions),
-                ]);
-                $this->productOptionsCreate(
-                    shop: $target,
-                    productGid: $mirror->target_product_gid,
-                    options: $desiredOptions,
-                    variantStrategy: 'LEAVE_AS_IS'
-                );
-            } else {
-                Log::info('Options exist on target → applying set (rename/reorder/add/remove)', [
-                    'target_shop' => $target->domain,
-                    'names' => array_map(fn($o) => $o['name'] ?? null, $desiredOptions),
-                ]);
-                // Încercăm schema nouă productOptionsSet; dacă nu există în versiunea de API, logăm și continuăm fără a arunca.
-                try {
-                    $this->productOptionsSet(
-                        shop: $target,
-                        productGid: $mirror->target_product_gid,
-                        options: $desiredOptions,
-                        variantStrategy: 'LEAVE_AS_IS'
-                    );
-                } catch (\Throwable $e) {
-                    Log::warning('productOptionsSet unavailable or failed; attempting REST fallback', [
-                        'target_shop' => $target->domain,
-                        'error' => $e->getMessage(),
-                    ]);
-                    $fallback = $this->productOptionsRestUpdate(
-                        shop: $target,
-                        productGid: $mirror->target_product_gid,
-                        options: $desiredOptions
-                    );
-                    if ($fallback) {
-                        Log::notice('Product options updated via REST fallback', [
-                            'target_shop' => $target->domain,
-                            'names' => array_map(fn($o) => $o['name'] ?? null, $desiredOptions),
-                        ]);
-                    } else {
-                        Log::error('Product options REST fallback failed; target schema unchanged', [
-                            'target_shop' => $target->domain,
-                        ]);
-                    }
-                }
-            }
-        }
-
-        // === 3) Variants: map + bulk economic + SKU/barcode (productSet) + inventory ===
-        $srcOptions   = $this->normalizeOptionsFromPayload($this->payload);
-        $srcVariants  = $this->normalizeSourceVariants($this->payload, $srcOptions);
-        $isDefaultProduct = $this->isDefaultProduct($srcOptions);
-
-        // Încearcă să recuperezi starea reală "tracked" din shop-ul sursă (pentru a replica Track quantity)
-        $source = Shop::find($this->sourceShopId);
-        $sourceTrackedByKey = [];
-        if ($source) {
-            try {
-                $sourceProductGid = 'gid://shopify/Product/' . $this->sourceProductId;
-                $sourceTrackedByKey = $this->fetchTrackedMapByKey(
-                    $source,
-                    $sourceProductGid,
-                    array_map(fn($o) => $o['name'], $srcOptions)
-                );
-            } catch (\Throwable $e) {
-                Log::warning('Source tracked fetch failed; using payload fallback', [
-                    'source_shop' => $source?->domain,
-                    'error' => $e->getMessage(),
-                ]);
-            }
-        }
-
-        // 3.0) Asigură maparea VariantMirror (prima rulare)
-        $this->ensureVariantMirrors($mirror, $target, $srcOptions, $srcVariants);
-
-        // 3.0.a) Recalculează difful acum că mirror-ul e sincronizat
-        $variantDiff = $this->computeVariantDiff($this->payload, $mirror, $srcOptions);
-        Log::info('Variant diff recalculated', [
-            'toCreate' => array_keys($variantDiff['toCreate']),
-            'toUpdate' => array_keys($variantDiff['toUpdate']),
-            'toDelete' => array_keys($variantDiff['toDelete']),
-        ]);
-
-        // 3.0.1) Șterge variantele care nu mai există în sursă (toDelete)
-        if (!empty($variantDiff['toDelete'])) {
-            foreach ($variantDiff['toDelete'] as $rawKey => $vmDel) {
-                try {
-                    $gid = $vmDel->target_variant_gid ?? null;
-                    if (!$gid) continue;
-                    $this->productVariantDelete($target, $gid);
-                    // Curăță mirror-ul
-                    $vmDel->delete();
-                    Log::info('Variant deleted on target', [
-                        'target_shop' => $target->domain,
-                        'key'         => $this->canonKey($rawKey),
-                        'variant_gid' => $gid,
-                    ]);
-                } catch (\Throwable $e) {
-                    Log::error('Variant delete failed', [
-                        'target_shop' => $target->domain,
-                        'key'         => $rawKey,
-                        'error'       => $e->getMessage(),
-                    ]);
-                }
-            }
-        }
-
-    // 3.0.2) Creează variante lipsă în target (toCreate) – folosind productVariantsBulkCreate (compatibil cu 2025-01)
-    if (!empty($variantDiff['toCreate'])) {
-        if ($isDefaultProduct) {
-            // Guard pentru produse cu varianta implicită "Default Title":
-            // nu încercăm create (Shopify nu permite a doua variantă fără opțiuni),
-            // ci facem bootstrap mapping către varianta existentă și forțăm update-urile ulterior.
-            try {
-                $optionNames = array_map(fn($o) => $o['name'], $srcOptions);
-                $targetMap = $this->fetchTargetVariantsMap($target, $mirror->target_product_gid, $optionNames);
-
-                foreach ($variantDiff['toCreate'] as $rawKey => $sv) {
-                    $ckey = $this->canonKey($rawKey);
-                    $existingGid = $targetMap[$ckey] ?? null;
-                    if (!$existingGid) {
-                        Log::warning('Default-variant guard: no target variant gid found for key; skipping create', [
-                            'target_shop' => $target->domain,
-                            'key'         => $ckey,
-                        ]);
-                        continue;
-                    }
-
-                    // Bootstrap/actualizează mirror-ul, dar lasă fingerprint-urile NULL pentru a declanșa update-urile mai jos
-                    VariantMirror::updateOrCreate(
-                        [
-                            'product_mirror_id' => $mirror->id,
-                            'source_options_key'=> $ckey,
-                            'source_variant_id' => $sv['source_variant_id'] ?? null,
-                        ],
-                        [
-                            'target_variant_gid'    => $existingGid,
-                            'variant_fingerprint'   => null,
-                            'inventory_fingerprint' => null,
-                        ]
-                    );
-
-                    Log::info('Default-variant guard: bootstrapped mirror mapping', [
-                        'target_shop' => $target->domain,
-                        'key'         => $ckey,
-                        'variant_gid' => $existingGid,
-                    ]);
-                }
-            } catch (\Throwable $e) {
-                Log::error('Default-variant guard failed during bootstrap', [
-                    'target_shop' => $target->domain,
-                    'error'       => $e->getMessage(),
-                ]);
-            }
-            // Sărim explicit create-ul pentru default variant
-        } else {
-            try {
-                $createdMap = $this->productVariantsBulkCreateForUpdate($target, $mirror->target_product_gid, $variantDiff['toCreate'], $srcOptions, !empty($variantDiff['toUpdate']));
-                foreach ($variantDiff['toCreate'] as $rawKey => $sv) {
-                    $ckey = $this->canonKey($rawKey);
-                    $newGid = $createdMap[$ckey]['variant_gid'] ?? null;
-                    if (!$newGid) {
-                        Log::warning('Variant bulk create did not return gid for key', ['target_shop'=>$target->domain,'key'=>$ckey]);
-                        continue;
-                    }
-                    VariantMirror::updateOrCreate(
-                        [
-                            'product_mirror_id' => $mirror->id,
-                            'source_options_key'=> $ckey,
-                            'source_variant_id' => $sv['source_variant_id'] ?? null,
-                        ],
-                        [
-                            'target_variant_gid'    => $newGid,
-                            'variant_fingerprint'   => $sv['variant_fingerprint'] ?? null,
-                            'inventory_fingerprint' => $sv['inventory_fingerprint'] ?? null,
-                        ]
-                    );
-                    Log::info('Variant created on target', [
-                        'target_shop' => $target->domain,
-                        'key'         => $ckey,
-                        'variant_gid' => $newGid,
-                    ]);
-
-                    // set stock if provided
-                    if (isset($sv['inventory_quantity']) && $sv['inventory_quantity'] !== null) {
-                        [$itemId, $locIds] = $this->fetchInventoryItemAndLocations($target, $newGid);
-                        if ($itemId) {
-                            $this->inventorySetQuantities($target, $itemId, $locIds, (int)$sv['inventory_quantity']);
-                        }
-                    }
-                }
-            } catch (\Throwable $e) {
-                Log::error('Variants bulk create failed', ['target_shop'=>$target->domain, 'error'=>$e->getMessage()]);
-            }
-        }
-    }
-
-    // 3.1) Re-sincronizează mirror-ul cu starea reală de pe Shopify după eventualele create/delete
-    // (crearea de variante noi poate schimba GID-urile variantelor existente pe target)
-    $this->ensureVariantMirrors($mirror, $target, $srcOptions, $srcVariants);
-    $mirrorByKey = $this->loadVariantMirrorMap($mirror);
-
-    // 3.2) BULK economic (price/compareAt/taxable/inventoryPolicy [+ greutate dacă decizi în builder])
-    $bulkUpdates = [];
-    foreach ($variantDiff['toUpdate'] as $rawKey => $entry) {
-        $ckey = $this->canonKey($rawKey);
-        $vm = $mirrorByKey[$ckey] ?? null;  // folosim mirror-ul proaspăt, nu obiectul vechi
-        $sv = $entry['src'] ?? null;
-        if (!$vm || !$sv || empty($vm->target_variant_gid)) continue;
-
-        $inp = $this->buildVariantUpdateInput($vm->target_variant_gid, $sv);
-        if (!empty($inp)) {
-            $bulkUpdates[] = $inp;
-        }
-    }
-
-    if (!empty($bulkUpdates)) {
-        Log::info('Variant updates payload (bulk economic fields)', array_map(fn($u) => [
-            'id'             => $u['id'] ?? null,
-            'price'          => $u['price'] ?? null,
-            'compareAtPrice' => $u['compareAtPrice'] ?? null,
-            'taxable'        => $u['taxable'] ?? null,
-            'inventoryPolicy'=> $u['inventoryPolicy'] ?? null,
-        ], $bulkUpdates));
-        $this->productVariantsBulkUpdate($target, $mirror->target_product_gid, $bulkUpdates);
-    } else {
-        Log::info('Variant bulk no-op (no economic changes)');
-    }
-
-    // 3.3) SKU / Barcode – cu productSet (necesită optionValues pentru fiecare variantă)
-    // Construim input-ul pe baza CHEILOR din sursă, ca să fie aliniat cu productOptions dorite.
-    $sourceOptions = $this->normalizeOptionsFromPayload($this->payload);
-    $productOptions = [];
-    foreach ($sourceOptions as $idx => $opt) {
-        $name = $opt['name'] ?? null;
-        if (!$name) continue;
-        $vals = [];
-        foreach (($opt['values'] ?? []) as $v) {
-            $sv = (string)$v;
-            if ($sv !== '') $vals[] = ['name' => $sv];
-        }
-        $productOptions[] = array_filter([
-            'name'     => $name,
-            'position' => $idx + 1,
-            'values'   => $vals,
-        ], fn($v) => $v !== null && $v !== []);
-    }
-
-    $variantsForSet = [];
-    foreach ($srcVariants as $rawKey => $sv) {
-        $ckey = $this->canonKey($rawKey);
-        $vm   = $mirrorByKey[$ckey] ?? null;
-        if (!$vm || empty($vm->target_variant_gid)) continue;
-
-        // Construim optionValues folosind numele/valorile din sursă (aliniate cu productOptions)
-        $optionValues = $this->buildOptionValuesForProductSet($rawKey, $sourceOptions);
-
-        $ident = [
-            'id'           => $vm->target_variant_gid,
-            'optionValues' => $optionValues,
-        ];
-
-        if (array_key_exists('sku', $sv))     { $ident['sku']     = $sv['sku']; }
-        if (array_key_exists('barcode', $sv)) { $ident['barcode'] = ($sv['barcode'] === '' ? null : $sv['barcode']); }
-
-        // Dacă avem ceva de setat (pe lângă id și optionValues), include această variantă
-        if (count($ident) > 2) {
-            $variantsForSet[] = $ident;
-        }
-    }
-
-    if (!empty($variantsForSet)) {
-        // Log::info('productSet variants payload (identities)', array_map(fn($s) => [
-        //     'id'      => $s['id'] ?? null,
-        //     'sku'     => $s['sku'] ?? null,
-        //     'barcode' => array_key_exists('barcode', $s) ? $s['barcode'] : '(not set)',
-        // ], $variantsForSet));
-
-        // Folosim helperul local productSet() care gestionează erorile
-        $this->productSet($target, [
-            'id'             => $mirror->target_product_gid,
-            'productOptions' => $productOptions,
-            'variants'       => array_values($variantsForSet),
-        ]);
-    }
-
-    // 3.35) Track quantity (InventoryItem.tracked) conform inventory_management din sursă
-    $trackedWantedByKey = [];
-    foreach ($srcVariants as $key => $sv) {
-        $ckey = $this->canonKey($key);
-        $vm   = $mirrorByKey[$ckey] ?? null;
-        if (!$vm || empty($vm->target_variant_gid)) continue;
-        // Preferăm starea din sursă (dacă am putut să o citim). Altfel, cădem pe payload.
-        if (array_key_exists($ckey, $sourceTrackedByKey)) {
-            $trackedWanted = (bool)$sourceTrackedByKey[$ckey];
-            // Log::debug('Track qty: using source tracked state', [
-            //     'key' => $ckey,
-            //     'tracked' => $trackedWanted,
-            // ]);
-        } else {
-            $present = (bool)($sv['inventory_management_present'] ?? false);
-            if (!$present) {
-                Log::info('Track qty: inventory_management missing in source payload → keep target as-is', [
-                    'key' => $ckey,
-                ]);
-                $trackedWantedByKey[$ckey] = null; // necunoscut
-                continue;
-            }
-            $imVal = strtolower((string)($sv['inventory_management'] ?? ''));
-            $trackedWanted = ($imVal === 'shopify');
-            // Log::debug('Track qty: using payload inventory_management', [
-            //     'key' => $ckey,
-            //     'value' => $sv['inventory_management'] ?? null,
-            //     'tracked' => $trackedWanted,
-            // ]);
-        }
-        $trackedWantedByKey[$ckey] = $trackedWanted;
-
-        [$itemId, ] = $this->fetchInventoryItemAndLocations($target, $vm->target_variant_gid);
-        if ($itemId !== null) {
-            // 3.35.1) InventoryItem.tracked este suficient în versiunea actuală de API pentru a reflecta checkbox-ul în Admin.
-            // Unele versiuni nu expun productVariantUpdate/productVariantsUpdate, deci evităm apelul care produce erori.
-            $invMgmt = $trackedWanted ? 'SHOPIFY' : 'NOT_MANAGED';
-            // Log::debug('Track qty: skipping variant inventoryManagement mutation (unsupported on this API); relying on InventoryItem.tracked', [
-            //     'key' => $ckey,
-            //     'variant_gid' => $vm->target_variant_gid,
-            //     'inventoryManagement_intended' => $invMgmt,
-            // ]);
-
-            // Log::debug('Track qty: applying', [
-            //     'key' => $ckey,
-            //     'inventory_management' => $sv['inventory_management'] ?? null,
-            //     'tracked' => $trackedWanted,
-            // ]);
-            $this->inventoryItemUpdate($target, $itemId, $trackedWanted);
-        } else {
-            Log::warning('Track qty: no inventoryItemId found', [
-                'key' => $ckey,
-                'variant_gid' => $vm->target_variant_gid,
-            ]);
-        }
-    }
-
-    // 3.4) Inventory qty – absolut (GraphQL inventorySetQuantities)
-    foreach ($srcVariants as $key => $sv) {
-        $ckey = $this->canonKey($key);
-        $vm   = $mirrorByKey[$ckey] ?? null;
-        if (!$vm || empty($vm->target_variant_gid)) continue;
-
-        // dacă payload-ul sursă indică explicit tracking off, sărim setarea de cantități
-        $trackedWanted = $trackedWantedByKey[$ckey] ?? null;
-        if ($trackedWanted === false) {
-            Log::info('Skip inventorySetQuantities: tracking OFF for variant', [
-                'key' => $ckey,
-            ]);
-            continue;
-        }
-
-        if (isset($sv['inventory_quantity']) && $sv['inventory_quantity'] !== null) {
-            [$itemId, $locIds] = $this->fetchInventoryItemAndLocations($target, $vm->target_variant_gid);
-            $this->inventorySetQuantities($target, $itemId, $locIds, (int)$sv['inventory_quantity']);
-        }
-    }
-
-    // 3.5) Persistă fingerprint-urile NOI pentru economic fields
-    foreach ($srcVariants as $key => $sv) {
-        $ckey = $this->canonKey($key);
-        if (!isset($mirrorByKey[$ckey])) continue;
-        $m = $mirrorByKey[$ckey];
-
-        if ((string)$m->variant_fingerprint !== (string)$sv['variant_fingerprint']) {
-            $m->variant_fingerprint = $sv['variant_fingerprint'];
-            $m->save();
-        }
-    }
-
         if ($mirror->target_product_gid) {
             $this->syncMetaobjectMetafields(
                 source: $source,
@@ -782,9 +260,865 @@ public function handle(): void
 
 
 
+    private function bootstrapLegacyVariantIdentity(
+        LegacyParentVariantBootstrapPolicy $policy,
+        ShopifyParentIdentityResolver $identityResolver,
+        ProductMirror $mirror,
+        Shop $target,
+        array $sourceById,
+        array $sourceOptions,
+        array $targetState
+    ): array {
+        $decision = $policy->decide($targetState, count($sourceById));
+
+        if ($decision['status'] === 'not_needed') {
+            return [
+                'status' => 'not_needed',
+                'target_state' => $targetState,
+                'reset_mirrors' => false,
+            ];
+        }
+
+        if ($decision['status'] === 'unsafe') {
+            Log::warning('Variant identity bootstrap skipped: unsafe legacy state', [
+                'reason' => $decision['reason'],
+                'source_product_id' => $this->sourceProductId,
+                'target_shop' => $target->domain,
+                'target_product_gid' => $mirror->target_product_gid,
+                'source_variant_ids' => array_map('intval', array_keys($sourceById)),
+                'managed_parentvariant_ids' => array_keys($targetState['by_parent_id'] ?? []),
+                'unmanaged_variant_gids' => $targetState['unmanaged_gids'] ?? [],
+                'ambiguous_parentvariant_ids' => array_keys(
+                    $targetState['ambiguous_parent_ids'] ?? []
+                ),
+            ]);
+
+            return [
+                'status' => 'unsafe',
+                'target_state' => $targetState,
+                'reset_mirrors' => false,
+            ];
+        }
+
+        if ($decision['action'] === 'attach_single') {
+            $sourceId = (int) array_key_first($sourceById);
+            $targetVariantGid = $targetState['unmanaged_gids'][0];
+
+            $this->setParentVariantMetafield(
+                $target,
+                $targetVariantGid,
+                $sourceId,
+                'legacy_bootstrap_single'
+            );
+
+            $verifiedState = $identityResolver->targetVariantState(
+                $target,
+                $mirror->target_product_gid
+            );
+            $this->assertBootstrapIdentityState($verifiedState, array_keys($sourceById));
+            $this->replaceVariantMirrorsFromVerifiedState(
+                $mirror,
+                $sourceById,
+                $verifiedState
+            );
+
+            Log::notice('Variant identity bootstrapped on existing target variant', [
+                'source_product_id' => $this->sourceProductId,
+                'source_variant_id' => $sourceId,
+                'target_shop' => $target->domain,
+                'target_variant_gid' => $targetVariantGid,
+            ]);
+
+            return [
+                'status' => 'bootstrapped',
+                'target_state' => $verifiedState,
+                'reset_mirrors' => true,
+            ];
+        }
+
+        // The replace_structure branch is added in Task 3.
+        throw new \RuntimeException('Unsupported legacy parentvariant bootstrap action');
+    }
+
+    private function assertBootstrapIdentityState(array $targetState, array $sourceIds): void
+    {
+        $expected = array_map('strval', $sourceIds);
+        $actual = array_map('strval', array_keys($targetState['by_parent_id'] ?? []));
+        sort($expected, SORT_STRING);
+        sort($actual, SORT_STRING);
+
+        if (!empty($targetState['unmanaged_gids'])
+            || !empty($targetState['ambiguous_parent_ids'])
+            || $expected !== $actual
+        ) {
+            throw new \RuntimeException('legacy_variant_bootstrap_postcondition_failed');
+        }
+    }
+
+    private function replaceVariantMirrorsFromVerifiedState(
+        ProductMirror $mirror,
+        array $sourceById,
+        array $targetState
+    ): void {
+        DB::transaction(function () use ($mirror, $sourceById, $targetState): void {
+            VariantMirror::where('product_mirror_id', $mirror->id)->delete();
+
+            foreach ($sourceById as $sourceId => $sourceVariant) {
+                $targetNode = $targetState['by_parent_id'][(string) $sourceId];
+                VariantMirror::create([
+                    'product_mirror_id' => $mirror->id,
+                    'source_variant_id' => (int) $sourceId,
+                    'source_options_key' => $sourceVariant['source_options_key'],
+                    'target_variant_id' => (int) (
+                        $targetNode['legacyResourceId']
+                        ?? $this->numericIdFromGid($targetNode['id'])
+                        ?? 0
+                    ),
+                    'target_variant_gid' => $targetNode['id'],
+                ]);
+            }
+        });
+    }
+
+    private function syncVariantsStrict(
+        ShopifyParentIdentityResolver $identityResolver,
+        LegacyParentVariantBootstrapPolicy $bootstrapPolicy,
+        ProductMirror $mirror,
+        Shop $target,
+        ?Shop $source
+    ): bool {
+        if (!$this->sourceVariantPayloadIsComplete($this->payload)) {
+            Log::warning('Variant sync stopped: Shopify webhook variant list may be truncated', [
+                'reason' => 'source_variant_payload_limit',
+                'source_product_id' => $this->sourceProductId,
+                'target_shop' => $target->domain,
+                'payload_variant_count' => count($this->payload['variants'] ?? []),
+            ]);
+
+            return false;
+        }
+
+        $sourceOptions = $this->normalizeOptionsFromPayload($this->payload);
+        $sourceVariants = $this->normalizeSourceVariants($this->payload, $sourceOptions);
+        $sourceById = [];
+
+        if (empty($sourceVariants)) {
+            Log::warning('Variant sync stopped: source payload contains no variants', [
+                'reason' => 'empty_source_variants',
+                'source_product_id' => $this->sourceProductId,
+                'target_shop' => $target->domain,
+            ]);
+
+            return false;
+        }
+
+        foreach ($sourceVariants as $sourceVariant) {
+            $optionsKey = (string) ($sourceVariant['source_options_key'] ?? '');
+            $sourceId = (int) ($sourceVariant['source_variant_id'] ?? 0);
+            if ($sourceId <= 0) {
+                Log::warning('Variant sync stopped: source variant has no stable ID', [
+                    'reason' => 'missing_source_variant_id',
+                    'source_product_id' => $this->sourceProductId,
+                    'target_shop' => $target->domain,
+                    'options_key' => $optionsKey,
+                ]);
+                return false;
+            }
+
+            if (isset($sourceById[(string) $sourceId])) {
+                Log::warning('Variant sync stopped: duplicate source variant ID', [
+                    'reason' => 'duplicate_source_variant_id',
+                    'source_product_id' => $this->sourceProductId,
+                    'source_variant_id' => $sourceId,
+                    'target_shop' => $target->domain,
+                ]);
+                return false;
+            }
+
+            $sourceById[(string) $sourceId] = $sourceVariant;
+        }
+
+        $targetState = $identityResolver->targetVariantState($target, $mirror->target_product_gid);
+        $bootstrap = $this->bootstrapLegacyVariantIdentity(
+            $bootstrapPolicy,
+            $identityResolver,
+            $mirror,
+            $target,
+            $sourceById,
+            $sourceOptions,
+            $targetState
+        );
+
+        if ($bootstrap['status'] === 'unsafe') {
+            return false;
+        }
+
+        $targetState = $bootstrap['target_state'];
+        $allowStructuralChanges = empty($targetState['unmanaged_gids'])
+            && empty($targetState['ambiguous_parent_ids']);
+
+        if (!$allowStructuralChanges) {
+            Log::warning('Variant structural sync skipped: target contains unmanaged or ambiguous variants', [
+                'reason' => 'incomplete_parentvariant_mapping',
+                'source_product_id' => $this->sourceProductId,
+                'target_shop' => $target->domain,
+                'unmanaged_variant_gids' => $targetState['unmanaged_gids'],
+                'ambiguous_parentvariant_ids' => array_keys($targetState['ambiguous_parent_ids']),
+            ]);
+
+            return false;
+        }
+
+        $verifiedMirrors = $this->reconcileStrictVariantMirrors(
+            $mirror,
+            $target,
+            $sourceById,
+            $targetState
+        );
+
+        $missing = [];
+        foreach ($sourceById as $sourceId => $sourceVariant) {
+            if (!isset($verifiedMirrors[$sourceId])) {
+                $missing[$sourceId] = $sourceVariant;
+            }
+        }
+
+        $stale = [];
+        foreach ($targetState['by_parent_id'] as $sourceId => $targetNode) {
+            if (!isset($sourceById[(string) $sourceId])) {
+                $stale[(string) $sourceId] = $targetNode;
+            }
+        }
+
+        if ($missing && $stale) {
+            $targetOptions = $this->fetchTargetOptions($target, $mirror->target_product_gid);
+            if (!$this->mixedReplacementHasCompatibleOptions($sourceOptions, $targetOptions)) {
+                Log::warning('Variant sync stopped: mixed replacement option structure differs', [
+                    'reason' => 'mixed_variant_replacement_option_structure_mismatch',
+                    'source_product_id' => $this->sourceProductId,
+                    'target_shop' => $target->domain,
+                    'source_option_names' => array_column($sourceOptions, 'name'),
+                    'target_option_names' => array_column($targetOptions, 'name'),
+                    'missing_source_variant_ids' => array_map('intval', array_keys($missing)),
+                    'stale_source_variant_ids' => array_map('intval', array_keys($stale)),
+                ]);
+
+                $replaced = $this->productSetVariantStructure(
+                    $target,
+                    $mirror->target_product_gid,
+                    $sourceById,
+                    $sourceOptions,
+                    $targetOptions,
+                    $verifiedMirrors
+                );
+
+                foreach ($sourceById as $sourceId => $sourceVariant) {
+                    $targetVariant = $replaced[$sourceId];
+                    VariantMirror::updateOrCreate(
+                        [
+                            'product_mirror_id' => $mirror->id,
+                            'source_variant_id' => (int) $sourceId,
+                        ],
+                        [
+                            'source_options_key' => $sourceVariant['source_options_key'],
+                            'target_variant_id' => (int) ($targetVariant['variant_id'] ?? 0),
+                            'target_variant_gid' => $targetVariant['variant_gid'],
+                        ]
+                    );
+                }
+
+                VariantMirror::where('product_mirror_id', $mirror->id)
+                    ->whereNotIn('source_variant_id', array_map('intval', array_keys($sourceById)))
+                    ->delete();
+
+                $targetState = $identityResolver->targetVariantState(
+                    $target,
+                    $mirror->target_product_gid
+                );
+                $expectedParentIds = array_map('strval', array_keys($sourceById));
+                $actualParentIds = array_map('strval', array_keys($targetState['by_parent_id']));
+                sort($expectedParentIds, SORT_STRING);
+                sort($actualParentIds, SORT_STRING);
+
+                if (!empty($targetState['unmanaged_gids'])
+                    || !empty($targetState['ambiguous_parent_ids'])
+                    || $actualParentIds !== $expectedParentIds
+                ) {
+                    throw new \RuntimeException(
+                        'Variant identity state is incomplete after productSet structural replacement'
+                    );
+                }
+
+                $verifiedMirrors = $this->reconcileStrictVariantMirrors(
+                    $mirror,
+                    $target,
+                    $sourceById,
+                    $targetState
+                );
+                $missing = [];
+                $stale = [];
+
+                Log::notice('Variant structure replaced declaratively through parentvariant', [
+                    'source_product_id' => $this->sourceProductId,
+                    'target_shop' => $target->domain,
+                    'source_variant_ids' => array_map('intval', array_keys($sourceById)),
+                ]);
+            }
+        }
+
+        if ($missing) {
+                // New variants need their option definitions before Shopify can
+                // accept optionValues in productVariantsBulkCreate.
+                $this->syncStrictProductOptions($target, $mirror->target_product_gid);
+                $targetState = $identityResolver->targetVariantState($target, $mirror->target_product_gid);
+
+                $created = $this->productVariantsBulkCreateForUpdate(
+                    $target,
+                    $mirror->target_product_gid,
+                    $missing,
+                    $sourceOptions,
+                    !empty($targetState['nodes_by_gid'])
+                );
+
+                foreach ($missing as $sourceVariant) {
+                    $sourceId = (int) $sourceVariant['source_variant_id'];
+                    $createdVariant = $created[(string) $sourceId] ?? null;
+                    $targetGid = $createdVariant['variant_gid'] ?? null;
+
+                    if (!$targetGid) {
+                        throw new \RuntimeException(
+                            'Variant create did not return a deterministic target ID for source variant '.$sourceId
+                        );
+                    }
+
+                    $this->setParentVariantMetafield(
+                        $target,
+                        $targetGid,
+                        $sourceId,
+                        'deterministic_create'
+                    );
+
+                    $verifiedMirrors[(string) $sourceId] = VariantMirror::updateOrCreate(
+                        [
+                            'product_mirror_id' => $mirror->id,
+                            'source_variant_id' => $sourceId,
+                        ],
+                        [
+                            'source_options_key' => $sourceVariant['source_options_key'],
+                            'target_variant_id' => (int) (
+                                $createdVariant['variant_id']
+                                ?? $this->numericIdFromGid($targetGid)
+                                ?? 0
+                            ),
+                            'target_variant_gid' => $targetGid,
+                        ]
+                    );
+                }
+        }
+
+        $staleVariantGids = array_values(array_filter(array_map(
+            static fn (array $targetNode) => $targetNode['id'] ?? null,
+            $stale
+        )));
+
+        if ($staleVariantGids) {
+            $this->productVariantsBulkDelete(
+                $target,
+                $mirror->target_product_gid,
+                $staleVariantGids
+            );
+
+            foreach ($stale as $sourceId => $targetNode) {
+                VariantMirror::where('product_mirror_id', $mirror->id)
+                    ->where('source_variant_id', (int) $sourceId)
+                    ->delete();
+
+                Log::info('Variant deleted on target through parentvariant', [
+                    'target_shop' => $target->domain,
+                    'source_variant_id' => (int) $sourceId,
+                    'target_variant_gid' => $targetNode['id'] ?? null,
+                ]);
+            }
+        }
+
+        // Collapse/rename options only after stale variants are gone. Shopify
+        // refuses deleting an option value while a variant still uses it.
+        $this->syncStrictProductOptions($target, $mirror->target_product_gid);
+        $targetState = $identityResolver->targetVariantState($target, $mirror->target_product_gid);
+        if (!empty($targetState['unmanaged_gids']) || !empty($targetState['ambiguous_parent_ids'])) {
+            Log::warning('Variant sync stopped after option synchronization changed identity state', [
+                'reason' => 'incomplete_parentvariant_mapping_after_option_sync',
+                'source_product_id' => $this->sourceProductId,
+                'target_shop' => $target->domain,
+                'unmanaged_variant_gids' => $targetState['unmanaged_gids'],
+                'ambiguous_parentvariant_ids' => array_keys($targetState['ambiguous_parent_ids']),
+            ]);
+
+            return false;
+        }
+
+        $verifiedMirrors = $this->reconcileStrictVariantMirrors(
+            $mirror,
+            $target,
+            $sourceById,
+            $targetState
+        );
+
+        $bulkUpdates = [];
+        foreach ($sourceById as $sourceId => $sourceVariant) {
+            $variantMirror = $verifiedMirrors[$sourceId] ?? null;
+            if (!$variantMirror?->target_variant_gid) {
+                continue;
+            }
+
+            $bulkUpdates[] = $this->buildVariantUpdateInput(
+                $variantMirror->target_variant_gid,
+                $sourceVariant
+            );
+        }
+
+        if ($bulkUpdates) {
+            $this->productVariantsBulkUpdate($target, $mirror->target_product_gid, $bulkUpdates);
+        }
+
+        $sourceTrackedById = [];
+        if ($source) {
+            try {
+                $sourceTrackedById = $this->fetchTrackedMapBySourceId(
+                    $source,
+                    'gid://shopify/Product/'.$this->sourceProductId
+                );
+            } catch (\Throwable $e) {
+                Log::warning('Source tracked fetch failed; using payload fallback', [
+                    'source_shop' => $source->domain,
+                    'source_product_id' => $this->sourceProductId,
+                    'error' => $e->getMessage(),
+                ]);
+            }
+        }
+
+        foreach ($sourceById as $sourceId => $sourceVariant) {
+            $variantMirror = $verifiedMirrors[$sourceId] ?? null;
+            if (!$variantMirror?->target_variant_gid) {
+                continue;
+            }
+
+            $tracked = $sourceTrackedById[$sourceId] ?? null;
+            if ($tracked === null && ($sourceVariant['inventory_management_present'] ?? false)) {
+                $tracked = strtolower((string) ($sourceVariant['inventory_management'] ?? '')) === 'shopify';
+            }
+
+            [$inventoryItemId, $locationIds] = $this->fetchInventoryItemAndLocations(
+                $target,
+                $variantMirror->target_variant_gid
+            );
+
+            if ($tracked !== null && $inventoryItemId) {
+                $this->inventoryItemUpdate($target, $inventoryItemId, (bool) $tracked);
+            }
+
+            if ($tracked !== false
+                && $inventoryItemId
+                && array_key_exists('inventory_quantity', $sourceVariant)
+                && $sourceVariant['inventory_quantity'] !== null
+            ) {
+                $this->inventorySetQuantities(
+                    $target,
+                    $inventoryItemId,
+                    $locationIds,
+                    (int) $sourceVariant['inventory_quantity']
+                );
+            }
+
+            $variantMirror->source_options_key = $sourceVariant['source_options_key'];
+            $variantMirror->variant_fingerprint = $sourceVariant['variant_fingerprint'] ?? null;
+            $variantMirror->inventory_fingerprint = $sourceVariant['inventory_fingerprint'] ?? null;
+            $variantMirror->save();
+        }
+
+        return true;
+    }
+
+    private function sourceVariantPayloadIsComplete(array $payload): bool
+    {
+        $variants = $payload['variants'] ?? [];
+
+        return is_array($variants) && count($variants) < 100;
+    }
+
+    private function mixedReplacementHasCompatibleOptions(
+        array $sourceOptions,
+        array $targetOptions
+    ): bool {
+        $sourceNames = array_map(
+            fn (array $option): string => $this->canonOptName((string) ($option['name'] ?? '')),
+            array_values($sourceOptions)
+        );
+        $targetNames = array_map(
+            fn (array $option): string => $this->canonOptName((string) ($option['name'] ?? '')),
+            array_values($targetOptions)
+        );
+
+        if (!$sourceNames
+            || in_array('', $sourceNames, true)
+            || in_array('', $targetNames, true)
+            || count(array_unique($sourceNames)) !== count($sourceNames)
+            || count(array_unique($targetNames)) !== count($targetNames)
+        ) {
+            return false;
+        }
+
+        return $sourceNames === $targetNames;
+    }
+
+    /**
+     * Replace a changed option/variant structure in one synchronous mutation.
+     * Existing variants are addressed only by GIDs verified through parentvariant.
+     *
+     * @return array<string, array{source_variant_id:int, variant_id:int|string|null, variant_gid:string}>
+     */
+    private function productSetVariantStructure(
+        Shop $shop,
+        string $productGid,
+        array $sourceById,
+        array $sourceOptions,
+        array $targetOptions,
+        array $verifiedMirrors
+    ): array {
+        if (!$sourceById || !$sourceOptions) {
+            throw new \RuntimeException('productSet structural replacement requires variants and options');
+        }
+
+        if ($this->mixedReplacementHasCompatibleOptions($sourceOptions, $targetOptions)) {
+            throw new \RuntimeException('productSet structural replacement was called for compatible options');
+        }
+
+        $productOptions = [];
+        foreach (array_values($sourceOptions) as $position => $option) {
+            $name = trim((string) ($option['name'] ?? ''));
+            $values = array_values(array_unique(array_filter(array_map(
+                static fn ($value): string => trim((string) $value),
+                $option['values'] ?? []
+            ), static fn (string $value): bool => $value !== '')));
+
+            if ($name === '' || !$values) {
+                throw new \RuntimeException('productSet structural replacement received an incomplete option');
+            }
+
+            $productOptions[] = [
+                'name' => $name,
+                'position' => $position + 1,
+                'values' => array_map(
+                    static fn (string $value): array => ['name' => $value],
+                    $values
+                ),
+            ];
+        }
+
+        $variantInputs = [];
+        foreach ($sourceById as $sourceIdKey => $sourceVariant) {
+            $sourceId = (int) ($sourceVariant['source_variant_id'] ?? 0);
+            if ($sourceId <= 0 || (string) $sourceId !== (string) $sourceIdKey) {
+                throw new \RuntimeException('productSet structural replacement has an invalid source variant ID');
+            }
+
+            $optionValues = $this->buildOptionValuesForProductSet(
+                (string) ($sourceVariant['source_options_key'] ?? ''),
+                $sourceOptions
+            );
+            if (count($optionValues) !== count($productOptions)) {
+                throw new \RuntimeException(
+                    'productSet structural replacement has incomplete variant option values for source '.$sourceId
+                );
+            }
+
+            $variantInput = [
+                'optionValues' => $optionValues,
+            ];
+            $retainedMirror = $verifiedMirrors[(string) $sourceId] ?? null;
+            if ($retainedMirror instanceof VariantMirror && $retainedMirror->target_variant_gid) {
+                $variantInput['id'] = $retainedMirror->target_variant_gid;
+            } else {
+                $variantInput['metafields'] = [[
+                    'namespace' => 'custom',
+                    'key' => 'parentvariant',
+                    'type' => 'number_integer',
+                    'value' => (string) $sourceId,
+                ]];
+            }
+
+            if (array_key_exists('price', $sourceVariant)
+                && $sourceVariant['price'] !== null
+                && $sourceVariant['price'] !== ''
+            ) {
+                $variantInput['price'] = (string) $sourceVariant['price'];
+            }
+            if (array_key_exists('compare_at_price', $sourceVariant)) {
+                $compareAtPrice = $sourceVariant['compare_at_price'];
+                $variantInput['compareAtPrice'] = ($compareAtPrice === null || $compareAtPrice === '')
+                    ? null
+                    : (string) $compareAtPrice;
+            }
+            if (array_key_exists('taxable', $sourceVariant) && $sourceVariant['taxable'] !== null) {
+                $variantInput['taxable'] = (bool) $sourceVariant['taxable'];
+            }
+            if (!empty($sourceVariant['inventory_policy'])) {
+                $variantInput['inventoryPolicy'] = strtolower((string) $sourceVariant['inventory_policy']) === 'continue'
+                    ? 'CONTINUE'
+                    : 'DENY';
+            }
+            if (array_key_exists('sku', $sourceVariant)) {
+                $variantInput['sku'] = (string) ($sourceVariant['sku'] ?? '');
+            }
+            if (array_key_exists('barcode', $sourceVariant)) {
+                $variantInput['barcode'] = ($sourceVariant['barcode'] === null || $sourceVariant['barcode'] === '')
+                    ? null
+                    : (string) $sourceVariant['barcode'];
+            }
+
+            $variantInputs[] = $variantInput;
+        }
+
+        $mutation = <<<'GQL'
+        mutation SyncProductVariantStructure(
+          $identifier: ProductSetIdentifiers!
+          $input: ProductSetInput!
+          $synchronous: Boolean!
+        ) {
+          productSet(identifier: $identifier, input: $input, synchronous: $synchronous) {
+            product {
+              id
+              variants(first: 250) {
+                nodes {
+                  id
+                  legacyResourceId
+                  metafield(namespace: "custom", key: "parentvariant") { value }
+                }
+              }
+            }
+            userErrors { field message code }
+          }
+        }
+        GQL;
+
+        $response = $this->gql($shop, $mutation, [
+            'identifier' => ['id' => $productGid],
+            'input' => [
+                'productOptions' => $productOptions,
+                'variants' => $variantInputs,
+            ],
+            'synchronous' => true,
+        ]);
+
+        if (!empty($response['errors'])) {
+            throw new \RuntimeException('productSet structural replacement errors: '.json_encode($response['errors']));
+        }
+        $userErrors = $response['data']['productSet']['userErrors'] ?? [];
+        if ($userErrors) {
+            throw new \RuntimeException('productSet structural replacement userErrors: '.json_encode($userErrors));
+        }
+
+        $product = $response['data']['productSet']['product'] ?? null;
+        if (($product['id'] ?? null) !== $productGid) {
+            throw new \RuntimeException('productSet structural replacement did not return the requested product');
+        }
+
+        $result = [];
+        foreach ($product['variants']['nodes'] ?? [] as $node) {
+            $sourceId = (string) ($node['metafield']['value'] ?? '');
+            $variantGid = $node['id'] ?? null;
+            if (!isset($sourceById[$sourceId]) || isset($result[$sourceId]) || !$variantGid) {
+                throw new \RuntimeException('productSet returned an invalid parentvariant identity state');
+            }
+
+            $result[$sourceId] = [
+                'source_variant_id' => (int) $sourceId,
+                'variant_id' => $node['legacyResourceId']
+                    ?? $this->numericIdFromGid($variantGid),
+                'variant_gid' => $variantGid,
+            ];
+        }
+
+        $expectedIds = array_map('strval', array_keys($sourceById));
+        $actualIds = array_map('strval', array_keys($result));
+        sort($expectedIds, SORT_STRING);
+        sort($actualIds, SORT_STRING);
+        if ($actualIds !== $expectedIds) {
+            throw new \RuntimeException('productSet did not return every expected parentvariant identity');
+        }
+
+        return $result;
+    }
+
+    private function syncStrictProductOptions(Shop $target, string $productGid): void
+    {
+        $desiredOptions = $this->buildOptionCreateInputsFromPayload($this->payload);
+        $targetOptions = $this->fetchTargetOptions($target, $productGid);
+        $hasOnlyDefaultTitle = count($targetOptions) === 1
+            && (
+                strtolower((string) ($targetOptions[0]['name'] ?? '')) === 'title'
+                && array_map('strval', $targetOptions[0]['values'] ?? []) === ['Default Title']
+            );
+
+        if (!$desiredOptions) {
+            if ($hasOnlyDefaultTitle) {
+                return;
+            }
+
+            $this->collapseTargetOptionsToDefaultTitle($target, $productGid, $targetOptions);
+            return;
+        }
+
+        if ($hasOnlyDefaultTitle) {
+            $this->productOptionsCreate($target, $productGid, $desiredOptions, 'LEAVE_AS_IS');
+            return;
+        }
+
+        $desiredNames = array_map(
+            fn (array $option): string => $this->canonOptName((string) ($option['name'] ?? '')),
+            $desiredOptions
+        );
+        $targetNames = array_map(
+            fn (array $option): string => $this->canonOptName((string) ($option['name'] ?? '')),
+            $targetOptions
+        );
+
+        if ($targetNames === $desiredNames) {
+            return;
+        }
+
+        if (count($targetNames) > count($desiredNames)
+            && count(array_unique($targetNames)) === count($targetNames)
+            && count(array_unique($desiredNames)) === count($desiredNames)
+        ) {
+            $extraOptions = array_values(array_filter(
+                $targetOptions,
+                fn (array $option): bool => !in_array(
+                    $this->canonOptName((string) ($option['name'] ?? '')),
+                    $desiredNames,
+                    true
+                )
+            ));
+            $retainedNames = array_values(array_filter(
+                $targetNames,
+                fn (string $name): bool => in_array($name, $desiredNames, true)
+            ));
+            $extraOptionIds = array_values(array_filter(array_map(
+                static fn (array $option): ?string => $option['id'] ?? null,
+                $extraOptions
+            )));
+
+            if ($retainedNames === $desiredNames
+                && count($extraOptionIds) === count($extraOptions)
+                && count($extraOptionIds) === count($targetNames) - count($desiredNames)
+            ) {
+                $this->productOptionsDelete($target, $productGid, $extraOptionIds);
+                return;
+            }
+        }
+
+        Log::warning('Product strict option sync skipped: non-default option replacement is not deterministic', [
+            'target_shop' => $target->domain,
+            'product_gid' => $productGid,
+        ]);
+    }
+
+    private function collapseTargetOptionsToDefaultTitle(
+        Shop $target,
+        string $productGid,
+        array $targetOptions
+    ): void {
+        if (count($targetOptions) !== 1) {
+            throw new \RuntimeException('Default Title collapse requires exactly one target option');
+        }
+
+        $option = $targetOptions[0];
+        $optionId = $option['id'] ?? null;
+        $optionValues = array_values($option['optionValues'] ?? []);
+        $activeValues = array_values(array_filter(
+            $optionValues,
+            static fn (array $value) => (bool) ($value['hasVariants'] ?? false)
+        ));
+
+        if (!$optionId || count($activeValues) !== 1 || empty($activeValues[0]['id'])) {
+            throw new \RuntimeException('Default Title collapse could not identify the retained option value');
+        }
+
+        $retainedValueId = $activeValues[0]['id'];
+        $valueIdsToDelete = array_values(array_filter(array_map(
+            static fn (array $value) => ($value['id'] ?? null) !== $retainedValueId
+                ? ($value['id'] ?? null)
+                : null,
+            $optionValues
+        )));
+
+        $this->productOptionUpdate(
+            $target,
+            $productGid,
+            ['id' => $optionId, 'name' => 'Title', 'position' => 1],
+            [['id' => $retainedValueId, 'name' => 'Default Title']],
+            $valueIdsToDelete
+        );
+    }
+
+    /** @return array<string, VariantMirror> */
+    private function reconcileStrictVariantMirrors(
+        ProductMirror $mirror,
+        Shop $target,
+        array $sourceById,
+        array $targetState
+    ): array {
+        $verified = [];
+
+        foreach ($sourceById as $sourceId => $sourceVariant) {
+            if (isset($targetState['ambiguous_parent_ids'][$sourceId])) {
+                Log::warning('Variant update skipped: ambiguous parentvariant mapping', [
+                    'reason' => 'ambiguous_parentvariant_mapping',
+                    'source_product_id' => $this->sourceProductId,
+                    'source_variant_id' => (int) $sourceId,
+                    'target_shop' => $target->domain,
+                    'candidate_gids' => array_column(
+                        $targetState['ambiguous_parent_ids'][$sourceId],
+                        'id'
+                    ),
+                ]);
+                continue;
+            }
+
+            $targetNode = $targetState['by_parent_id'][$sourceId] ?? null;
+            if (!$targetNode) {
+                Log::warning('Variant update skipped: strict parentvariant mapping unavailable', [
+                    'reason' => 'missing_parentvariant_mapping',
+                    'source_product_id' => $this->sourceProductId,
+                    'source_variant_id' => (int) $sourceId,
+                    'target_shop' => $target->domain,
+                ]);
+                continue;
+            }
+
+            $verified[$sourceId] = VariantMirror::updateOrCreate(
+                [
+                    'product_mirror_id' => $mirror->id,
+                    'source_variant_id' => (int) $sourceId,
+                ],
+                [
+                    'source_options_key' => $sourceVariant['source_options_key'],
+                    'target_variant_id' => (int) (
+                        $targetNode['legacyResourceId']
+                        ?? $this->numericIdFromGid($targetNode['id'])
+                        ?? 0
+                    ),
+                    'target_variant_gid' => $targetNode['id'],
+                ]
+            );
+        }
+
+        return $verified;
+    }
+
     private function gql(Shop $shop, string $query, array $variables = []): array
     {
-        $version  = '2025-01';
+        $version  = $shop->api_version ?: '2025-01';
         $endpoint = "https://{$shop->domain}/admin/api/{$version}/graphql.json";
 
         $resp = Http::withHeaders([
@@ -1850,7 +2184,8 @@ public function handle(): void
     }
 
     /**
-     * Normalizează variantele sursă într-o hartă key => payload normalizat
+     * Normalizează variantele sursă într-o listă; cheia opțiunilor rămâne
+     * doar date pentru mutații, nu identitate de corelare.
      */
     private function normalizeSourceVariants(array $payload, array $optionNames): array
     {
@@ -1877,6 +2212,7 @@ public function handle(): void
 
             $norm = [
                 'source_variant_id'   => $v['id'] ?? null,
+                'source_options_key'  => $this->canonKey($key),
                 'sku'                 => $v['sku'] ?? null,
                 'barcode'             => $v['barcode'] ?? null,
                 'price'               => $v['price'] ?? null,
@@ -1895,7 +2231,7 @@ public function handle(): void
             $norm['variant_fingerprint']   = $this->variantFingerprint($norm);
             $norm['inventory_fingerprint'] = $this->inventoryFingerprint($norm);
 
-            $out[$key] = $norm;
+            $out[] = $norm;
         }
 
         return $out;
@@ -1977,32 +2313,53 @@ public function handle(): void
         ];
     }
 
-    private function productVariantDelete(Shop $shop, string $variantGid): void
+    private function productVariantsBulkDelete(
+        Shop $shop,
+        string $productGid,
+        array $variantGids
+    ): void
     {
+        $variantGids = array_values(array_unique(array_filter($variantGids)));
+        if (!$variantGids) {
+            return;
+        }
+
         $m = <<<'GQL'
-        mutation productVariantDelete($id: ID!) {
-          productVariantDelete(id: $id) {
-            deletedProductVariantId
+        mutation deleteProductVariants($productId: ID!, $variantsIds: [ID!]!) {
+          productVariantsBulkDelete(productId: $productId, variantsIds: $variantsIds) {
+            product { id }
             userErrors { field message code }
           }
         }
         GQL;
 
-        $res = $this->gql($shop, $m, ['id' => $variantGid]);
+        $res = $this->gql($shop, $m, [
+            'productId' => $productGid,
+            'variantsIds' => $variantGids,
+        ]);
+
         if (!empty($res['errors'])) {
-            Log::error('productVariantDelete top-level errors', ['target'=>$shop->domain, 'errors'=>$res['errors']]);
-            throw new \RuntimeException('productVariantDelete errors: '.json_encode($res['errors']));
+            Log::error('productVariantsBulkDelete top-level errors', [
+                'target' => $shop->domain,
+                'errors' => $res['errors'],
+            ]);
+            throw new \RuntimeException('productVariantsBulkDelete errors: '.json_encode($res['errors']));
         }
-        $ue = $res['data']['productVariantDelete']['userErrors'] ?? [];
+
+        $ue = $res['data']['productVariantsBulkDelete']['userErrors'] ?? [];
         if (!empty($ue)) {
-            Log::error('productVariantDelete userErrors', ['target'=>$shop->domain, 'userErrors'=>$ue]);
-            throw new \RuntimeException('productVariantDelete userErrors: '.json_encode($ue));
+            Log::error('productVariantsBulkDelete userErrors', [
+                'target' => $shop->domain,
+                'userErrors' => $ue,
+            ]);
+            throw new \RuntimeException('productVariantsBulkDelete userErrors: '.json_encode($ue));
         }
     }
 
     /**
      * Bulk create variants for update flow using ProductVariantsBulkCreate.
-     * Returns map: canonKey => ['variant_gid'=>..., 'inventory_item_gid'=>...]
+     * Returns a map keyed by source variant ID. Option values are request data,
+     * never an identity used to rediscover the created variant.
      */
     private function productVariantsBulkCreateForUpdate(Shop $shop, string $productGid, array $toCreate, array $srcOptions, bool $hasExistingVariants = false): array
     {
@@ -2010,11 +2367,25 @@ public function handle(): void
 
         // Build ProductVariantsBulkInput[]
         $variantsInput = [];
+        $sourceIds = [];
         $optionNames = array_map(fn($o) => (string)($o['name'] ?? ''), $srcOptions);
 
-        foreach ($toCreate as $rawKey => $sv) {
+        foreach ($toCreate as $sourceIdKey => $sv) {
+            $sourceId = (int) ($sv['source_variant_id'] ?? 0);
+            if ($sourceId <= 0) {
+                throw new \RuntimeException('Cannot create target variant without source variant ID');
+            }
+            if ((string) $sourceId !== (string) $sourceIdKey) {
+                throw new \RuntimeException('Variant create map is not keyed by source variant ID');
+            }
+            if (in_array((string) $sourceId, $sourceIds, true)) {
+                throw new \RuntimeException('Duplicate source variant ID in update payload: '.$sourceId);
+            }
+
+            $sourceIds[] = (string) $sourceId;
             // optionValues [{name, optionName}]
             $ov = [];
+            $rawKey = (string) ($sv['source_options_key'] ?? '');
             $pairs = array_filter(explode('|', (string)$rawKey));
             $map = [];
             foreach ($pairs as $p) { [$n,$v] = array_pad(explode('=', $p, 2), 2, ''); $map[$this->canonOptName($n)] = $this->canonOptVal($v); }
@@ -2040,6 +2411,12 @@ public function handle(): void
                 'inventoryItem'   => array_filter([
                     'sku' => $sv['sku'] ?? null,
                 ], fn($x) => $x !== null && $x !== ''),
+                'metafields'      => [[
+                    'namespace' => 'custom',
+                    'key' => 'parentvariant',
+                    'type' => 'number_integer',
+                    'value' => (string) $sourceId,
+                ]],
             ], fn($x) => $x !== null && $x !== []);
         }
 
@@ -2050,7 +2427,11 @@ public function handle(): void
             $mutation = <<<'GQL'
             mutation CreateVariants($productId: ID!, $variants: [ProductVariantsBulkInput!]!) {
               productVariantsBulkCreate(productId: $productId, variants: $variants) {
-                productVariants { id selectedOptions { name value } inventoryItem { id } }
+                productVariants {
+                  id
+                  metafield(namespace: "custom", key: "parentvariant") { value }
+                  inventoryItem { id }
+                }
                 userErrors { field message }
               }
             }
@@ -2060,7 +2441,11 @@ public function handle(): void
             $mutation = <<<'GQL'
             mutation CreateVariants($productId: ID!, $variants: [ProductVariantsBulkInput!]!, $strategy: ProductVariantsBulkCreateStrategy!) {
               productVariantsBulkCreate(productId: $productId, variants: $variants, strategy: $strategy) {
-                productVariants { id selectedOptions { name value } inventoryItem { id } }
+                productVariants {
+                  id
+                  metafield(namespace: "custom", key: "parentvariant") { value }
+                  inventoryItem { id }
+                }
                 userErrors { field message }
               }
             }
@@ -2081,78 +2466,31 @@ public function handle(): void
         }
 
         $created = $res['data']['productVariantsBulkCreate']['productVariants'] ?? [];
+        if (count($created) !== count($sourceIds)) {
+            throw new \RuntimeException(sprintf(
+                'Shopify returned %d created variants for %d requested source variants',
+                count($created),
+                count($sourceIds)
+            ));
+        }
 
-        // Map back to canonical key
         $out = [];
         foreach ($created as $node) {
-            $sel = $node['selectedOptions'] ?? [];
-            $byName = [];
-            foreach ($sel as $so) { $byName[$this->canonOptName((string)($so['name'] ?? ''))] = $this->canonOptVal((string)($so['value'] ?? '')); }
-            $parts = [];
-            foreach ($optionNames as $n) { $parts[] = $this->canonOptName($n).'='.($byName[$this->canonOptName($n)] ?? ''); }
-            $ckey = implode('|', $parts);
-            $out[$ckey] = [
+            $sourceId = (string) ($node['metafield']['value'] ?? '');
+            $variantGid = $node['id'] ?? null;
+            if (!in_array($sourceId, $sourceIds, true) || isset($out[$sourceId]) || !$variantGid) {
+                throw new \RuntimeException('Shopify returned an invalid or duplicate parentvariant after variant create');
+            }
+
+            $out[$sourceId] = [
+                'source_variant_id' => (int) $sourceId,
+                'variant_id' => $this->numericIdFromGid($variantGid),
                 'variant_gid'        => $node['id'] ?? null,
                 'inventory_item_gid' => $node['inventoryItem']['id'] ?? null,
             ];
         }
 
         return $out;
-    }
-
-    /**
-     * Încărcă map-ul de mirror pentru variante: source_options_key => VariantMirror
-     */
-    private function loadVariantMirrorMap(ProductMirror $pm): array
-    {
-        $rows = VariantMirror::where('product_mirror_id', $pm->id)->get();
-        $map = [];
-        foreach ($rows as $row) {
-            $key = $this->canonKey($row->source_options_key ?? '');
-            $map[$key] = $row;
-        }
-        return $map;
-    }
-
-    /**
-     * Calculează difful: care variante se creează / se actualizează / se șterg (doar raport)
-     */
-    private function computeVariantDiff(array $payload, ProductMirror $pm, array $srcOptions): array
-    {
-        $srcVariants    = $this->normalizeSourceVariants($payload, $srcOptions);
-        $mirrorByKey    = $this->loadVariantMirrorMap($pm);
-
-        $toCreate = [];
-        $toUpdate = [];
-        $toDelete = [];
-
-        foreach ($srcVariants as $key => $sv) {
-            $mirror = $mirrorByKey[$key] ?? null;
-            if (!$mirror) {
-                $toCreate[$key] = $sv;
-                continue;
-            }
-
-            $toUpdate[$key] = [
-                'src'    => $sv,
-                'mirror' => $mirror,
-            ];
-
-            unset($mirrorByKey[$key]);
-        }
-
-        // Resturile din $mirrorByKey reprezintă variantele care nu mai există în payload.
-        if (!empty($mirrorByKey)) {
-            Log::info('Variant mirrors without source counterparts', [
-                'product_mirror_id' => $pm->id,
-                'keys'              => array_keys($mirrorByKey),
-            ]);
-            foreach ($mirrorByKey as $key => $mirror) {
-                $toDelete[$key] = $mirror;
-            }
-        }
-
-        return compact('toCreate','toUpdate','toDelete');
     }
 
     private function buildOptionCreateInputsFromPayload(array $src): array
@@ -2190,6 +2528,11 @@ public function handle(): void
             name
             values
             position
+            optionValues {
+              id
+              name
+              hasVariants
+            }
             }
         }
         }
@@ -2230,372 +2573,137 @@ public function handle(): void
         }
     }
 
-    // Set/reorder/rename/add/remove product options (schema nouă). În unele versiuni poate lipsi.
-    private function productOptionsSet(Shop $shop, string $productGid, array $options, string $variantStrategy = 'LEAVE_AS_IS'): void
-    {
-        $m = <<<'GQL'
-        mutation setOptions($productId: ID!, $options: [ProductOptionInput!]!, $variantStrategy: ProductOptionSetVariantStrategy) {
-          productOptionsSet(productId: $productId, options: $options, variantStrategy: $variantStrategy) {
+    private function productOptionsDelete(
+        Shop $shop,
+        string $productGid,
+        array $optionGids,
+        string $strategy = 'POSITION'
+    ): void {
+        $optionGids = array_values(array_unique(array_filter($optionGids)));
+        if (!$optionGids) {
+            return;
+        }
+
+        $mutation = <<<'GQL'
+        mutation deleteOptions(
+          $productId: ID!
+          $options: [ID!]!
+          $strategy: ProductOptionDeleteStrategy
+        ) {
+          productOptionsDelete(
+            productId: $productId
+            options: $options
+            strategy: $strategy
+          ) {
             product { id }
             userErrors { field message code }
           }
         }
         GQL;
 
-        // Convertim shape-ul nostru (OptionCreateInput) la OptionInput așteptat de Set
-        $opts = [];
-        foreach ($options as $opt) {
-            $values = [];
-            foreach (($opt['values'] ?? []) as $v) {
-                // Acceptă atât string cât și {name}; normalizăm la {name}
-                if (is_array($v) && isset($v['name'])) {
-                    $values[] = ['name' => (string)$v['name']];
-                } else {
-                    $values[] = ['name' => (string)$v];
-                }
-            }
-            $opts[] = array_filter([
-                'name'     => $opt['name'] ?? null,
-                'position' => $opt['position'] ?? null,
-                'values'   => $values,
-            ], fn($v) => $v !== null && $v !== []);
-        }
-
-        $res = $this->gql($shop, $m, [
-            'productId'       => $productGid,
-            'options'         => $opts,
-            'variantStrategy' => $variantStrategy,
+        $response = $this->gql($shop, $mutation, [
+            'productId' => $productGid,
+            'options' => $optionGids,
+            'strategy' => $strategy,
         ]);
 
-        // Dacă API-ul nu are mutația/enum-ul, Shopify pune eroarea în top-level errors
-        if (!empty($res['errors'])) {
-            Log::error('productOptionsSet top-level errors', ['target' => $shop->domain, 'errors' => $res['errors']]);
-            // Lasă apelantul să decidă fallback; ridicăm excepție clară
-            throw new \RuntimeException('productOptionsSet top-level errors: ' . json_encode($res['errors']));
+        if (!empty($response['errors'])) {
+            Log::error('productOptionsDelete top-level errors', [
+                'target' => $shop->domain,
+                'errors' => $response['errors'],
+            ]);
+            throw new \RuntimeException(
+                'productOptionsDelete top-level errors: '.json_encode($response['errors'])
+            );
         }
-        $ue = $res['data']['productOptionsSet']['userErrors'] ?? [];
-        if (!empty($ue)) {
-            Log::error('productOptionsSet userErrors', ['target' => $shop->domain, 'userErrors' => $ue]);
-            throw new \RuntimeException('productOptionsSet userErrors: ' . json_encode($ue));
+
+        $userErrors = $response['data']['productOptionsDelete']['userErrors'] ?? [];
+        if ($userErrors) {
+            Log::error('productOptionsDelete userErrors', [
+                'target' => $shop->domain,
+                'userErrors' => $userErrors,
+            ]);
+            throw new \RuntimeException(
+                'productOptionsDelete userErrors: '.json_encode($userErrors)
+            );
         }
     }
 
-    /**
-     * Fallback REST update pentru opțiuni atunci când productOptionsSet nu este disponibil.
-     */
-    private function productOptionsRestUpdate(Shop $shop, string $productGid, array $options): bool
+    private function productOptionUpdate(
+        Shop $shop,
+        string $productGid,
+        array $option,
+        array $optionValuesToUpdate,
+        array $optionValuesToDelete
+    ): void
     {
-        $productId = $this->numericIdFromGid($productGid);
-        if (!$productId) {
-            Log::warning('REST fallback: invalid product gid', [
-                'target_shop' => $shop->domain,
-                'product_gid' => $productGid,
-            ]);
-            return false;
-        }
-
-        $payloadOptions = [];
-        foreach ($options as $opt) {
-            $name = $opt['name'] ?? null;
-            if (!$name) continue;
-
-            $values = [];
-            foreach (($opt['values'] ?? []) as $value) {
-                if (is_array($value) && isset($value['name'])) {
-                    $val = (string)$value['name'];
-                } else {
-                    $val = (string)$value;
-                }
-                if ($val !== '') {
-                    $values[] = $val;
-                }
-            }
-
-            $payloadOptions[] = array_filter([
-                'name'     => $name,
-                'position' => $opt['position'] ?? null,
-                'values'   => $values ?: null,
-            ], fn($v) => $v !== null);
-        }
-
-        if (empty($payloadOptions)) {
-            Log::warning('REST fallback: no valid options to apply', [
-                'target_shop' => $shop->domain,
-                'product_gid' => $productGid,
-            ]);
-            return false;
-        }
-
-        $version = $shop->api_version ?: '2025-01';
-        $url = "https://{$shop->domain}/admin/api/{$version}/products/{$productId}.json";
-
-        try {
-            $resp = Http::withHeaders([
-                'X-Shopify-Access-Token' => $shop->access_token,
-                'Content-Type'           => 'application/json',
-            ])->put($url, [
-                'product' => [
-                    'id'      => (int)$productId,
-                    'options' => $payloadOptions,
-                ],
-            ]);
-        } catch (\Throwable $e) {
-            Log::error('REST fallback: exception updating options', [
-                'target_shop' => $shop->domain,
-                'error'       => $e->getMessage(),
-            ]);
-            return false;
-        }
-
-        if ($resp->failed()) {
-            Log::error('REST fallback: request failed', [
-                'target_shop' => $shop->domain,
-                'status'      => $resp->status(),
-                'body'        => $resp->body(),
-            ]);
-            return false;
-        }
-
-        return true;
-    }
-
-    private function fetchTargetVariantsForMapping(Shop $shop, string $productGid, array $optionNames): array
-    {
-        $q = <<<'GQL'
-        query($id: ID!) {
-        product(id: $id) {
-            variants(first: 250) {
-            nodes {
-                id
-                selectedOptions { name value }
-                metafield(namespace: "custom", key: "parentvariant") { value }
-            }
-            }
-        }
+        $m = <<<'GQL'
+        mutation updateOption(
+          $productId: ID!
+          $option: OptionUpdateInput!
+          $optionValuesToUpdate: [OptionValueUpdateInput!]
+          $optionValuesToDelete: [ID!]
+        ) {
+          productOptionUpdate(
+            productId: $productId
+            option: $option
+            optionValuesToUpdate: $optionValuesToUpdate
+            optionValuesToDelete: $optionValuesToDelete
+            variantStrategy: LEAVE_AS_IS
+          ) {
+            product { id }
+            userErrors { field message code }
+          }
         }
         GQL;
 
-        $r = $this->gql($shop, $q, ['id' => $productGid]);
-        $nodes = $r['data']['product']['variants']['nodes'] ?? [];
+        $res = $this->gql($shop, $m, [
+            'productId' => $productGid,
+            'option' => $option,
+            'optionValuesToUpdate' => $optionValuesToUpdate,
+            'optionValuesToDelete' => $optionValuesToDelete,
+        ]);
 
-        $byKey = [];
-        $byParentVariantId = [];
-        $nodesByGid = [];
-        foreach ($nodes as $v) {
-            // construim cheia canonică din selectedOptions în ORDINEA din $optionNames
-            $sel = $v['selectedOptions'] ?? [];
-            $byName = [];
-            foreach ($sel as $so) {
-                $byName[$this->canonOptName((string)($so['name'] ?? ''))] = $this->canonOptVal((string)($so['value'] ?? ''));
-            }
-            $parts = [];
-            foreach ($optionNames as $name) {
-                $parts[] = $this->canonOptName($name).'='.($byName[$this->canonOptName($name)] ?? '');
-            }
-            $key = implode('|', $parts);
-            $gid = $v['id'] ?? null;
-            if (!$gid) {
-                continue;
-            }
-
-            $parentVariantValue = trim((string)($v['metafield']['value'] ?? ''));
-            $v['parentvariant_value'] = $parentVariantValue;
-
-            $byKey[$key] = $gid; // target variant GID
-            $nodesByGid[$gid] = $v;
-
-            if ($parentVariantValue !== '') {
-                $byParentVariantId[$parentVariantValue] = $gid;
-            }
+        if (!empty($res['errors'])) {
+            Log::error('productOptionUpdate top-level errors', ['target' => $shop->domain, 'errors' => $res['errors']]);
+            throw new \RuntimeException('productOptionUpdate top-level errors: '.json_encode($res['errors']));
         }
 
-        return [
-            'by_key' => $byKey,
-            'by_parent_variant_id' => $byParentVariantId,
-            'nodes_by_gid' => $nodesByGid,
-            'nodes' => array_values($nodesByGid),
-        ];
+        $ue = $res['data']['productOptionUpdate']['userErrors'] ?? [];
+        if (!empty($ue)) {
+            Log::error('productOptionUpdate userErrors', ['target' => $shop->domain, 'userErrors' => $ue]);
+            throw new \RuntimeException('productOptionUpdate userErrors: '.json_encode($ue));
+        }
     }
 
-    // --- Target variants: citire și mapare pe cheie canonică ---
-    private function fetchTargetVariantsMap(Shop $shop, string $productGid, array $optionNames): array
+    /** @return array<string, bool> */
+    private function fetchTrackedMapBySourceId(Shop $shop, string $productGid): array
     {
-        return $this->fetchTargetVariantsForMapping($shop, $productGid, $optionNames)['by_key'] ?? [];
-    }
-
-    // Citește de pe produsul sursă starea tracked pentru fiecare variantă și mapează pe cheia canonică
-    private function fetchTrackedMapByKey(Shop $shop, string $productGid, array $optionNames): array
-    {
-        $q = <<<'GQL'
-        query($id: ID!) {
+        $query = <<<'GQL'
+        query SourceVariantTracking($id: ID!) {
           product(id: $id) {
             variants(first: 250) {
               nodes {
-                id
-                selectedOptions { name value }
-                inventoryItem { id tracked }
+                legacyResourceId
+                inventoryItem { tracked }
               }
             }
           }
         }
         GQL;
 
-        $r = $this->gql($shop, $q, ['id' => $productGid]);
-        $nodes = $r['data']['product']['variants']['nodes'] ?? [];
+        $response = $this->gql($shop, $query, ['id' => $productGid]);
+        $result = [];
 
-        $map = [];
-        foreach ($nodes as $v) {
-            $sel = $v['selectedOptions'] ?? [];
-            $byName = [];
-            foreach ($sel as $so) {
-                $byName[$this->canonOptName((string)($so['name'] ?? ''))] = $this->canonOptVal((string)($so['value'] ?? ''));
+        foreach ($response['data']['product']['variants']['nodes'] ?? [] as $variant) {
+            $sourceId = (string) ($variant['legacyResourceId'] ?? '');
+            if ($sourceId !== '') {
+                $result[$sourceId] = (bool) ($variant['inventoryItem']['tracked'] ?? false);
             }
-            $parts = [];
-            foreach ($optionNames as $name) {
-                $parts[] = $this->canonOptName($name).'='.($byName[$this->canonOptName($name)] ?? '');
-            }
-            $key = implode('|', $parts);
-            $map[$key] = (bool)($v['inventoryItem']['tracked'] ?? false);
         }
-        return $map; // key => tracked(bool)
+
+        return $result;
     }
-
-    // --- Asigură existența VariantMirror pe cheile comune (lazy bootstrap) ---
-private function ensureVariantMirrors(
-    ProductMirror $pm,
-    Shop $target,
-    array $srcOptions,
-    array $srcVariantsByKey
-): void {
-    $optionNames = array_map(fn($o) => $o['name'], $srcOptions);
-
-    $targetVariantState = $this->fetchTargetVariantsForMapping($target, $pm->target_product_gid, $optionNames);
-
-    // key => targetVariantGid (din Shopify target)
-    $targetMap = $targetVariantState['by_key'] ?? [];
-    $targetByParentVariant = $targetVariantState['by_parent_variant_id'] ?? [];
-    $targetNodesByGid = $targetVariantState['nodes_by_gid'] ?? [];
-    $targetNodes = $targetVariantState['nodes'] ?? [];
-
-    foreach ($srcVariantsByKey as $rawKey => $sv) {
-        $ckey = $this->canonKey($rawKey);
-        $srcVarId = $sv['source_variant_id'] ?? null;
-
-        // 1) caută întâi după (product_mirror_id, source_variant_id) – e unică
-        $vm = null;
-        if ($srcVarId) {
-            $vm = VariantMirror::where('product_mirror_id', $pm->id)
-                ->where('source_variant_id', $srcVarId)
-                ->first();
-        }
-
-        // 2) dacă nu există după ID, încearcă după cheie canonică
-        if (!$vm) {
-            $vm = VariantMirror::where('product_mirror_id', $pm->id)
-                ->where('source_options_key', $ckey)
-                ->first();
-        }
-
-        $targetGid = $targetMap[$ckey] ?? null;
-        $matchedBy = $targetGid ? 'options_key' : null;
-
-        if (!$targetGid && $srcVarId) {
-            $targetGid = $targetByParentVariant[(string)$srcVarId] ?? null;
-            $matchedBy = $targetGid ? 'parentvariant' : null;
-        }
-
-        if (!$targetGid && count($srcVariantsByKey) === 1 && count($targetNodes) === 1) {
-            $targetGid = $targetNodes[0]['id'] ?? null;
-            $matchedBy = $targetGid ? 'single_variant' : null;
-        }
-
-        if (!$vm) {
-            // nu avem rând – creăm doar dacă putem mappa la o variantă din target
-            if (!$targetGid) {
-                // nu există varianta în target; o vom crea într-o etapă viitoare
-                \Log::info('ensureVariantMirrors: skip create (no target variant)', [
-                    'product_mirror_id' => $pm->id,
-                    'key' => $ckey,
-                ]);
-                continue;
-            }
-
-            VariantMirror::create([
-                'product_mirror_id'     => $pm->id,
-                'source_options_key'    => $ckey,
-                'source_variant_id'     => $srcVarId,
-                'target_variant_gid'    => $targetGid,
-                'variant_fingerprint'   => $sv['variant_fingerprint'] ?? null,
-                'inventory_fingerprint' => $sv['inventory_fingerprint'] ?? null,
-            ]);
-
-            \Log::info('ensureVariantMirrors: created', [
-                'product_mirror_id' => $pm->id,
-                'key'               => $ckey,
-                'target_gid'        => $targetGid,
-                'matched_by'        => $matchedBy,
-            ]);
-        } else {
-            // există – facem backfill/normalizare fără să stricăm fingerprint-urile existente
-            $dirty = false;
-
-            if ($vm->source_options_key !== $ckey) {
-                $vm->source_options_key = $ckey;
-                $dirty = true;
-            }
-
-            if ($targetGid && $vm->target_variant_gid !== $targetGid) {
-                $vm->target_variant_gid = $targetGid;
-                $dirty = true;
-            } elseif (!$targetGid && !empty($vm->target_variant_gid) && isset($targetNodesByGid[$vm->target_variant_gid])) {
-                // Varianta există încă în Shopify, dar opțiunile ei nu mai coincid cu cheia sursă.
-                // Păstrăm legătura și o lăsăm să fie normalizată de update-ul curent.
-                $targetGid = $vm->target_variant_gid;
-                $matchedBy = 'existing_mirror_gid';
-            } elseif (!$targetGid && !empty($vm->target_variant_gid)) {
-                // Varianta nu mai există pe target (a fost ștearsă sau nu a fost creată niciodată).
-                // Ștergem intrarea din mirror ca să fie tratată ca toCreate la pasul următor.
-                $vm->delete();
-                \Log::info('ensureVariantMirrors: stale GID cleared (variant not found on target)', [
-                    'product_mirror_id' => $pm->id,
-                    'key'               => $ckey,
-                    'stale_gid'         => $vm->target_variant_gid,
-                ]);
-                continue;
-            }
-
-            // nu suprascriem fingerprint-urile dacă sunt deja puse;
-            // dar dacă lipsesc (null/empty) le completăm
-            if (empty($vm->variant_fingerprint) && !empty($sv['variant_fingerprint'])) {
-                $vm->variant_fingerprint = $sv['variant_fingerprint'];
-                $dirty = true;
-            }
-            if (empty($vm->inventory_fingerprint) && !empty($sv['inventory_fingerprint'])) {
-                $vm->inventory_fingerprint = $sv['inventory_fingerprint'];
-                $dirty = true;
-            }
-
-            if ($dirty) {
-                $vm->save();
-                // \Log::info('ensureVariantMirrors: updated', [
-                //     'product_mirror_id' => $pm->id,
-                //     'key'               => $ckey,
-                //     'target_gid'        => $vm->target_variant_gid,
-                // ]);
-            }
-        }
-
-        if ($targetGid && $srcVarId) {
-            $currentParentVariant = (string)($targetNodesByGid[$targetGid]['parentvariant_value'] ?? '');
-            if ($currentParentVariant !== (string)$srcVarId) {
-                $this->setParentVariantMetafield($target, $targetGid, (int)$srcVarId, $matchedBy);
-                if (isset($targetNodesByGid[$targetGid])) {
-                    $targetNodesByGid[$targetGid]['parentvariant_value'] = (string)$srcVarId;
-                }
-            }
-        }
-    }
-}
 
     private function setParentVariantMetafield(Shop $target, string $targetVariantGid, int $sourceVariantId, ?string $matchedBy = null): void
     {
@@ -2607,44 +2715,31 @@ private function ensureVariantMirrors(
         }
         GQL;
 
-        try {
-            $response = $this->gql($target, $mutation, [
-                'metafields' => [[
-                    'ownerId' => $targetVariantGid,
-                    'namespace' => 'custom',
-                    'key' => 'parentvariant',
-                    'type' => 'number_integer',
-                    'value' => (string)$sourceVariantId,
-                ]],
-            ]);
+        $response = $this->gql($target, $mutation, [
+            'metafields' => [[
+                'ownerId' => $targetVariantGid,
+                'namespace' => 'custom',
+                'key' => 'parentvariant',
+                'type' => 'number_integer',
+                'value' => (string)$sourceVariantId,
+            ]],
+        ]);
 
-            $errors = $response['data']['metafieldsSet']['userErrors'] ?? [];
-            if (!empty($errors)) {
-                Log::warning('Parentvariant metafield set returned user errors', [
-                    'target_shop' => $target->domain,
-                    'target_variant_gid' => $targetVariantGid,
-                    'source_variant_id' => $sourceVariantId,
-                    'matched_by' => $matchedBy,
-                    'errors' => $errors,
-                ]);
-                return;
-            }
-
-            Log::info('Parentvariant metafield set on target variant', [
-                'target_shop' => $target->domain,
-                'target_variant_gid' => $targetVariantGid,
-                'source_variant_id' => $sourceVariantId,
-                'matched_by' => $matchedBy,
-            ]);
-        } catch (\Throwable $e) {
-            Log::warning('Parentvariant metafield set failed on target variant', [
-                'target_shop' => $target->domain,
-                'target_variant_gid' => $targetVariantGid,
-                'source_variant_id' => $sourceVariantId,
-                'matched_by' => $matchedBy,
-                'error' => $e->getMessage(),
-            ]);
+        if (!empty($response['errors'])) {
+            throw new \RuntimeException('Parentvariant metafield GraphQL errors: '.json_encode($response['errors']));
         }
+
+        $errors = $response['data']['metafieldsSet']['userErrors'] ?? [];
+        if ($errors) {
+            throw new \RuntimeException('Parentvariant metafield userErrors: '.json_encode($errors));
+        }
+
+        Log::info('Parentvariant metafield set on target variant', [
+            'target_shop' => $target->domain,
+            'target_variant_gid' => $targetVariantGid,
+            'source_variant_id' => $sourceVariantId,
+            'matched_by' => $matchedBy,
+        ]);
     }
 
 
@@ -2672,6 +2767,18 @@ private function ensureVariantMirrors(
 
         if (array_key_exists('inventory_policy', $src) && $src['inventory_policy'] !== null && $src['inventory_policy'] !== '') {
             $input['inventoryPolicy'] = (strtolower((string)$src['inventory_policy']) === 'continue') ? 'CONTINUE' : 'DENY';
+        }
+
+        if (array_key_exists('barcode', $src)) {
+            $input['barcode'] = ($src['barcode'] === '' || $src['barcode'] === null)
+                ? null
+                : (string) $src['barcode'];
+        }
+
+        if (array_key_exists('sku', $src)) {
+            $input['inventoryItem'] = [
+                'sku' => ($src['sku'] === null) ? '' : (string) $src['sku'],
+            ];
         }
 
         // dacă vrei și greutatea (acceptată în bulk), poți păstra:
@@ -3136,167 +3243,6 @@ private function productSet(Shop $shop, array $input): void
     }
 }
 
-
-    // --- Discovery helpers (read-only) ---
-    private function searchTargetProductByParentProduct(Shop $shop, int $sourceProductId): array
-    {
-        $snapshotMatches = ProductParentBackfillCandidate::query()
-            ->where('target_shop_id', $shop->id)
-            ->where('source_product_id', $sourceProductId)
-            ->where('parentproduct_value', $sourceProductId)
-            ->get();
-
-        if ($snapshotMatches->count() === 1) {
-            $match = $snapshotMatches->first();
-
-            return [
-                'gid' => $match->target_product_gid,
-                'handle' => $match->target_handle,
-                'title' => $match->target_title,
-            ];
-        }
-
-        if ($snapshotMatches->count() > 1) {
-            return [
-                'ambiguous' => true,
-                'candidates' => $snapshotMatches
-                    ->map(fn (ProductParentBackfillCandidate $match) => [
-                        'source_product_id' => $match->source_product_id,
-                        'target_product_id' => $match->target_product_id,
-                        'target_product_gid' => $match->target_product_gid,
-                        'target_title' => $match->target_title,
-                        'target_handle' => $match->target_handle,
-                        'match_status' => $match->match_status,
-                    ])
-                    ->values()
-                    ->all(),
-            ];
-        }
-
-        $q = <<<'GQL'
-        query($query: String!) {
-          products(first: 10, query: $query) {
-            nodes {
-              id
-              handle
-              title
-              metafield(namespace: "custom", key: "parentproduct") {
-                value
-              }
-            }
-          }
-        }
-        GQL;
-
-        $queryStr = 'metafields.custom.parentproduct:' . $sourceProductId;
-        $res = $this->gql($shop, $q, ['query' => $queryStr]);
-        $nodes = $res['data']['products']['nodes'] ?? [];
-        $matches = [];
-
-        foreach ($nodes as $node) {
-            if ((string)($node['metafield']['value'] ?? '') !== (string)$sourceProductId) {
-                continue;
-            }
-
-            $matches[] = $node;
-        }
-
-        if (count($matches) === 1) {
-            return [
-                'gid' => $matches[0]['id'] ?? null,
-                'handle' => $matches[0]['handle'] ?? null,
-                'title' => $matches[0]['title'] ?? null,
-            ];
-        }
-
-        return [
-            'ambiguous' => count($matches) > 1,
-            'candidates' => array_values(array_map(fn (array $node) => [
-                'target_product_gid' => $node['id'] ?? null,
-                'target_product_id' => isset($node['id']) ? $this->numericIdFromGid($node['id']) : null,
-                'target_title' => $node['title'] ?? null,
-                'target_handle' => $node['handle'] ?? null,
-                'parentproduct' => $node['metafield']['value'] ?? null,
-            ], $matches)),
-        ];
-    }
-
-    private function searchTargetProductByHandle(Shop $shop, string $handle): array
-    {
-        $q = <<<'GQL'
-        query($query: String!) {
-          products(first: 1, query: $query) {
-            nodes { id handle title }
-          }
-        }
-        GQL;
-
-        $queryStr = 'handle:' . $handle;
-        $res = $this->gql($shop, $q, ['query' => $queryStr]);
-        $nodes = $res['data']['products']['nodes'] ?? [];
-        if (count($nodes) === 1) {
-            return [
-                'gid'    => $nodes[0]['id'] ?? null,
-                'handle' => $nodes[0]['handle'] ?? null,
-                'title'  => $nodes[0]['title'] ?? null,
-            ];
-        }
-        return [
-            'ambiguous' => count($nodes) > 1,
-            'candidates' => array_values(array_map(fn (array $node) => [
-                'target_product_gid' => $node['id'] ?? null,
-                'target_product_id' => isset($node['id']) ? $this->numericIdFromGid($node['id']) : null,
-                'target_title' => $node['title'] ?? null,
-                'target_handle' => $node['handle'] ?? null,
-            ], $nodes)),
-        ];
-    }
-
-    private function searchTargetProductBySkus(Shop $shop, array $skus): array
-    {
-        $parts = [];
-        foreach (array_values(array_unique($skus)) as $s) {
-            $s = trim((string)$s);
-            if ($s === '') continue;
-            $parts[] = 'sku:"' . addslashes($s) . '"';
-        }
-        if (!$parts) return [];
-        $queryStr = implode(' OR ', $parts);
-
-        $q = <<<'GQL'
-        query($query: String!) {
-          products(first: 10, query: $query) {
-            nodes { id handle title }
-          }
-        }
-        GQL;
-
-        $res = $this->gql($shop, $q, ['query' => $queryStr]);
-        $nodes = $res['data']['products']['nodes'] ?? [];
-        if (count($nodes) === 1) {
-            return [
-                'gid'    => $nodes[0]['id'] ?? null,
-                'handle' => $nodes[0]['handle'] ?? null,
-                'title'  => $nodes[0]['title'] ?? null,
-            ];
-        }
-        return [
-            'ambiguous' => count($nodes) > 1,
-            'candidates' => array_values(array_map(fn (array $node) => [
-                'target_product_gid' => $node['id'] ?? null,
-                'target_product_id' => isset($node['id']) ? $this->numericIdFromGid($node['id']) : null,
-                'target_title' => $node['title'] ?? null,
-                'target_handle' => $node['handle'] ?? null,
-            ], $nodes)),
-        ];
-    }
-
-    private function sendParentProductBootstrapIssueEmail(array $context): void
-    {
-        $context['created_at'] = now()->toIso8601String();
-
-        Log::warning('Parentproduct bootstrap issue email suppressed', $context);
-    }
 
     // Normalizează nume/opțiuni ca să construim chei stabile
     private function canonOptName(string $s): string { return mb_strtolower(trim($s)); }
