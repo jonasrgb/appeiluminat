@@ -32,4 +32,15 @@ class BemBootstrapIdentityContractTest extends TestCase
         $this->assertStringNotContainsString("'sku:'.", $source);
         $this->assertStringNotContainsString('ambiguous_parentproduct_snapshot', $source);
     }
+
+    public function test_bem_bootstrap_repairs_only_a_known_backup_product_with_missing_identity(): void
+    {
+        $source = file_get_contents(
+            app_path('Services/Shopify/BemWatermark/BemWatermarkUpdateBootstrapService.php')
+        );
+
+        $this->assertStringContainsString("\$role === 'backup'", $source);
+        $this->assertStringContainsString('repairMissingParentProduct', $source);
+        $this->assertStringContainsString('target_product_gid', $source);
+    }
 }

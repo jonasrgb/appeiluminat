@@ -68,6 +68,9 @@ return [
             'path' => storage_path('logs/laravel.log'),
             'level' => env('LOG_LEVEL', 'debug'),
             'days' => 14,
+            // Web requests run as www-data while scheduled commands run as
+            // mitnickoff, so rotated daily files must remain writable by both.
+            'permission' => 0666,
         ],
 
         'slack' => [

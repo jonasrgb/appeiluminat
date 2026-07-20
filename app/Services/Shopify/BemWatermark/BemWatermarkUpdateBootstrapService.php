@@ -267,6 +267,42 @@ class BemWatermarkUpdateBootstrapService
             $existing?->target_product_gid
         );
 
+        if (
+            $resolution['status'] === 'missing'
+            && $role === 'backup'
+            && $existing?->target_product_gid
+            && !$this->targetMirrorIsShared($existing)
+        ) {
+            try {
+                $repaired = $this->parentIdentityResolver->repairMissingParentProduct(
+                    $target,
+                    $sourceProductId,
+                    $existing->target_product_gid
+                );
+
+                if ($repaired) {
+                    Log::notice('BEM update bootstrap repaired missing backup parentproduct', [
+                        'target_shop' => $target->domain,
+                        'source_product_id' => $sourceProductId,
+                        'target_product_gid' => $existing->target_product_gid,
+                    ]);
+
+                    $resolution = $this->parentIdentityResolver->resolveProduct(
+                        $target,
+                        $sourceProductId,
+                        $existing->target_product_gid
+                    );
+                }
+            } catch (\Throwable $e) {
+                Log::warning('BEM update bootstrap could not repair missing backup parentproduct', [
+                    'target_shop' => $target->domain,
+                    'source_product_id' => $sourceProductId,
+                    'target_product_gid' => $existing->target_product_gid,
+                    'error' => $e->getMessage(),
+                ]);
+            }
+        }
+
         if ($resolution['status'] !== 'found' || empty($resolution['product']['id'])) {
             Log::warning('BEM update bootstrap stopped: strict parentproduct resolution failed', [
                 'role' => $role,
@@ -310,6 +346,15 @@ class BemWatermarkUpdateBootstrapService
         ]);
 
         return $mirror;
+    }
+
+    private function targetMirrorIsShared(ProductMirror $mirror): bool
+    {
+        return ProductMirror::query()
+            ->where('target_shop_id', $mirror->target_shop_id)
+            ->where('target_product_gid', $mirror->target_product_gid)
+            ->whereKeyNot($mirror->getKey())
+            ->exists();
     }
 
     private function fetchSourceState(Shop $source, string $sourceProductGid): array

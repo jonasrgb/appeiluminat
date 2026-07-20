@@ -144,6 +144,62 @@ final class ShopifyParentIdentityResolver
         ];
     }
 
+    public function repairMissingParentProduct(
+        Shop $shop,
+        int $sourceProductId,
+        string $expectedTargetGid
+    ): bool {
+        $expected = $this->fetchProduct($shop, $expectedTargetGid);
+        if (!$expected || empty($expected['id'])) {
+            return false;
+        }
+
+        // Never overwrite an existing identity, even when it points elsewhere.
+        if ($this->parentValue($expected, 'parentproduct') !== null) {
+            return false;
+        }
+
+        // Do not claim the cached product if another live product already owns
+        // this source ID. The normal resolver must surface that state instead.
+        if (!empty($this->searchProductsByParentProduct($shop, $sourceProductId))) {
+            return false;
+        }
+
+        $response = $this->request($shop, <<<'GQL'
+            mutation RepairMissingParentProduct($metafields: [MetafieldsSetInput!]!) {
+              metafieldsSet(metafields: $metafields) {
+                metafields { key value }
+                userErrors { field message code }
+              }
+            }
+            GQL, [
+                'metafields' => [[
+                    'ownerId' => $expectedTargetGid,
+                    'namespace' => 'custom',
+                    'key' => 'parentproduct',
+                    'type' => 'number_integer',
+                    'value' => (string) $sourceProductId,
+                ]],
+            ]);
+
+        if (!empty($response['data']['metafieldsSet']['userErrors'] ?? [])) {
+            return false;
+        }
+
+        $written = $response['data']['metafieldsSet']['metafields'][0] ?? null;
+        if (
+            ($written['key'] ?? null) === 'parentproduct'
+            && ($written['value'] ?? null) === (string) $sourceProductId
+        ) {
+            return true;
+        }
+
+        $verified = $this->resolveProduct($shop, $sourceProductId, $expectedTargetGid);
+
+        return $verified['status'] === 'found'
+            && ($verified['product']['id'] ?? null) === $expectedTargetGid;
+    }
+
     private function fetchProduct(Shop $shop, string $productGid): ?array
     {
         $response = $this->request($shop, <<<'GQL'
